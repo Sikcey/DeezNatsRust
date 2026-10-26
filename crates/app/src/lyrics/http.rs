@@ -2,32 +2,10 @@
 use std::{
     ffi::c_void,
     ptr::{null, null_mut},
-    sync::atomic::{AtomicU64, Ordering},
     sync::OnceLock,
     time::{Duration, Instant},
 };
 use windows_sys::Win32::Networking::WinHttp::*;
-static SPOTIFY_RETRY_AT: AtomicU64 = AtomicU64::new(0);
-fn epoch() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-pub(crate) fn spotify_cooldown() -> Option<u64> {
-    let seconds = SPOTIFY_RETRY_AT
-        .load(Ordering::Relaxed)
-        .saturating_sub(epoch());
-    (seconds > 0).then_some(seconds)
-}
-fn retry_seconds(header: &str) -> u64 {
-    header
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .filter(|seconds| *seconds > 0)
-        .unwrap_or(60)
-}
 struct Handle(*mut c_void);
 unsafe impl Send for Handle {}
 unsafe impl Sync for Handle {}
@@ -110,13 +88,6 @@ fn request_transport(method:&str,url:&str,headers:&[(&str,&str)],body:&[u8],limi
     if body.len() > 1024 * 1024 {
         return Err("Provider request too large".into());
     }
-    if host.eq_ignore_ascii_case("api.spotify.com") {
-        if let Some(seconds) = spotify_cooldown() {
-            return Err(format!(
-                "Provider HTTP 429: Spotify requests paused; try again in {seconds} seconds"
-            ));
-        }
-    }
     let mut header = String::new();
     for (name, value) in headers {
         if name.contains(['\r', '\n']) || value.contains(['\r', '\n']) {
@@ -184,28 +155,6 @@ fn request_transport(method:&str,url:&str,headers:&[(&str,&str)],body:&[u8],limi
         {
             return Err("Invalid provider response".into());
         }
-        if status == 429 && host.eq_ignore_ascii_case("api.spotify.com") {
-            let mut header = [0u16; 128];
-            let mut bytes = (header.len() * 2) as u32;
-            let name = wide("Retry-After");
-            let seconds = if WinHttpQueryHeaders(
-                request.0,
-                WINHTTP_QUERY_CUSTOM,
-                name.as_ptr(),
-                header.as_mut_ptr().cast(),
-                &mut bytes,
-                null_mut(),
-            ) != 0
-            {
-                retry_seconds(&String::from_utf16_lossy(
-                    &header[..header.iter().position(|c| *c == 0).unwrap_or(header.len())],
-                ))
-            } else {
-                60
-            };
-            SPOTIFY_RETRY_AT.fetch_max(epoch().saturating_add(seconds), Ordering::Relaxed);
-            return Err(format!("Provider HTTP 429: Spotify rate limit or quota reached; try again in {seconds} seconds"));
-        }
         if !(200..300).contains(&status) {
             return Err(format!("Provider HTTP {status}"));
         }
@@ -254,13 +203,6 @@ pub(super) fn post_json(url: &str, value: &serde_json::Value) -> Result<serde_js
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn retry_after_uses_server_delay_without_shortening_long_limits() {
-        assert_eq!(retry_seconds("120"), 120);
-        assert_eq!(retry_seconds("86400"), 86400);
-        assert_eq!(retry_seconds("invalid"), 60);
-        assert_eq!(retry_seconds("0"), 60);
-    }
     #[test]
     fn rejects_unsafe_urls_and_header_injection_before_network() {
         assert!(request("GET", "http://example.com", &[], &[]).is_err());

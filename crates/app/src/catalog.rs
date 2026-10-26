@@ -515,6 +515,10 @@ fn inherit_collection_metadata(page: &mut Page, value: &Value) {
     let metadata = value.get(&entity.kind)
         .or_else(|| value.get("data").and_then(|data| data.get(&entity.kind)))
         .unwrap_or(value);
+    if let Some(description) = metadata.get("description").or_else(|| metadata.get("DESCRIPTION")).and_then(Value::as_str) {
+        if !entity.raw.is_object() { entity.raw = json!({}); }
+        entity.raw["description"] = json!(description);
+    }
     let artwork = picture(metadata);
     if !artwork.is_empty() {
         entity.artwork = artwork;
@@ -769,6 +773,7 @@ pub enum Job {
     Route(View, Option<Entry>, String),
     More(Page),
     Api(String, Vec<Value>),
+    Playlist(crate::playlist::Mutation),
     Lyrics(Entry, String, u32),
     LyricsWindow(Entry, Vec<Entry>, u32),
     TrackInfo(Entry),
@@ -779,6 +784,7 @@ pub struct Request {
     pub job: Job,
 }
 pub enum Event {
+    Playlist(crate::playlist::Mutation, Result<crate::playlist::Outcome, String>),
     Page(u64, Arc<Page>),
     Api(u64, String, Result<Value, String>),
     Lyrics(
@@ -1029,6 +1035,10 @@ impl Worker {
                             page.loading = completed < shelves.len();
                             tx.send(Event::Page(generation, Arc::new(page.clone()))).map_err(|_|"Window closed".into())
                         });
+                    }
+                    Job::Playlist(mut mutation) => {
+                        let result = crate::playlist::execute(&engine, &mut mutation);
+                        if tx.send(Event::Playlist(mutation, result)).is_err() { return; }
                     }
                     Job::Api(name, args) => {
                         let result = if name == "RustPodcastLibraryJSON" {
@@ -1413,7 +1423,7 @@ fn load(
     let (name, args, kind, table) = match view {
         View::Favorites => ("DZFavoritesJSON", vec![], "track", true),
         View::Albums => ("DZFavoriteAlbumsJSON", vec![], "album", false),
-        View::Playlists => ("DZPlaylistsJSON", vec![], "playlist", false),
+        View::Playlists | View::PlaylistPicker => ("DZPlaylistsJSON", vec![], "playlist", false),
         View::Recent => ("DZHistoryRecentJSON", vec![json!(200)], "track", true),
         View::Flow => {
             if query.is_empty() || query == "default" {
@@ -1486,6 +1496,15 @@ fn load(
     if table {
         page.rows = table_entries(&value, kind);
         inherit_collection_metadata(&mut page, &value);
+        if let Some(playlist) = page.entity.as_ref().filter(|item| item.kind == "playlist") {
+            if let Ok(metadata) = public(engine, &format!("playlist/{}", playlist.id)) {
+                let preview = playlist.artwork.clone();
+                inherit_collection_metadata(&mut page, &metadata);
+                if preview.starts_with("playlist-cover:") {
+                    if let Some(entity) = page.entity.as_mut() { entity.artwork = preview; }
+                }
+            }
+        }
         // The native album API often returns only tracks, without a header.
         if let Some(album) = page.entity.as_ref().filter(|item| item.kind == "album" && item.artwork.is_empty()) {
             if let Ok(metadata) = public(engine, &format!("album/{}", album.id)) {

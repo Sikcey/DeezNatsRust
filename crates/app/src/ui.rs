@@ -19,6 +19,7 @@ pub enum View {
     Account,
     FlowTune,
     PlaylistEdit,
+    PlaylistPicker,
     CoverEdit,
     Album,
     Artist,
@@ -48,6 +49,7 @@ impl View {
             Self::Lyrics => "Lyrics",
             Self::Account => "Sign in to Deezer",
             Self::FlowTune => "Customize Flow",
+            Self::PlaylistPicker => "Add to playlist",
             Self::PlaylistEdit => "Edit playlist",
             Self::CoverEdit => "Edit cover",
             Self::Album => "Album",
@@ -284,6 +286,13 @@ pub enum Action {
     Filter(usize),
     Notice(&'static str),
     SavePlaylist,
+    EditPlaylist(crate::catalog::Entry),
+    ChoosePlaylist(crate::catalog::Entry),
+    ChoosePlaylistCover,
+    ClearPlaylistDescription,
+    CropPlaylistCover(f32, f32, f32),
+    ExportPlaylistCover,
+    DeletePlaylist,
     Search,
     Eq(usize, i32),
     Close,
@@ -309,8 +318,6 @@ pub enum Action {
 
     DeezerLogo,
 
-    ConnectSpotifyLyrics,
-    DisconnectSpotifyLyrics,
     StreamingQuality(usize),
     EqMode(bool),
     EqReset,
@@ -403,6 +410,7 @@ pub struct Scene {
     pub artwork_ahead: Vec<(i32, String)>,
     pub content_buttons: std::ops::Range<usize>,
     pub content_labels: std::ops::Range<usize>,
+    pub queue_labels: std::ops::Range<usize>,
     pub content_panels: std::ops::Range<usize>,
     pub content_pictures: std::ops::Range<usize>,
     pub content_top: i32,
@@ -411,7 +419,6 @@ pub struct Scene {
     pub panels: Vec<Panel>,
     pub search: Option<Rect>,
     pub session: Option<Rect>,
-    pub lyrics_session: Option<Rect>,
 
     pub track: Option<Rect>,
     pub name: Option<Rect>,
@@ -527,6 +534,9 @@ impl Scene {
     }
 }
 pub struct Ui {
+    pub playlist_draft: crate::playlist::Draft,
+    pub playlist_busy: bool,
+    pub playlist_track: Option<crate::catalog::Entry>,
     pub expanded_palettes: bool,
     pub expanded_themes: bool,
     pub expanded_podcast_description: Option<String>,
@@ -596,7 +606,6 @@ pub struct Ui {
     pub lyrics_size_panel: u32,
     pub lyrics_size_fullscreen: u32,
     pub lyrics_sources: u32,
-    pub spotify_lyrics_saved: bool,
 
     pub deezer_login_open: bool,
     pub deezer_login_advanced: bool,
@@ -642,6 +651,9 @@ pub struct Ui {
 impl Default for Ui {
     fn default() -> Self {
         Self {
+            playlist_draft: Default::default(),
+            playlist_busy: false,
+            playlist_track: None,
             expanded_palettes: false,
             expanded_themes: false,
             expanded_podcast_description: None,
@@ -711,7 +723,6 @@ impl Default for Ui {
             lyrics_size_panel: 100,
             lyrics_size_fullscreen: 100,
             lyrics_sources: crate::lyrics::DEFAULT_SOURCES,
-            spotify_lyrics_saved: crate::lyrics::spotify_connected(),
 
             deezer_login_open: false,
             deezer_login_advanced: false,
@@ -996,6 +1007,7 @@ impl Ui {
                 ui.lyrics_sources |= 1 << 7;
             }
         }
+        ui.lyrics_sources &= (1 << crate::lyrics::LYRIC_SOURCES.len()) - 1;
         ui.visualizer_style = value["VisualizerStyle"].as_u64().unwrap_or(0).min(2) as u8;
         ui.lyrics_visualizer = value["LyricsVisualizer"].as_bool().unwrap_or(true);
         ui.sidebar_collapsed = value["SidebarCollapsed"].as_bool().unwrap_or(false);
@@ -2122,10 +2134,8 @@ fn settings(scene: &mut Scene, ui: &Ui, x: i32, y: i32, w: i32, connected: bool,
                 let is_supported = (crate::lyrics::SUPPORTED_SOURCES & (1 << idx)) != 0;
                 let enabled = is_supported && (ui.lyrics_sources & (1 << idx)) != 0;
                 scene.panel(x, cy, w, 44, 8);
-                let label_text = if *source == "Spotify" && !ui.spotify_lyrics_saved {
-                    "Spotify (session required)".into()
-                } else if is_supported {
-                    source.to_string()
+                let label_text = if is_supported {
+                source.to_string()
                 } else {
                     format!("{source} (Unavailable)")
                 };
@@ -2148,58 +2158,7 @@ fn settings(scene: &mut Scene, ui: &Ui, x: i32, y: i32, w: i32, connected: bool,
                 }
                 cy += 50;
             }
-            cy += 12;
-            scene.label(x, cy, w, "Spotify lyrics", 9);
-            cy += 30;
-            let spotify_status = crate::lyrics::spotify_status().unwrap_or_else(|| {
-                if ui.spotify_lyrics_saved {
-                    "Protected session saved; connection not yet verified.".into()
-                } else {
-                    "Import a signed-in web-player token JSON. Cookie refresh may be rejected by Spotify. Lyrics only.".into()
-                }
-            });
-            for line in wrap_text(&spotify_status, w, 14) {
-                scene.label_sized(x, cy, w, 24, line, 1);
-                cy += 24;
-            }
-            cy += 10;
-            if w < 420 {
-                scene.lyrics_session = Some(Rect::new(x, cy, w, 32));
-                cy += 42;
-                let button_w = ((w - 12) / 2).max(1);
-                scene.button(
-                    Rect::new(x, cy, button_w, 32),
-                    "Save session",
-                    "",
-                    Action::ConnectSpotifyLyrics,
-                    false,
-                );
-                scene.button(
-                    Rect::new(x + button_w + 12, cy, button_w, 32),
-                    "Disconnect",
-                    "",
-                    Action::DisconnectSpotifyLyrics,
-                    false,
-                );
-            } else {
-                scene.lyrics_session = Some(Rect::new(x, cy, w - 230, 32));
-                scene.button(
-                    Rect::new(x + w - 218, cy, 100, 32),
-                    "Save session",
-                    "",
-                    Action::ConnectSpotifyLyrics,
-                    false,
-                );
-                scene.button(
-                    Rect::new(x + w - 106, cy, 100, 32),
-                    "Disconnect",
-                    "",
-                    Action::DisconnectSpotifyLyrics,
-                    false,
-                );
-            }
-            cy += 46;
-            scene.content_height = cy + 40 + ui.scroll;
+    scene.content_height = cy + 40 + ui.scroll;
         }
         4 => {
             // Playback + Equalizer at bottom
@@ -2568,29 +2527,42 @@ fn format_date(raw: &str) -> String {
     }
     trimmed.to_string()
 }
-fn queue_lines(entry: &crate::catalog::Entry, width: i32) -> Vec<String> {
-    let mut lines = wrap_text(&entry.title, width, 16);
-    lines.extend(wrap_text(&entry.subtitle, width, 16));
-    if let Some(name) = entry.raw["added_by"].as_str().filter(|s| !s.is_empty()) {
-        lines.extend(wrap_text(&format!("Added by {name}"), width, 16));
+fn queue_lines(entry: &crate::catalog::Entry, _width: i32) -> Vec<String> {
+    let mut metadata = entry.subtitle.clone();
+    if entry.duration > 0 {
+        let seconds = entry.duration / 1000;
+        metadata.push_str(&format!(" \u{2022} {}:{:02}", seconds / 60, seconds % 60));
     }
-    lines
+    if let Some(name) = entry.raw["added_by"].as_str().filter(|s| !s.is_empty()) {
+        metadata.push_str(&format!(" \u{2022} Added by {name}"));
+    }
+    vec![entry.title.clone(), metadata]
 }
-fn queue_text_width(entry: &crate::catalog::Entry, row_width: i32) -> i32 {
-    row_width - if entry.artwork.is_empty() { 24 } else { 72 }
+fn queue_text_width(_entry: &crate::catalog::Entry, row_width: i32) -> i32 {
+    (row_width - 96).max(1)
 }
 fn queue_button(s: &mut Scene, entry: &crate::catalog::Entry, index: usize, rect: Rect, current: bool) {
     let text_w = queue_text_width(entry, rect.w);
     s.button(rect, "", "", Action::QueueJump(index), current);
     if let Some(btn) = s.buttons.last_mut() {
-        btn.artwork = entry.artwork.clone();
         btn.accessible = format!("{}: {}", if current { "Now playing" } else { "Play next" }, queue_lines(entry, text_w).join(" "));
     }
-    for (line, text) in queue_lines(entry, text_w).into_iter().enumerate() {
-        s.label_sized(rect.x + rect.w - text_w - 12, rect.y + 8 + line as i32 * 24, text_w, 24, text, 1);
+    // Artwork has its own bounds: button artwork fills the entire button.
+    if !entry.artwork.is_empty() && rect.h >= 64 {
+        s.pictures.push((Rect::new(rect.x + 26, rect.y + 10, 44, 44), entry.artwork.clone()));
+    }
+    if rect.h >= 64 {
+        for (line, text) in queue_lines(entry, text_w).into_iter().enumerate() {
+            s.label_sized(rect.x + 82, rect.y + 10 + line as i32 * 24, text_w, 24, text, if line == 0 { 0 } else { 1 });
+        }
     }
 }
 fn build_queue_sidebar(s: &mut Scene, ui: &Ui, qx: i32, qw: i32, h: i32) {
+    let start = s.labels.len();
+    build_queue_sidebar_contents(s, ui, qx, qw, h);
+    s.queue_labels = start..s.labels.len();
+}
+fn build_queue_sidebar_contents(s: &mut Scene, ui: &Ui, qx: i32, qw: i32, h: i32) {
     let bottom = h - if ui.view == View::Lyrics { 12 } else { 96 };
     s.panel(qx, 10, qw, bottom - 20, 0);
     // Reserve action space first, then let the localized title use the rest.
@@ -2654,7 +2626,7 @@ fn build_queue_sidebar(s: &mut Scene, ui: &Ui, qx: i32, qw: i32, h: i32) {
     } else {
         ui.queue_index.min(items.len().saturating_sub(1))
     };
-    let current_h = queue_lines(items[cur].1, queue_text_width(items[cur].1, qw - 38)).len() as i32 * 24 + 20;
+    let current_h = 72;
     // Keep the current track pinned when it leaves room for upcoming tracks.
     // Oversized metadata joins the scroll area so every line remains reachable.
     let pinned = current_h + 150 < bottom - y;
@@ -2670,7 +2642,7 @@ fn build_queue_sidebar(s: &mut Scene, ui: &Ui, qx: i32, qw: i32, h: i32) {
     let viewport = Rect::new(qx + 12, y, qw - 24, (bottom - 18 - y).max(1));
     s.queue_viewport = Some(viewport);
     let upcoming: Vec<_> = items.iter().skip(cur + usize::from(pinned)).copied().collect();
-    let heights: Vec<_> = upcoming.iter().map(|(_, entry)| (queue_lines(entry, queue_text_width(entry, qw - 38)).len() as i32 + 2).max(3) * 24).collect();
+    let heights = vec![72; upcoming.len()];
     let total: i32 = heights.iter().sum();
     let max = ((total - viewport.h).max(0) + 23) / 24;
     let offset = ui.queue_scroll.min(max as usize) as i32;
@@ -2681,18 +2653,7 @@ fn build_queue_sidebar(s: &mut Scene, ui: &Ui, qx: i32, qw: i32, h: i32) {
         let end = (row_y + height - 6).min(viewport.y + viewport.h);
         if end > top {
             let rect = Rect::new(qx + 12, top, qw - 38, end - top);
-            s.button(rect, "", "", Action::QueueJump(*idx), *idx == items[cur].0);
-            let text_w = queue_text_width(entry, rect.w);
-            if let Some(btn) = s.buttons.last_mut() {
-                btn.accessible = queue_lines(entry, text_w).join(" ");
-                if top == row_y && end - top >= 44 { btn.artwork = entry.artwork.clone(); }
-            }
-            for (line, text) in queue_lines(entry, text_w).into_iter().enumerate() {
-                let ly = row_y + 8 + line as i32 * 24;
-                if ly >= viewport.y && ly + 24 <= viewport.y + viewport.h {
-                    s.label_sized(rect.x + rect.w - text_w - 12, ly, text_w, 24, text, 1);
-                }
-            }
+            queue_button(s, entry, *idx, rect, *idx == items[cur].0);
         }
         row_y += height;
     }
@@ -3515,6 +3476,7 @@ pub fn build(
                             | View::Favorites
                             | View::Albums
                             | View::Playlists
+            | View::PlaylistPicker
                             | View::Recent
                             | View::Album
                             | View::Artist
@@ -3631,7 +3593,7 @@ pub fn build(
                     Rect::new(ax, body_top - 54, 100, 36),
                     "Edit",
                     "\u{e70f}",
-                    Action::Go(View::PlaylistEdit),
+                    Action::EditPlaylist(entity.clone()),
                     false,
                 );
                 ax += 112;
@@ -3702,6 +3664,7 @@ pub fn build(
                     | View::Favorites
                     | View::Albums
                     | View::Playlists
+            | View::PlaylistPicker
                     | View::Recent
                     | View::Album
                     | View::Artist
@@ -3988,6 +3951,7 @@ pub fn build(
                 s.name = Some(Rect::new(x, top + 36, cw.min(540), 34));
                 s.label(x, top + 92, cw, "Description", 0);
                 s.description = Some(Rect::new(x, top + 128, cw.min(540), 84));
+            s.button(Rect::new(x + 190, top + 242, 150.min((cw - 190).max(1)), 38), "Clear description", "", Action::ClearPlaylistDescription, false);
                 s.button(
                     Rect::new(x, top + 242, 180, 38),
                     "Choose cover",
@@ -4002,27 +3966,45 @@ pub fn build(
                     Action::SavePlaylist,
                     true,
                 );
-                s.content_height = top + 380 + ui.scroll;
+                if !ui.playlist_draft.id.is_empty() {
+                s.button(Rect::new(x, top + 354, 160, 38), "Delete playlist", "", Action::DeletePlaylist, false);
+            }
+            if ui.playlist_busy {
+                s.label(x, top + 406, cw, "Saving playlist...", 1);
+                for button in &mut s.buttons {
+                    if matches!(button.action, Action::SavePlaylist | Action::DeletePlaylist | Action::ClearPlaylistDescription | Action::Go(View::CoverEdit)) { button.enabled = false; }
+                }
+            }
+            s.content_height = top + 470 + ui.scroll;
             }
             View::CoverEdit => {
-                s.label(x, top, cw, "Playlist cover", 3);
-                s.panel(x, top + 54, 240, 240, 2);
-                s.button(
-                    Rect::new(x, top + 320, 160, 38),
-                    "Choose image",
-                    "",
-                    Action::Notice("Playlist cover import is still being ported."),
-                    false,
-                );
-                s.button(
-                    Rect::new(x + 172, top + 320, 100, 38),
-                    "Back",
-                    "",
-                    Action::Back,
-                    false,
-                );
+            s.label(x, top, cw, "Playlist cover", 3);
+            let side = cw.min(240);
+            s.panel(x, top + 54, side, side, 2);
+            if !ui.playlist_draft.preview.is_empty() {
+                s.pictures.push((Rect::new(x, top + 54, side, side), ui.playlist_draft.preview.clone()));
             }
-            View::Downloads => {
+            let mut yy = top + 310;
+            for (label, action) in [
+                ("Choose image", Action::ChoosePlaylistCover),
+                ("Zoom in", Action::CropPlaylistCover(0.0, 0.0, 0.25)),
+                ("Zoom out", Action::CropPlaylistCover(0.0, 0.0, -0.25)),
+                ("Move left", Action::CropPlaylistCover(-0.1, 0.0, 0.0)),
+                ("Move right", Action::CropPlaylistCover(0.1, 0.0, 0.0)),
+                ("Move up", Action::CropPlaylistCover(0.0, -0.1, 0.0)),
+                ("Move down", Action::CropPlaylistCover(0.0, 0.1, 0.0)),
+                ("Export cropped cover", Action::ExportPlaylistCover),
+                ("Back to playlist", Action::Back),
+            ] {
+                s.button(Rect::new(x, yy, cw.min(240), 36), label, "", action, false);
+                if let Some(button) = s.buttons.last_mut() {
+                    button.enabled = !ui.playlist_busy && (matches!(button.action, Action::ChoosePlaylistCover | Action::Back) || ui.playlist_draft.image.is_some());
+                }
+                yy += 44;
+            }
+            s.content_height = yy + 40 + ui.scroll;
+        }
+        View::Downloads => {
                 if ui.downloads.is_empty() {
                     s.label(x, top, cw, "No downloads yet", 3);
                 }
@@ -4070,7 +4052,10 @@ pub fn build(
                     Action::Go(View::PlaylistEdit),
                     false,
                 );
+                if ui.now.kind == "track" && !ui.now.id.is_empty() {
+                s.button(Rect::new(x, top + 156, 240, 38), "Add to playlist", "+", Action::ChoosePlaylist(ui.now.clone()), false);
             }
+        }
             View::Storage => {
                 s.label(x, top, cw, "Data and cache location", 3);
                 let directory = crate::storage::data_dir().unwrap_or_default();
@@ -4219,7 +4204,6 @@ fn login_modal(s: &mut Scene, rect: Rect, title: &str, close: Action) {
     s.auth_modal = Some((rect, s.labels.len(), s.buttons.len()));
     s.search = None;
     s.session = None;
-    s.lyrics_session = None;
 
     s.track = None;
     s.name = None;
@@ -4725,7 +4709,7 @@ fn render_skeletons(
     let is_artist = entity_kind == Some("artist") || ui.view == View::Artist;
     let is_album = entity_kind == Some("album") || (entity.is_none() && ui.view == View::Album);
     let is_show = entity_kind == Some("podcast") || ui.view == View::Show;
-    let is_grid = matches!(ui.view, View::Albums | View::Playlists);
+    let is_grid = matches!(ui.view, View::Albums | View::Playlists | View::PlaylistPicker);
     let is_track_list = matches!(
         ui.view,
         View::Favorites | View::Recent | View::Offline | View::Flow
@@ -5440,18 +5424,20 @@ fn wrap_text(text: &str, width: i32, font: i32) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn queue_attribution_wraps_and_remains_reachable_in_small_windows() {
+    fn compact_queue_metadata_remains_reachable_in_small_windows() {
         let name = format!("Çağrı {} 日本語", "W".repeat(54));
         let mut ui = Ui { queue_sidebar_open: true, ..Default::default() };
-        ui.queue = (0..8).map(|i| crate::catalog::Entry {
+        ui.queue = (0..20).map(|i| crate::catalog::Entry {
             id: i.to_string(), title: "A long track title with several words".into(),
-            subtitle: "An artist with a long credit".into(),
+            subtitle: "An artist with a long credit".into(), artwork: "queue-cover".into(),
             raw: serde_json::json!({"added_by":name}), ..Default::default()
         }).collect();
         ui.now = ui.queue[0].clone();
         for size in [(800, 600), (1200, 800), (1600, 1000)] {
             let scene = build(&ui, size, true, false, "", false, 50);
             assert!(scene.queue_scroll_max > 0);
+            assert!(scene.buttons.iter().filter(|b| matches!(b.action, Action::QueueJump(_))).all(|b| b.artwork.is_empty() && b.rect.h <= 72));
+            assert!(scene.pictures.iter().any(|(r, url)| url == "queue-cover" && r.w == 44 && r.h == 44));
             let mut seen = String::new();
             for offset in 0..=scene.queue_scroll_max {
                 ui.queue_scroll = offset;
@@ -6334,6 +6320,21 @@ mod tests {
         );
     }
     #[test]
+    fn queue_labels_are_identical_on_regular_and_lyrics_pages() {
+        let mut ui = Ui { queue_sidebar_open: true, ..Default::default() };
+        ui.now = crate::catalog::Entry { id: "track".into(), title: "Prismatic".into(), subtitle: "Svdden Death".into(), ..Default::default() };
+        ui.queue = vec![ui.now.clone()];
+        let regular = build(&ui, (1200, 800), true, false, "", true, 50);
+        ui.view = View::Lyrics;
+        let lyrics = build(&ui, (1200, 800), true, false, "", true, 50);
+        let labels = |scene: &Scene| scene.labels[scene.queue_labels.clone()].iter()
+            .map(|label| (label.text.clone(), label.kind, label.rect.w, label.rect.h))
+            .collect::<Vec<_>>();
+        assert!(!regular.queue_labels.is_empty());
+        assert_eq!(labels(&regular), labels(&lyrics));
+        assert!(lyrics.labels[lyrics.queue_labels.clone()].iter().any(|label| label.text == "Prismatic"));
+    }
+    #[test]
     fn queue_sidebar_shows_now_playing_and_next_up_songs() {
         let mut ui = Ui::default();
         ui.queue_sidebar_open = true;
@@ -6883,7 +6884,6 @@ mod tests {
         let mut ui = Ui::default();
         ui.view = View::Settings;
         ui.tab = 3;
-        ui.spotify_lyrics_saved = true;
         ui.lyrics_sources = crate::lyrics::SUPPORTED_SOURCES;
         let scene = build(&ui, (1200, 800), true, false, "", false, 50);
 

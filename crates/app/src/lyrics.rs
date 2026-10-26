@@ -9,7 +9,6 @@ mod formats;
 pub(crate) mod http;
 #[path = "lyrics/kugou.rs"]
 mod kugou;
-pub use extras::{spotify_connected, spotify_disconnect, spotify_save, spotify_status};
 #[path = "lyrics/providers.rs"]
 mod providers;
 
@@ -29,7 +28,7 @@ pub struct LyricLine {
     pub translation: String,
 }
 
-pub const LYRIC_SOURCES: [&str; 11] = [
+pub const LYRIC_SOURCES: [&str; 10] = [
     "Deezer",
     "LRCLIB",
     "Musixmatch",
@@ -40,7 +39,6 @@ pub const LYRIC_SOURCES: [&str; 11] = [
     "KuGou",
     "Apple Music",
     "YouTube Music",
-    "Spotify",
 ];
 
 /// Fetches lyrics from enabled providers and picks the richest result:
@@ -61,7 +59,7 @@ pub fn fetch_best_lyrics(
     // Resolve independent providers concurrently; this stays off the UI/audio
     // threads and is bounded by the enabled provider slots.
     let results = std::thread::scope(|scope| {
-        let handles: Vec<_> = [0, 3, 8, 5, 7, 2, 10, 4, 1, 9]
+        let handles: Vec<_> = [0, 3, 8, 5, 7, 2, 4, 1, 9]
             .into_iter()
             .filter(|source| enabled_sources & (1 << source) != 0)
             .map(|source| {
@@ -150,11 +148,6 @@ impl LyricCache {
             .push_back((key, std::time::Instant::now(), value, bytes));
     }
 }
-pub fn clear_cache() {
-    let mut cache = lyric_cache().lock().unwrap();
-    cache.entries.clear();
-    cache.bytes = 0;
-}
 fn lyric_cache() -> &'static std::sync::Mutex<LyricCache> {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<LyricCache>> = std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(LyricCache::default()))
@@ -174,7 +167,6 @@ fn fetch_provider(
         5 => extras::petit(track),
         8 => extras::apple(track),
         9 => extras::youtube(track),
-        10 => extras::spotify(track),
         7 => kugou::fetch(track, &mut json_fetch),
         3 => providers::amll(track, &mut json_fetch),
         4 => providers::netease(track, &mut json_fetch),
@@ -220,7 +212,7 @@ fn fetch_sources(
     let mut best = (String::new(), Vec::new());
     let mut best_score = (0, 0, 0);
     let mut errors = Vec::new();
-    for source in [0, 3, 8, 5, 7, 2, 10, 4, 1, 9] {
+    for source in [0, 3, 8, 5, 7, 2, 4, 1, 9] {
         let name = LYRIC_SOURCES[source];
         if enabled_sources & (1 << source) == 0
             || (source == 0 && id.is_empty())
@@ -234,7 +226,7 @@ fn fetch_sources(
                     0 => parse_deezer_lyrics(&value),
                     7 => kugou::parse(value["krc"].as_str().unwrap_or_default()),
                     3 | 8 => formats::ttml(value["ttml"].as_str().unwrap_or_default()),
-                    2 | 5 | 9 | 10 if value["lines"].is_array() => extras::parse(&value),
+                    2 | 5 | 9 if value["lines"].is_array() => extras::parse(&value),
                     4 => {
                         let words = formats::yrc(
                             value
@@ -276,8 +268,8 @@ fn fetch_sources(
     Ok(best)
 }
 
-pub const SUPPORTED_SOURCES: u32 = 0x7bf;
-pub const DEFAULT_SOURCES: u32 = SUPPORTED_SOURCES & !(1 << 10);
+pub const SUPPORTED_SOURCES: u32 = 0x3bf;
+pub const DEFAULT_SOURCES: u32 = SUPPORTED_SOURCES;
 
 fn quality(lines: &[LyricLine]) -> (u8, usize, usize) {
     let word_lines = lines
@@ -982,7 +974,7 @@ mod tests {
                 _=>json!({"syncedLyrics":"[00:01]A\n[00:03]B\n[00:04]C"}),
             })
         }).unwrap();
-        assert_eq!(requested, [0, 3, 8, 5, 7, 2, 10, 4, 1, 9]);
+        assert_eq!(requested, [0, 3, 8, 5, 7, 2, 4, 1, 9]);
         assert_eq!(source, "NetEase");
         assert_eq!(lines.len(), 2);
         assert_eq!(score_lyrics(&lines), 3);

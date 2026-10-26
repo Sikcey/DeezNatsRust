@@ -28,6 +28,8 @@ mod deezer_webview;
 #[cfg(windows)]
 mod theme;
 #[cfg(windows)]
+mod playlist;
+#[cfg(windows)]
 mod ui;
 #[cfg(windows)]
 mod visualizer;

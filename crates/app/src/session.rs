@@ -94,7 +94,7 @@ fn read(path: PathBuf) -> Result<String, String> {
 }
 
 fn provider_path(name: &str) -> Result<PathBuf, String> {
-    if !matches!(name, "spotify" | "musixmatch") {
+    if !matches!(name, "musixmatch") {
         return Err("Unknown credential provider".into());
     }
     Ok(
@@ -112,9 +112,6 @@ pub fn provider_save(name: &str, value: &str) -> Result<(), String> {
             .ok_or("Invalid provider file")?,
         value,
     )
-}
-pub fn provider_exists(name: &str) -> bool {
-    provider_path(name).is_ok_and(|p| p.is_file())
 }
 pub fn provider_remove(name: &str) -> Result<(), String> {
     match std::fs::remove_file(provider_path(name)?) {

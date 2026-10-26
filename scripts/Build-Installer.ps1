@@ -32,7 +32,7 @@ try {
             Add-SourceFile $_.FullName ('DeezNatsRust/' + $_.FullName.Substring($project.Length + 1))
         }
     }
-    Get-ChildItem -LiteralPath $project -File | Where-Object { $_.Name -in @('README.md', 'NOTICE.md', 'CHANGELOG.md', 'CONTRIBUTING.md', 'SECURITY.md', 'THEMES.md', 'Cargo.toml', 'Cargo.lock', 'LICENSE', '.gitignore') } | ForEach-Object {
+    Get-ChildItem -LiteralPath $project -File | Where-Object { $_.Name -in @('README.md', 'NOTICE.md', 'SOURCE-AND-DEPENDENCIES.md', 'CHANGELOG.md', 'CONTRIBUTING.md', 'SECURITY.md', 'THEMES.md', 'Cargo.toml', 'Cargo.lock', 'LICENSE', '.gitignore') } | ForEach-Object {
         Add-SourceFile $_.FullName ('DeezNatsRust/' + $_.Name)
     }
     $engineSource = Join-Path $EngineRoot 'vendor/opendeezer'

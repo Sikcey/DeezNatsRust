@@ -37,7 +37,6 @@ const DESCRIPTION: i32 = 505;
 const SEEK: i32 = 506;
 const VOLUME: i32 = 507;
 const STATUS: i32 = 508;
-const LYRICS_SESSION: i32 = 509;
 
 const SEEK_STEPS: u32 = 10_000;
 const COLLAPSE_BUTTON: i32 = 900;
@@ -2144,7 +2143,6 @@ fn shift_scroll_content(scene: &mut Scene, delta: i32) {
     for rect in [
         &mut scene.eq_graph,
         &mut scene.eq_sliders,
-        &mut scene.lyrics_session,
     ]
     .into_iter()
     .flatten()
@@ -2221,7 +2219,6 @@ unsafe fn scroll_to(hwnd: HWND, app: &mut App, position: i32) {
     if settings {
         for (id, rect) in [
             (SESSION, app.scene.session),
-            (LYRICS_SESSION, app.scene.lyrics_session),
         ] {
             if id == SESSION && app.ui.tab != 1 {
                 continue;
@@ -2283,10 +2280,6 @@ unsafe fn rebuild(hwnd: HWND, app: &mut App) {
         }
     }
     let previous_anchor = app.scene.lyrics_anchor;
-    if let Some(control) = app.edits.get(&LYRICS_SESSION) {
-        let hint = { "Spotify sp_dc cookie or web token JSON (protected locally)" };
-        SendMessageW(*control, EM_SETCUEBANNER, 1, wide(hint).as_ptr() as isize);
-    }
     let previous_scroll = app.layout_scroll;
     app.layout_scroll = app.ui.scroll;
     let had_karaoke_preview = app.scene.karaoke_preview.is_some();
@@ -2422,7 +2415,6 @@ unsafe fn rebuild(hwnd: HWND, app: &mut App) {
     for (id, r) in [
         (SEARCH, app.scene.search),
         (SESSION, app.scene.session),
-        (LYRICS_SESSION, app.scene.lyrics_session),
         (TRACK, app.scene.track),
         (NAME, app.scene.name),
         (DESCRIPTION, app.scene.description),
@@ -2439,6 +2431,11 @@ unsafe fn rebuild(hwnd: HWND, app: &mut App) {
                         || (r.y >= app.scene.content_top && r.y + r.h <= content_bottom(app, h))
                 }),
             );
+        }
+    }
+    for id in [NAME, DESCRIPTION] {
+        if let Some(&control) = app.edits.get(&id) {
+            EnableWindow(control, (!(app.ui.view == View::PlaylistEdit && app.ui.playlist_busy)) as i32);
         }
     }
     let Some(&volume_control) = app.edits.get(&VOLUME) else {
@@ -2586,6 +2583,55 @@ unsafe fn login(hwnd: HWND, app: &mut App) {
     rebuild(hwnd, app);
 }
 
+unsafe fn capture_playlist_fields(app: &mut App) {
+    app.ui.playlist_draft.title = read(app.edits[&NAME]);
+    let description = read(app.edits[&DESCRIPTION]);
+    app.ui.playlist_draft.description_changed |= description != app.ui.playlist_draft.description;
+    app.ui.playlist_draft.description = description;
+}
+unsafe fn set_playlist_fields(app: &App) {
+    SetWindowTextW(app.edits[&NAME], wide(&app.ui.playlist_draft.title).as_ptr());
+    SetWindowTextW(app.edits[&DESCRIPTION], wide(&app.ui.playlist_draft.description).as_ptr());
+}
+unsafe fn submit_playlist(app: &mut App, mutation: crate::playlist::Mutation) {
+    if app.ui.playlist_busy { app.notice = "A playlist update is still in progress".into(); return; }
+    let Some(engine) = app.snapshot.engine.clone().filter(|_| app.snapshot.connected) else {
+        app.notice = "Connect Deezer first".into(); return;
+    };
+    if let crate::playlist::Mutation::Save { title, .. } = &mutation {
+        if title.trim().is_empty() { app.notice = "Enter a playlist name".into(); return; }
+    }
+    let request = crate::catalog::Request { generation: app.generation, engine, job: crate::catalog::Job::Playlist(mutation) };
+    if app.catalog.requests.send(request).is_ok() {
+        app.ui.playlist_busy = true; app.notice = "Updating playlist...".into();
+    } else { app.notice = "Catalog worker is unavailable".into(); }
+}
+fn update_playlist_preview(app: &mut App) {
+    match app.ui.playlist_draft.jpeg().and_then(|bytes| crate::catalog::decode(&bytes, 500)) {
+        Ok(bitmap) => {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let key = format!("playlist-cover:{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+            if app.ui.playlist_draft.preview.starts_with("playlist-cover:") { app.images.remove(&app.ui.playlist_draft.preview); }
+            app.images.insert(key.clone(), Arc::new(bitmap));
+            app.ui.playlist_draft.preview = key;
+            app.notice = "Cover ready. Save the playlist to upload it.".into();
+        }
+        Err(e) => app.notice = e,
+    }
+}
+unsafe fn playlist_export_path(hwnd: HWND) -> Option<PathBuf> {
+    let mut path = vec![0u16; 32768];
+    let name = wide("playlist-cover.jpg"); path[..name.len()].copy_from_slice(&name);
+    let filter = wide("JPEG image\0*.jpg\0"); let extension = wide("jpg");
+    let mut dialog: OPENFILENAMEW = zeroed();
+    dialog.lStructSize = size_of::<OPENFILENAMEW>() as u32; dialog.hwndOwner = hwnd;
+    dialog.lpstrFilter = filter.as_ptr(); dialog.lpstrDefExt = extension.as_ptr();
+    dialog.lpstrFile = path.as_mut_ptr(); dialog.nMaxFile = path.len() as u32;
+    dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if GetSaveFileNameW(&mut dialog) == 0 { return None; }
+    Some(PathBuf::from(String::from_utf16_lossy(&path[..path.iter().position(|v| *v == 0).unwrap_or(0)])))
+}
+
 unsafe fn data_request(app: &mut App, job: crate::catalog::Job) {
     if let Some(engine) = app.snapshot.engine.clone() {
         let lyrics = matches!(
@@ -2670,6 +2716,7 @@ unsafe fn load_page(app: &mut App) {
             | View::Favorites
             | View::Albums
             | View::Playlists
+            | View::PlaylistPicker
             | View::Recent
             | View::Queue
             | View::Album
@@ -2905,6 +2952,41 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
     }
     while let Ok(event) = app.catalog.updates.try_recv() {
         match event {
+            crate::catalog::Event::Playlist(mutation, result) => {
+                app.ui.playlist_busy = false;
+                if let crate::playlist::Mutation::Save { id, seed, .. } = &mutation {
+                    app.ui.playlist_draft.id = id.clone();
+                    if seed.is_none() { app.ui.playlist_draft.seed = None; }
+                }
+                app.page_cache.clear();
+                app.catalog.session.invalidate();
+                app.library_loaded = false;
+                match result {
+                    Ok(outcome) => {
+                        if matches!(mutation, crate::playlist::Mutation::Save { .. }) { app.ui.playlist_draft.image = None; }
+                        if matches!(mutation, crate::playlist::Mutation::Save { .. }) && matches!(app.ui.view, View::PlaylistEdit | View::CoverEdit) {
+                            let entry = crate::catalog::Entry {
+                                id: outcome.id, kind: "playlist".into(), title: app.ui.playlist_draft.title.clone(),
+                                artwork: app.ui.playlist_draft.preview.clone(), raw: serde_json::json!({"description":app.ui.playlist_draft.description}), ..Default::default()
+                            };
+                            navigate(app, View::Album, Some(entry), String::new());
+                            load_page(app);
+                        } else if matches!(mutation, crate::playlist::Mutation::Add(..)) && app.ui.view == View::PlaylistPicker {
+                            let entry = app.ui.page.as_ref().and_then(|p| p.rows.iter().find(|e| e.id == outcome.id)).cloned()
+                                .unwrap_or(crate::catalog::Entry { id: outcome.id.clone(), kind: "playlist".into(), title: "Playlist".into(), ..Default::default() });
+                            app.ui.playlist_track = None;
+                            navigate(app, View::Album, Some(entry), String::new()); load_page(app);
+                        } else if outcome.deleted && (app.entity.as_ref().is_some_and(|e| e.id == outcome.id) || matches!(app.ui.view, View::PlaylistEdit | View::CoverEdit)) {
+                            navigate(app, View::Playlists, None, String::new()); load_page(app);
+                        } else if matches!(app.ui.view, View::Album | View::Playlists | View::PlaylistPicker) {
+                            load_page(app);
+                        }
+                        app.notice = if outcome.deleted { "Playlist deleted" } else { "Playlist updated" }.into();
+                    }
+                    Err(error) => app.notice = error,
+                }
+                dirty = true;
+            }
             crate::catalog::Event::Page(generation, page) if generation == app.generation => {
                 if page.error.is_empty() {
                     let key = page_key(app);
@@ -3925,6 +4007,13 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
             data_request(app, crate::catalog::Job::Api(name.into(), args));
             app.notice = "Loading from Deezer...".into();
         }
+        Action::OpenItem(item) if app.ui.view == View::PlaylistPicker => {
+            if item.kind == "playlist" {
+                if let Some(track) = app.ui.playlist_track.clone() {
+                    submit_playlist(app, crate::playlist::Mutation::Add(item.id, track.id));
+                }
+            }
+        }
         Action::OpenItem(item) => {
             if item.playable() {
                 let mut items = Vec::new();
@@ -4100,7 +4189,71 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
             app.ui.deezer_login_open = true;
             app.ui.deezer_login_advanced = false;
         }
+        Action::EditPlaylist(item) => {
+            if app.ui.playlist_busy { app.notice = "Wait for the playlist update to finish".into(); }
+            else {
+                app.ui.playlist_draft = crate::playlist::Draft::from_entry(Some(&item));
+                navigate(app, View::PlaylistEdit, None, String::new());
+                set_playlist_fields(app);
+            }
+        }
+        Action::ChoosePlaylist(track) => {
+            app.ui.playlist_track = Some(track);
+            navigate(app, View::PlaylistPicker, None, String::new());
+            load_page(app);
+        }
+        Action::ClearPlaylistDescription => {
+            if !app.ui.playlist_busy {
+                app.ui.playlist_draft.description.clear();
+                app.ui.playlist_draft.description_changed = true;
+                SetWindowTextW(app.edits[&DESCRIPTION], wide("").as_ptr());
+            }
+        }
+        Action::ChoosePlaylistCover => {
+            if !app.ui.playlist_busy {
+                if let Some(path) = open_image(hwnd) {
+                    match app.ui.playlist_draft.choose(&path) {
+                        Ok(()) => update_playlist_preview(app),
+                        Err(error) => app.notice = error,
+                    }
+                }
+            }
+        }
+        Action::CropPlaylistCover(x, y, zoom) => {
+            if !app.ui.playlist_busy {
+                let draft = &mut app.ui.playlist_draft;
+                draft.x = (draft.x + x).clamp(0.0, 1.0);
+                draft.y = (draft.y + y).clamp(0.0, 1.0);
+                draft.zoom = (draft.zoom + zoom).clamp(1.0, 4.0);
+                update_playlist_preview(app);
+            }
+        }
+        Action::ExportPlaylistCover => {
+            match app.ui.playlist_draft.jpeg() {
+                Ok(bytes) => {
+                    if let Some(path) = playlist_export_path(hwnd) {
+                        app.notice = match std::fs::write(path, bytes) {
+                            Ok(()) => "Cover exported".into(), Err(e) => e.to_string(),
+                        };
+                    }
+                }
+                Err(e) => app.notice = e,
+            }
+        }
+        Action::DeletePlaylist => {
+            let id = app.ui.playlist_draft.id.clone();
+            if !id.is_empty() && !app.ui.playlist_busy && MessageBoxW(hwnd, wide("Delete this playlist from Deezer? This cannot be undone.").as_ptr(), wide("Delete playlist").as_ptr(), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES {
+                submit_playlist(app, crate::playlist::Mutation::Delete(id));
+            }
+        }
         Action::Go(view) => {
+            if matches!(view, View::PlaylistEdit | View::CoverEdit) && app.ui.playlist_busy { return; }
+            if view == View::PlaylistEdit {
+                app.ui.playlist_draft = crate::playlist::Draft::from_entry(None);
+                set_playlist_fields(app);
+            }
+            if view == View::CoverEdit { capture_playlist_fields(app); }
+
             let view = if view == View::Account {
                 View::Settings
             } else {
@@ -4428,20 +4581,17 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
         }
         Action::Notice(message) => app.notice = message.into(),
         Action::SavePlaylist => {
-            app.page_cache.clear();
-            let name = read(app.edits[&NAME]);
-            if name.trim().is_empty() {
-                app.notice = "Enter a playlist name.".into();
-            } else {
-                data_request(
-                    app,
-                    crate::catalog::Job::Api(
-                        "DZCreatePlaylist".into(),
-                        vec![serde_json::json!(name)],
-                    ),
-                );
-                app.notice = "Creating playlist...".into();
-            }
+            if app.ui.playlist_busy { return; }
+            capture_playlist_fields(app);
+            let draft = &app.ui.playlist_draft;
+            let cover = if draft.image.is_some() {
+                match draft.jpeg() { Ok(bytes) => Some(bytes), Err(e) => { app.notice = e; rebuild(hwnd, app); return; } }
+            } else { None };
+            let mutation = crate::playlist::Mutation::Save {
+                id: draft.id.clone(), title: draft.title.clone(), description: (draft.id.is_empty() || draft.description_changed).then(|| draft.description.clone()), cover,
+                seed: draft.seed.as_ref().map(|e| e.id.clone()),
+            };
+            submit_playlist(app, mutation);
         }
         Action::Search => {
             let query = read(app.edits[&SEARCH]);
@@ -4755,37 +4905,6 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
             app.ui.lyrics_fullscreen = !app.ui.lyrics_fullscreen;
             rebuild(hwnd, app);
         }
-        Action::ConnectSpotifyLyrics => {
-            let mut input = read(app.edits[&LYRICS_SESSION]);
-            let result = crate::lyrics::spotify_save(&input);
-            // Clear the native editor immediately; credentials never enter UI preferences.
-            SetWindowTextW(app.edits[&LYRICS_SESSION], wide("").as_ptr());
-            unsafe {
-                input.as_bytes_mut().fill(0);
-            }
-            match result {
-                Ok(()) => {
-                    app.ui.spotify_lyrics_saved = true;
-                    app.ui.lyrics_sources |= 1 << 10;
-                    app.ui.save_preferences();
-                    crate::lyrics::clear_cache();
-                    app.lyrics_id.clear();
-                    app.notice = "Spotify session saved; the next lookup will validate it.".into();
-                }
-                Err(error) => app.notice = error,
-            }
-        }
-        Action::DisconnectSpotifyLyrics => match crate::lyrics::spotify_disconnect() {
-            Ok(()) => {
-                app.ui.spotify_lyrics_saved = false;
-                app.ui.lyrics_sources &= !(1 << 10);
-                app.ui.save_preferences();
-                crate::lyrics::clear_cache();
-                app.lyrics_id.clear();
-                app.notice = "Spotify lyrics disconnected".into();
-            }
-            Err(error) => app.notice = error,
-        },
         Action::ToggleLyricSource(idx) => {
             if (crate::lyrics::SUPPORTED_SOURCES & (1 << idx)) == 0 {
                 return;
@@ -4910,7 +5029,7 @@ unsafe fn paint(hwnd: HWND, app: &App) {
     let saved = SaveDC(dc);
     // Leave active text editors to Windows so repainting the player cannot erase
     // the caret, IME composition, text selection, or partially typed queries.
-    for id in [SEARCH, SESSION, TRACK, NAME, DESCRIPTION, LYRICS_SESSION] {
+    for id in [SEARCH, SESSION, TRACK, NAME, DESCRIPTION] {
         if let Some(control) = app.edits.get(&id) {
             if IsWindowVisible(*control) != 0 {
                 let mut rect: RECT = zeroed();
@@ -6170,7 +6289,7 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
                 };
                 IntersectClipRect(memory, left_c, top_c, right_c, bottom_c);
             }
-            let font = if app.ui.view == View::Lyrics {
+            let font = if app.ui.view == View::Lyrics && !app.scene.queue_labels.contains(&index) {
                 if let Some((_, _, f_act, f_inact, f_plain)) = app.lyrics_fonts {
                     match label.kind {
                         13 | 14 | 15 => f_act,
@@ -7434,7 +7553,21 @@ unsafe fn draw_button(app: &App, draw: &DRAWITEMSTRUCT) {
             crate::drawing::stroke(draw.hDC, r, argb(accent, 210), radius, 1.5);
             return;
         }
-        let has_art = app.images.get(&node.artwork);
+        // Queue grip is geometry rather than a font glyph, so every Windows font works.
+    if matches!(node.action, Action::QueueJump(_)) && node.rect.h >= 64 {
+        for column in 0..2 {
+            for row in 0..3 {
+                let dot = app.rect(Rect::new(
+                    node.rect.x + 8 + column * 5,
+                    node.rect.y + 23 + row * 6,
+                    2,
+                    2,
+                ));
+                crate::drawing::fill(draw.hDC, dot, argb(palette[5], 230), app.px(1) as f32);
+            }
+        }
+    }
+    let has_art = app.images.get(&node.artwork);
         if let Some(image) = has_art {
             faded_bitmap(draw.hDC, r, image, r.right - r.left, 255);
         } else {
@@ -7770,7 +7903,8 @@ unsafe fn show_context_menu(hwnd: HWND, app: &mut App, pt: POINT) {
         );
         if item.kind == "track" {
             let sub = CreatePopupMenu();
-            AppendMenuW(sub, MF_STRING, 10, wide(app.ui.t("New playlist")).as_ptr());
+            AppendMenuW(sub, MF_STRING, 13, wide(app.ui.t("New playlist")).as_ptr());
+            AppendMenuW(sub, MF_STRING, 10, wide(app.ui.t("Choose playlist")).as_ptr());
             AppendMenuW(
                 menu,
                 MF_POPUP,
@@ -7785,6 +7919,12 @@ unsafe fn show_context_menu(hwnd: HWND, app: &mut App, pt: POINT) {
             AppendMenuW(menu, MF_STRING, 9, wide(app.ui.t("Share")).as_ptr());
         }
 
+        if item.kind == "playlist" {
+            AppendMenuW(menu, MF_STRING, 11, wide(app.ui.t("Edit playlist")).as_ptr());
+        }
+        if item.kind == "track" && app.entity.as_ref().is_some_and(|e| e.kind == "playlist") {
+            AppendMenuW(menu, MF_STRING, 14, wide(app.ui.t("Remove from playlist")).as_ptr());
+        }
         let mut screen_pt = pt;
         content_to_screen(hwnd, &mut screen_pt);
         let sel = TrackPopupMenu(
@@ -7863,8 +8003,18 @@ unsafe fn show_context_menu(hwnd: HWND, app: &mut App, pt: POINT) {
                 }
                 rebuild(hwnd, app);
             }
-            10 => {
+            10 => activate(hwnd, app, Action::ChoosePlaylist(item.clone())),
+            11 => activate(hwnd, app, Action::EditPlaylist(item.clone())),
+            13 => {
+                if app.ui.playlist_busy { return; }
                 activate(hwnd, app, Action::Go(View::PlaylistEdit));
+                app.ui.playlist_draft.seed = Some(item.clone());
+            }
+            14 => {
+                if let Some(playlist) = app.entity.as_ref().filter(|e| e.kind == "playlist") {
+                    let mutation = crate::playlist::Mutation::Remove(playlist.id.clone(), item.id.clone());
+                    submit_playlist(app, mutation);
+                }
             }
             _ => {}
         }
@@ -7900,9 +8050,9 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                 &round as *const _ as _,
                 4,
             );
-            for id in [SEARCH, SESSION, TRACK, NAME, DESCRIPTION, LYRICS_SESSION] {
+            for id in [SEARCH, SESSION, TRACK, NAME, DESCRIPTION] {
                 let style = ES_AUTOHSCROLL as u32
-                    | if matches!(id, SESSION | LYRICS_SESSION) {
+                    | if matches!(id, SESSION) {
                         ES_PASSWORD as u32
                     } else if id == DESCRIPTION {
                         ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32
@@ -7918,10 +8068,6 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                     "Search songs, artists, albums, playlists or podcasts...",
                 ),
                 (SESSION, "Paste ARL, or leave empty to use saved session"),
-                (
-                    LYRICS_SESSION,
-                    "Spotify sp_dc cookie or web token JSON (protected locally)",
-                ),
                 (TRACK, "Deezer track ID"),
                 (NAME, "Playlist name"),
             ] {
@@ -9252,11 +9398,7 @@ pub fn run() -> Result<(), String> {
                 let focused = windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus();
                 let id = GetDlgCtrlID(focused);
 
-                if id == LYRICS_SESSION && app.ui.view == View::Settings && app.ui.tab == 3 {
-                    activate(hwnd, &mut app, Action::ConnectSpotifyLyrics);
-                    continue;
-                }
-                if matches!(id, SESSION | LYRICS_SESSION) {
+                if id == SESSION {
                     login(hwnd, &mut app);
                     continue;
                 }
@@ -9711,7 +9853,6 @@ mod behavior_tests {
                 assert!(translated == expected);
             }
             assert!(scene.eq_graph == fresh.eq_graph && scene.eq_sliders == fresh.eq_sliders);
-            assert!(scene.lyrics_session == fresh.lyrics_session);
             assert!(scene
                 .buttons
                 .iter()

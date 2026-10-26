@@ -4,7 +4,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Default)]
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
 struct Location {
     active: Option<PathBuf>,
     pending: Option<PathBuf>,
@@ -20,32 +21,38 @@ fn manifest(base: &Path) -> PathBuf {
     base.join("DeezNatsRust/storage-location.json")
 }
 fn read(base: &Path) -> Result<Location, String> {
-    match fs::read(manifest(base)) {
-        Ok(bytes) => {
-            let value: serde_json::Value = serde_json::from_slice(&bytes)
-                .map_err(|e| format!("Invalid storage location: {e}"))?;
-            let path = |key: &str| value[key].as_str().map(PathBuf::from);
-            Ok(Location {
-                active: path("active"),
-                pending: path("pending"),
-                downloads: path("downloads"),
-            })
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Location::default()),
-        Err(e) => Err(e.to_string()),
-    }
+    let primary = manifest(base);
+    let backup = primary.with_extension("json.bak");
+    let bytes = match fs::read(&primary) {
+        Ok(bytes) if serde_json::from_slice::<Location>(&bytes).is_ok() => Ok(bytes),
+        Ok(_) => fs::read(&backup).map_err(|e| format!("Invalid storage location; backup unavailable: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match fs::read(&backup) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Location::default()),
+            result => result.map_err(|e| e.to_string()),
+        },
+        Err(e) => return Err(e.to_string()),
+    }?;
+    serde_json::from_slice(&bytes).map_err(|e| format!("Invalid storage location: {e}"))
 }
 fn write(base: &Path, location: &Location) -> Result<(), String> {
     fs::create_dir_all(base.join("DeezNatsRust")).map_err(|e| e.to_string())?;
     let path = manifest(base);
     let temporary = path.with_extension("json.tmp");
     fs::write(&temporary, serde_json::to_vec(&serde_json::json!({"active":location.active,"pending":location.pending,"downloads":location.downloads})).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    fs::rename(temporary, path).map_err(|e| e.to_string())
+    fs::rename(temporary, &path).map_err(|e| e.to_string())?;
+    let backup = path.with_extension("json.bak");
+    let backup_temporary = path.with_extension("json.bak.tmp");
+    fs::copy(&path, &backup_temporary).map_err(|e| e.to_string())?;
+    fs::rename(backup_temporary, backup).map_err(|e| e.to_string())
 }
 pub fn data_dir_at(base: &Path) -> Result<PathBuf, String> {
-    Ok(read(base)?
-        .active
-        .unwrap_or_else(|| base.join("DeezNatsRust")))
+    match read(base)?.active {
+        Some(path) if !path.is_absolute() || !path.is_dir() => Err(format!(
+            "The configured data folder is unavailable: {}. Reconnect its drive and try again.", path.display()
+        )),
+        Some(path) => Ok(path),
+        None => Ok(base.join("DeezNatsRust")),
+    }
 }
 pub fn data_dir() -> Result<PathBuf, String> {
     data_dir_at(&base()?)
@@ -129,6 +136,9 @@ fn initialize_at(base: &Path) -> Result<(), String> {
                 "The configured data folder is unavailable. Reconnect its drive and try again."
                     .into(),
             );
+        }
+        if location.active.is_some() {
+            write(base, &location)?;
         }
         return Ok(());
     };
@@ -227,6 +237,8 @@ fn copy_tree(
         if source == root
             && (name == "storage-location.json"
                 || name == "storage-location.json.tmp"
+                || name == "storage-location.json.bak"
+                || name == "storage-location.json.bak.tmp"
                 || name == ".deeznats-migration.json" || name == "page-cache")
         {
             continue;
@@ -286,6 +298,47 @@ fn copy_tree(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn relocated_data_is_found_after_primary_pointer_is_lost_or_corrupted() {
+        let base = fixture();
+        let target = base.join("external/data");
+        fs::create_dir_all(&target).unwrap();
+        write(&base, &Location { active: Some(target.clone()), ..Default::default() }).unwrap();
+        fs::remove_file(manifest(&base)).unwrap();
+        assert_eq!(data_dir_at(&base).unwrap(), target);
+        initialize_at(&base).unwrap();
+        assert!(manifest(&base).is_file());
+        fs::write(manifest(&base), b"broken JSON").unwrap();
+        assert_eq!(data_dir_at(&base).unwrap(), target);
+        initialize_at(&base).unwrap();
+        assert_eq!(data_dir_at(&base).unwrap(), target);
+        fs::write(manifest(&base), br#"{"active":42}"#).unwrap();
+        assert_eq!(data_dir_at(&base).unwrap(), target);
+        fs::remove_dir_all(base).unwrap();
+    }
+    #[test]
+    fn existing_redirect_gains_a_backup_on_upgrade() {
+        let base = fixture();
+        let target = base.join("external/data");
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(manifest(&base).parent().unwrap()).unwrap();
+        fs::write(manifest(&base), serde_json::to_vec(&serde_json::json!({"active":target})).unwrap()).unwrap();
+        initialize_at(&base).unwrap();
+        fs::remove_file(manifest(&base)).unwrap();
+        assert_eq!(data_dir_at(&base).unwrap(), target);
+        fs::remove_dir_all(base).unwrap();
+    }
+    #[test]
+    fn unavailable_relocated_data_does_not_fall_back_to_an_empty_profile() {
+        let base = fixture();
+        let target = base.join("disconnected-drive/data");
+        write(&base, &Location { active: Some(target.clone()), ..Default::default() }).unwrap();
+        assert!(data_dir_at(&base).is_err());
+        assert!(initialize_at(&base).is_err());
+        assert!(!target.exists());
+        assert_eq!(read(&base).unwrap().active, Some(target));
+        fs::remove_dir_all(base).unwrap();
+    }
     fn fixture() -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "deeznats-storage-{}-{:?}",

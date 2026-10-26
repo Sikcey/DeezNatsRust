@@ -40,6 +40,10 @@ See [building and testing](docs/BUILDING.md) for engine and installer instructio
 ## Data and compatibility
 
 Settings and session data live in `%LOCALAPPDATA%\DeezNatsRust`.
+After moving data in Settings, this AppData folder retains `storage-location.json`
+and its `.bak` recovery copy. Installed and standalone builds use this shared
+pointer automatically; upgrades and uninstalling preserve it and your data.
+If the destination drive is disconnected, reconnect it before starting the app.
 The application can read a current-user legacy DeezNats session or a profile
 selected with `DEEZNATS_PROFILE`. Profiles and downloaded media are not included
 in this repository. Importing the official Deezer application's encrypted offline

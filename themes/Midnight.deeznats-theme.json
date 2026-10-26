@@ -1,0 +1,38 @@
+{
+  "format": "deeznats-theme",
+  "version": 1,
+  "name": "Midnight",
+  "light": false,
+  "background": {
+    "mode": "solid",
+    "blur": 70,
+    "tint_opacity": 60,
+    "tint": "#E8EDF6",
+    "color": "#10131D",
+    "brightness": 96
+  },
+  "colors": {
+    "dark": {
+      "Background": "#10131D",
+      "Panel": "#171C2A",
+      "Raised": "#252C40",
+      "Border": "#39425A",
+      "Text": "#F2F4FB",
+      "Muted": "#A9B3CC",
+      "Icon": "#F2F4FB",
+      "Accent": "#B59AFF",
+      "GradientStart": "#9D7CFF",
+      "GradientEnd": "#65469C"
+    },
+    "light": {}
+  },
+  "corners": 2,
+  "solid_theme": 0,
+  "window_blur": true,
+  "ui_blur": true,
+  "player": {
+    "layout": 0,
+    "transparent": false,
+    "opacity": 92
+  }
+}

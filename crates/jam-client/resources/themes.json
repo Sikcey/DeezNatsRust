@@ -1,0 +1,315 @@
+{
+  "themes": [
+    {
+      "id": 0,
+      "name": "System",
+      "light": false,
+      "palette": {
+        "Background": "#171717",
+        "Panel": "#231f1f",
+        "Raised": "#342d2d",
+        "Border": "#473e3e",
+        "Text": "#f8f8f8",
+        "Accent": "#db54b9",
+        "Muted": "#aaaabb",
+        "AccentText": "#ffffff",
+        "GradientStart": "#db54b9",
+        "GradientEnd": "#171717"
+      }
+    },
+    {
+      "id": 1,
+      "name": "Dark",
+      "light": false,
+      "palette": {
+        "Background": "#141212",
+        "Panel": "#1e1a1a",
+        "Raised": "#2c2626",
+        "Border": "#423838",
+        "Text": "#f7f5f5",
+        "Accent": "#9f397c",
+        "Muted": "#aaaabb",
+        "AccentText": "#ffffff",
+        "GradientStart": "#9f397c",
+        "GradientEnd": "#141212"
+      }
+    },
+    {
+      "id": 2,
+      "name": "OLED",
+      "light": false,
+      "palette": {
+        "Background": "#000000",
+        "Panel": "#0c0c0c",
+        "Raised": "#181818",
+        "Border": "#242424",
+        "Text": "#f8f8f8",
+        "Accent": "#db54b9",
+        "Muted": "#aaaabb",
+        "AccentText": "#ffffff",
+        "GradientStart": "#db54b9",
+        "GradientEnd": "#000000"
+      }
+    },
+    {
+      "id": 3,
+      "name": "Catppuccin Frappé",
+      "light": false,
+      "palette": {
+        "Background": "#303446",
+        "Panel": "#292c3d",
+        "Raised": "#414559",
+        "Border": "#565b73",
+        "Text": "#c6d0f5",
+        "Accent": "#c69ee6",
+        "Muted": "#aaaabb",
+        "AccentText": "#ffffff",
+        "GradientStart": "#c69ee6",
+        "GradientEnd": "#303446"
+      }
+    },
+    {
+      "id": 4,
+      "name": "Rose Pine",
+      "light": false,
+      "palette": {
+        "Background": "#191724",
+        "Panel": "#1f1d2e",
+        "Raised": "#2a263d",
+        "Border": "#403b52",
+        "Text": "#e0def4",
+        "Accent": "#eb6fb7",
+        "Muted": "#aaaabb",
+        "AccentText": "#ffffff",
+        "GradientStart": "#eb6fb7",
+        "GradientEnd": "#191724"
+      }
+    },
+    {
+      "id": 5,
+      "name": "Nord",
+      "light": false,
+      "palette": {
+        "Background": "#2e3440",
+        "Panel": "#3b4252",
+        "Raised": "#4b5366",
+        "Border": "#5b647a",
+        "Text": "#eceff4",
+        "Accent": "#88c0d0",
+        "Muted": "#aaaabb",
+        "AccentText": "#ffffff",
+        "GradientStart": "#88c0d0",
+        "GradientEnd": "#2e3440"
+      }
+    },
+    {
+      "id": 6,
+      "name": "Dracula",
+      "light": false,
+      "palette": {
+        "Background": "#282a36",
+        "Panel": "#1f212a",
+        "Raised": "#44475a",
+        "Border": "#575b74",
+        "Text": "#f8f8f2",
+        "Accent": "#ff79c6",
+        "Muted": "#aaaabb",
+        "AccentText": "#ffffff",
+        "GradientStart": "#ff79c6",
+        "GradientEnd": "#282a36"
+      }
+    },
+    {
+      "id": 7,
+      "name": "Gruvbox",
+      "light": false,
+      "palette": {
+        "Background": "#282828",
+        "Panel": "#3c3836",
+        "Raised": "#504945",
+        "Border": "#6b625c",
+        "Text": "#ebdbb2",
+        "Accent": "#d79b2f",
+        "Muted": "#aaaabb",
+        "AccentText": "#ffffff",
+        "GradientStart": "#d79b2f",
+        "GradientEnd": "#282828"
+      }
+    },
+    {
+      "id": 8,
+      "name": "Tokyo Night",
+      "light": false,
+      "palette": {
+        "Background": "#1a1b26",
+        "Panel": "#24283b",
+        "Raised": "#2f354d",
+        "Border": "#414a6b",
+        "Text": "#c0caf5",
+        "Accent": "#7aa2f7",
+        "Muted": "#aaaabb",
+        "AccentText": "#ffffff",
+        "GradientStart": "#7aa2f7",
+        "GradientEnd": "#1a1b26"
+      }
+    },
+    {
+      "id": 9,
+      "name": "Emerald Forest",
+      "light": false,
+      "palette": {
+        "Background": "#0f1914",
+        "Panel": "#16241d",
+        "Raised": "#20352a",
+        "Border": "#2f4d3d",
+        "Text": "#e8f5ec",
+        "Accent": "#2ecc71",
+        "Muted": "#aaaabb",
+        "AccentText": "#ffffff",
+        "GradientStart": "#2ecc71",
+        "GradientEnd": "#0f1914"
+      }
+    },
+    {
+      "id": 10,
+      "name": "Solar Amber",
+      "light": false,
+      "palette": {
+        "Background": "#181310",
+        "Panel": "#241d17",
+        "Raised": "#332921",
+        "Border": "#4e3f33",
+        "Text": "#fdf4eb",
+        "Accent": "#f39c12",
+        "Muted": "#aaaabb",
+        "AccentText": "#ffffff",
+        "GradientStart": "#f39c12",
+        "GradientEnd": "#181310"
+      }
+    },
+    {
+      "id": 11,
+      "name": "Blood Moon",
+      "light": false,
+      "palette": {
+        "Background": "#180f16",
+        "Panel": "#241621",
+        "Raised": "#341f30",
+        "Border": "#4d2e47",
+        "Text": "#f5ebfa",
+        "Accent": "#d82448",
+        "Muted": "#aaaabb",
+        "AccentText": "#ffffff",
+        "GradientStart": "#d82448",
+        "GradientEnd": "#180f16"
+      }
+    },
+    {
+      "id": 12,
+      "name": "Porcelain",
+      "light": true,
+      "palette": {
+        "Background": "#f2f4f8",
+        "Panel": "#ffffff",
+        "Raised": "#e3e7f0",
+        "Border": "#bfc6d4",
+        "Text": "#181c26",
+        "Accent": "#5445d6",
+        "Muted": "#aaaabb",
+        "AccentText": "#ffffff",
+        "GradientStart": "#5445d6",
+        "GradientEnd": "#f2f4f8"
+      }
+    },
+    {
+      "id": 13,
+      "name": "Linen",
+      "light": true,
+      "palette": {
+        "Background": "#f6f1ea",
+        "Panel": "#fffdf9",
+        "Raised": "#eae1d5",
+        "Border": "#c9b9a6",
+        "Text": "#261e17",
+        "Accent": "#9a4e22",
+        "Muted": "#aaaabb",
+        "AccentText": "#ffffff",
+        "GradientStart": "#9a4e22",
+        "GradientEnd": "#f6f1ea"
+      }
+    },
+    {
+      "id": 14,
+      "name": "Sage",
+      "light": true,
+      "palette": {
+        "Background": "#eef4f0",
+        "Panel": "#f9fcfa",
+        "Raised": "#dce8e0",
+        "Border": "#b0c6b8",
+        "Text": "#18261e",
+        "Accent": "#276e48",
+        "Muted": "#aaaabb",
+        "AccentText": "#ffffff",
+        "GradientStart": "#276e48",
+        "GradientEnd": "#eef4f0"
+      }
+    },
+    {
+      "id": 15,
+      "name": "Rosewater",
+      "light": true,
+      "palette": {
+        "Background": "#f8eff2",
+        "Panel": "#fff9fb",
+        "Raised": "#eddce2",
+        "Border": "#cfafb9",
+        "Text": "#2b1820",
+        "Accent": "#ad2e62",
+        "Muted": "#aaaabb",
+        "AccentText": "#ffffff",
+        "GradientStart": "#ad2e62",
+        "GradientEnd": "#f8eff2"
+      }
+    },
+    {
+      "id": 16,
+      "name": "Sky",
+      "light": true,
+      "palette": {
+        "Background": "#edf4fa",
+        "Panel": "#f8fbff",
+        "Raised": "#dae8f5",
+        "Border": "#afc6dd",
+        "Text": "#152232",
+        "Accent": "#1961ae",
+        "Muted": "#aaaabb",
+        "AccentText": "#ffffff",
+        "GradientStart": "#1961ae",
+        "GradientEnd": "#edf4fa"
+      }
+    },
+    {
+      "id": 17,
+      "name": "Lavender",
+      "light": true,
+      "palette": {
+        "Background": "#f3effa",
+        "Panel": "#faf8ff",
+        "Raised": "#e4dcf3",
+        "Border": "#c1b3db",
+        "Text": "#221933",
+        "Accent": "#6d38b8",
+        "Muted": "#aaaabb",
+        "AccentText": "#ffffff",
+        "GradientStart": "#6d38b8",
+        "GradientEnd": "#f3effa"
+      }
+    }
+  ],
+  "defaults": {
+    "theme": 8,
+    "opacity": 40,
+    "blur": 20
+  }
+}

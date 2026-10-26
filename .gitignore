@@ -1,0 +1,16 @@
+/target/
+/artifacts/
+/.local/
+*.log
+.env
+.env.*
+!.env.example
+
+# Local assistant instructions and internal working files
+/.privateinfo/
+/AGENTS.md
+/.geminiignore
+/GEMINI.md
+/CLAUDE.md
+__pycache__/
+*.py[cod]

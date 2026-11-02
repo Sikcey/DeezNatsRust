@@ -32,6 +32,7 @@ use windows_sys::Win32::{
 use crate::drawing::gpu;
 mod compositor_clock;
 mod artwork_damage;
+mod canvas_input;
 const SEARCH: i32 = 501;
 const SESSION: i32 = 502;
 const TRACK: i32 = 503;
@@ -307,7 +308,6 @@ fn lerp_adaptive_color(c1: u32, c2: u32, t: f32) -> u32 {
 fn lerp_color(c1: u32, c2: u32, t: f32) -> u32 {
     lerp_adaptive_color(c1, c2, t)
 }
-thread_local! {static SEARCH_TEXT_MASK:std::cell::Cell<bool>=const {std::cell::Cell::new(false)};}
 thread_local! {static HOVERED_CONTROL:std::cell::Cell<HWND>=const {std::cell::Cell::new(null_mut())};}
 thread_local! {static CAPTION_HOVER:std::cell::Cell<(HWND,usize)>=const {std::cell::Cell::new((null_mut(),0))};}
 thread_local! {
@@ -1032,6 +1032,9 @@ unsafe fn draw_karaoke_row(
     true
 }
 unsafe fn make_control(hwnd: HWND, class: &str, id: i32, style: u32, app: &App) -> HWND {
+    if class == "EDIT" && matches!(id, SEARCH | NAME | DESCRIPTION) {
+        return canvas_input::create(hwnd, id, app.fonts[0]);
+    }
     let h = CreateWindowExW(
         if class == "EDIT" {
             0
@@ -1429,78 +1432,7 @@ unsafe fn copy_text(hwnd: HWND, text: &str) -> Result<(), String> {
         Err("Could not copy link".into())
     }
 }
-// Text editing retains the native caret and selection behavior.
-// Native editing/caret/IME remain intact; only the editor background comes from the glass shell.
-unsafe fn paint_search_edit(
-    hwnd: HWND,
-    memory: HDC,
-    bits: *mut u32,
-    stride: i32,
-    backdrop: &EditBackdrop,
-    foreground: u32,
-) {
-    GdiFlush();
-    for y in 0..backdrop.height {
-        std::slice::from_raw_parts_mut(bits.offset((y * stride) as isize), backdrop.width as usize)
-            .fill(0);
-    }
-    let previous = SEARCH_TEXT_MASK.replace(true);
-    SetTextColor(memory, rgb(255, 255, 255));
-    SetBkColor(memory, 0);
-    if GetWindowTextLengthW(hwnd) == 0 {
-        // The themed native cue banner paints its own opaque background.
-        // Render it into the same text mask as entered text instead.
-        let mut cue = [0u16; 512];
-        if SendMessageW(
-            hwnd,
-            EM_GETCUEBANNER,
-            cue.as_mut_ptr() as usize,
-            cue.len() as isize,
-        ) != 0
-        {
-            let mut rect = zeroed();
-            SendMessageW(hwnd, EM_GETRECT, 0, &mut rect as *mut RECT as isize);
-            let font = SendMessageW(hwnd, WM_GETFONT, 0, 0) as HGDIOBJ;
-            let previous_font = SelectObject(memory, font);
-            SetTextColor(memory, rgb(160, 160, 160));
-            SetBkMode(memory, TRANSPARENT as i32);
-            DrawTextW(
-                memory,
-                cue.as_ptr(),
-                -1,
-                &mut rect,
-                DT_LEFT | DT_SINGLELINE | DT_NOPREFIX,
-            );
-            SelectObject(memory, previous_font);
-        }
-    } else {
-        SendMessageW(hwnd, WM_PRINTCLIENT, memory as usize, PRF_CLIENT as isize);
-    }
-    SEARCH_TEXT_MASK.set(previous);
-    GdiFlush();
-    let foreground = dib(foreground);
-    for y in 0..backdrop.height {
-        for x in 0..backdrop.width {
-            let pixel = bits.offset((y * stride + x) as isize);
-            let background = backdrop.pixels[(y * backdrop.width + x) as usize];
-            let channels = [*pixel & 255, (*pixel >> 8) & 255, (*pixel >> 16) & 255];
-            let low = *channels.iter().min().unwrap();
-            let alpha = *channels.iter().max().unwrap();
-            if alpha - low > 64 {
-                *pixel |= 0xff000000;
-                continue;
-            } // Native colored selection highlight.
-            let mut result = (alpha + (background >> 24) * (255 - alpha) / 255) << 24;
-            for shift in [0, 8, 16] {
-                result |= ((((foreground >> shift) & 255) * alpha
-                    + ((background >> shift) & 255) * (255 - alpha))
-                    / 255)
-                    << shift;
-            }
-            *pixel = result;
-        }
-    }
-}
+// The search canvas samples the shell so its background follows glass and theme changes.
 unsafe fn cache_search_backdrop(app: &App, bits: *const u32, stride: i32, width: i32, height: i32) {
     if bits.is_null() {
         return;
@@ -1532,119 +1464,28 @@ unsafe fn cache_search_backdrop(app: &App, bits: *const u32, stride: i32, width:
         }
     }
 }
+// Only session and track-ID fields use the native editor.
 unsafe extern "system" fn opaque_control(
-    hwnd: HWND,
-    msg: u32,
-    wp: usize,
-    lp: isize,
-    _: usize,
-    _: usize,
+    hwnd: HWND, msg: u32, wp: usize, lp: isize, _: usize, _: usize,
 ) -> isize {
-    let parent = GetParent(hwnd);
-    let pointer = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut App;
-    let search = GetDlgCtrlID(hwnd) == SEARCH;
-    if search && msg == WM_ERASEBKGND {
-        return 1;
-    }
-    let print_search =
-        search && matches!(msg, WM_PRINT | WM_PRINTCLIENT) && !SEARCH_TEXT_MASK.get();
-    if msg == WM_PAINT || print_search {
+    if msg == WM_PAINT {
         let mut ps = zeroed();
-        let dc = if print_search {
-            wp as HDC
-        } else {
-            BeginPaint(hwnd, &mut ps)
-        };
+        let dc = BeginPaint(hwnd, &mut ps);
         let mut rect = zeroed();
         GetClientRect(hwnd, &mut rect);
-        let params = BP_PAINTPARAMS {
-            cbSize: size_of::<BP_PAINTPARAMS>() as u32,
-            dwFlags: BPPF_ERASE,
-            ..zeroed()
-        };
+        let params = BP_PAINTPARAMS { cbSize: size_of::<BP_PAINTPARAMS>() as u32,
+            dwFlags: BPPF_ERASE, ..zeroed() };
         let mut memory = null_mut();
         let buffer = BeginBufferedPaint(dc, &rect, BPBF_TOPDOWNDIB, &params, &mut memory);
         if buffer != 0 {
-            let backdrop = if search && !pointer.is_null() {
-                (*pointer).search_backdrop.borrow().clone()
-            } else {
-                None
-            };
-            let mut bits = null_mut();
-            let mut stride = 0;
-            if let Some(backdrop) =
-                backdrop.filter(|b| b.width == rect.right && b.height == rect.bottom)
-            {
-                if GetBufferedPaintBits(buffer, &mut bits, &mut stride) == 0 {
-                    paint_search_edit(
-                        hwnd,
-                        memory,
-                        bits.cast(),
-                        stride,
-                        &backdrop,
-                        (*pointer).palette()[4],
-                    );
-                } else {
-                    DefSubclassProc(hwnd, WM_PRINTCLIENT, memory as usize, PRF_CLIENT as isize);
-                }
-            } else {
-                if search && !pointer.is_null() {
-                    let color = (*pointer).palette()[1];
-                    let fallback = EditBackdrop {
-                        width: rect.right,
-                        height: rect.bottom,
-                        pixels: vec![
-                            0xff000000 | dib(color);
-                            (rect.right * rect.bottom).max(0) as usize
-                        ],
-                    };
-                    if GetBufferedPaintBits(buffer, &mut bits, &mut stride) == 0 {
-                        paint_search_edit(
-                            hwnd,
-                            memory,
-                            bits.cast(),
-                            stride,
-                            &fallback,
-                            (*pointer).palette()[4],
-                        );
-                    }
-                } else {
-                    DefSubclassProc(hwnd, WM_PRINTCLIENT, memory as usize, PRF_CLIENT as isize);
-                    BufferedPaintSetAlpha(buffer, null(), 255);
-                }
-            }
+            DefSubclassProc(hwnd, WM_PRINTCLIENT, memory as usize, PRF_CLIENT as isize);
+            BufferedPaintSetAlpha(buffer, null(), 255);
             EndBufferedPaint(buffer, 1);
-        } else {
-            DefSubclassProc(hwnd, WM_PRINTCLIENT, dc as usize, PRF_CLIENT as isize);
-        }
-        if !print_search {
-            EndPaint(hwnd, &ps);
-        }
+        } else { DefSubclassProc(hwnd, WM_PRINTCLIENT, dc as usize, PRF_CLIENT as isize); }
+        EndPaint(hwnd, &ps);
         return 0;
     }
-    let result = DefSubclassProc(hwnd, msg, wp, lp);
-    if search
-        && matches!(
-            msg,
-            WM_CHAR
-                | WM_KEYDOWN
-                | WM_PASTE
-                | WM_CUT
-                | WM_CLEAR
-                | WM_UNDO
-                | WM_SETTEXT
-                | WM_SETFOCUS
-                | WM_KILLFOCUS
-                | WM_LBUTTONDOWN
-                | WM_LBUTTONUP
-                | WM_MOUSEMOVE
-                | EM_SETSEL
-                | EM_REPLACESEL
-        )
-    {
-        InvalidateRect(hwnd, null(), 0);
-    }
-    result
+    DefSubclassProc(hwnd, msg, wp, lp)
 }
 // The caption shares the client backdrop; content coordinates remain independent of it.
 fn custom_caption(ui: &Ui) -> bool {
@@ -2930,6 +2771,7 @@ unsafe fn rebuild(hwnd: HWND, app: &mut App) {
         (SESSION, "Paste ARL, or leave empty to use saved session"),
         (TRACK, "Deezer track ID"),
         (NAME, "Playlist name"),
+        (DESCRIPTION, "Description"),
     ] {
         if let Some(control) = app.edits.get(&id) {
             SendMessageW(
@@ -9925,6 +9767,8 @@ unsafe fn render_region(
             },
         );
         render_mark!("labels");
+        gpu::select_layer(gpu::Layer::Direct);
+        canvas_input::render(app, memory);
         let mut pixels = null_mut();
         let mut stride = 0;
         if frame.is_none() && GetBufferedPaintBits(buffer, &mut pixels, &mut stride) == 0 {
@@ -11635,18 +11479,7 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
         }
         WM_DRAWITEM => 1,
         WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT => {
-            if SEARCH_TEXT_MASK.get() {
-                SetTextColor(wp as HDC, rgb(255, 255, 255));
-                SetBkColor(wp as HDC, 0);
-                SetBkMode(wp as HDC, OPAQUE as i32);
-                return GetStockObject(BLACK_BRUSH) as isize;
-            }
             let palette = app.palette();
-            if GetDlgCtrlID(lp as HWND) == SEARCH && app.search_backdrop.borrow().is_some() {
-                SetTextColor(wp as HDC, palette[4]);
-                SetBkMode(wp as HDC, TRANSPARENT as i32);
-                return GetStockObject(HOLLOW_BRUSH) as isize;
-            }
             SetTextColor(wp as HDC, palette[4]);
             SetBkColor(wp as HDC, palette[1]);
             app.brush as isize
@@ -13529,7 +13362,7 @@ pub fn run() -> Result<(), String> {
                     continue;
                 }
 
-                if id == SEARCH {
+                if id == SEARCH && !canvas_input::composing(focused) {
                     if app.ui.view != View::FlowTune {
                         activate(hwnd, &mut app, Action::Search);
                     }
@@ -13669,6 +13502,81 @@ mod behavior_tests {
         }
     }
 
+    #[test]
+    fn canvas_input_preserves_playlist_cover_drafts_and_filters_flow_live() {
+        unsafe {
+            let hwnd = CreateWindowExW(0, wide("STATIC").as_ptr(), wide("").as_ptr(),
+                WS_OVERLAPPEDWINDOW, 0, 0, 900, 700, null_mut(), null_mut(),
+                GetModuleHandleW(null()), null());
+            assert!(!hwnd.is_null());
+            let mut app = test_app();
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, &mut app as *mut App as isize);
+            for id in [SEARCH, NAME, DESCRIPTION] {
+                let control = make_control(hwnd, "EDIT", id, 0, &app);
+                app.edits.insert(id, control);
+            }
+            let status = make_control(hwnd, "STATIC", STATUS, 0, &app);
+            app.edits.insert(STATUS, status);
+            app.ui.view = View::PlaylistEdit;
+            app.ui.playlist_draft.title = "Original".into();
+            set_playlist_fields(&app);
+            SetWindowTextW(app.edits[&NAME], wide("Edited title").as_ptr());
+            SetWindowTextW(app.edits[&DESCRIPTION], wide("First\nSecond").as_ptr());
+            activate(hwnd, &mut app, Action::Go(View::CoverEdit));
+            assert_eq!(app.ui.playlist_draft.title, "Edited title");
+            assert_eq!(app.ui.playlist_draft.description, "First\nSecond");
+            assert!(app.ui.playlist_draft.description_changed);
+            activate(hwnd, &mut app, Action::Back);
+            assert_eq!(app.ui.view, View::PlaylistEdit);
+            assert_eq!(read(app.edits[&NAME]), "Edited title");
+            assert_eq!(read(app.edits[&DESCRIPTION]), "First\nSecond");
+            app.ui.view = View::FlowTune;
+            app.ui.flow_genre_limit = 100;
+            app.ui.scroll = 80;
+            SetWindowTextW(app.edits[&SEARCH], wide("ambient").as_ptr());
+            procedure(hwnd, WM_COMMAND, SEARCH as usize | ((EN_CHANGE as usize) << 16), app.edits[&SEARCH] as isize);
+            assert_eq!(app.ui.flow_filter, "ambient");
+            assert_eq!(app.ui.flow_genre_limit, 30);
+            assert_eq!(app.ui.scroll, 0);
+            // Regression: checking a child WM_PRINTCLIENT is insufficient. Its
+            // pixels can disappear under DirectComposition. The root frame
+            // itself must contain the current editor text.
+            app.ui.view = View::PlaylistEdit;
+            rebuild(hwnd, &mut app);
+            BufferedPaintInit();
+            let dc = CreateCompatibleDC(null_mut());
+            let mut bits = null_mut();
+            let info = BITMAPINFO { bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32, biWidth: 900,
+                biHeight: -700, biPlanes: 1, biBitCount: 32, biCompression: BI_RGB,
+                ..zeroed() }, ..zeroed() };
+            let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+            assert!(!bitmap.is_null());
+            let old = SelectObject(dc, bitmap);
+            let field = app.rect(app.scene.name.unwrap());
+            let capture = || {
+                GdiFlush();
+                let pixels = std::slice::from_raw_parts(bits.cast::<u32>(), 900*700);
+                let caption = caption_height(hwnd);
+                (field.top+caption..field.bottom+caption).flat_map(|y|
+                    pixels[y as usize*900+field.left as usize..y as usize*900+field.right as usize].iter().copied()
+                ).collect::<Vec<_>>()
+            };
+            SetWindowTextW(app.edits[&NAME], wide("iiiiiiiiiiii").as_ptr());
+            render(hwnd, &app, dc, None);
+            let first = capture();
+            SetWindowTextW(app.edits[&NAME], wide("WWWWWWWWWWWW").as_ptr());
+            render(hwnd, &app, dc, None);
+            assert_ne!(first, capture(), "root canvas omitted editor glyphs");
+            SelectObject(dc, old); DeleteObject(bitmap); DeleteDC(dc);
+            BufferedPaintUnInit();
+            // Programmatic field loading, editing, and cover navigation never replace the canvas windows.
+            assert!(GetWindow(app.edits[&NAME], GW_CHILD).is_null());
+            DestroyWindow(hwnd);
+            for font in app.fonts { DeleteObject(font); }
+            DeleteObject(app.brush);
+        }
+    }
     #[test]
     fn queue_rows_use_canvas_hit_testing_outside_main_content() {
         unsafe {
@@ -15027,135 +14935,6 @@ mod behavior_tests {
             }
         }
     }
-    #[test]
-    fn native_search_edit_preserves_glass_pixels_while_typing_and_clearing() {
-        unsafe extern "system" fn test_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
-            if matches!(msg, WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC) {
-                SetTextColor(wp as HDC, rgb(255, 255, 255));
-                SetBkColor(wp as HDC, 0);
-                SetBkMode(wp as HDC, OPAQUE as i32);
-                return GetStockObject(BLACK_BRUSH) as isize;
-            }
-            DefWindowProcW(hwnd, msg, wp, lp)
-        }
-        unsafe {
-            let name = wide("DeezNatsSearchBackdropTest");
-            let instance = GetModuleHandleW(null());
-            let class = WNDCLASSW {
-                lpfnWndProc: Some(test_proc),
-                hInstance: instance,
-                lpszClassName: name.as_ptr(),
-                ..zeroed()
-            };
-            assert_ne!(RegisterClassW(&class), 0);
-            let parent = CreateWindowExW(
-                0,
-                name.as_ptr(),
-                wide("").as_ptr(),
-                WS_OVERLAPPEDWINDOW,
-                0,
-                0,
-                400,
-                200,
-                null_mut(),
-                null_mut(),
-                instance,
-                null(),
-            );
-            let edit = CreateWindowExW(
-                0,
-                wide("EDIT").as_ptr(),
-                wide("Search").as_ptr(),
-                WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL as u32,
-                0,
-                0,
-                240,
-                30,
-                parent,
-                SEARCH as HMENU,
-                instance,
-                null(),
-            );
-            assert!(!edit.is_null());
-            let dc = CreateCompatibleDC(null_mut());
-            let mut bits = null_mut();
-            let info = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: 240,
-                    biHeight: -30,
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB,
-                    ..zeroed()
-                },
-                ..zeroed()
-            };
-            let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
-            assert!(!bitmap.is_null());
-            let previous = SelectObject(dc, bitmap);
-            for solid in [None, Some(0xff282828), Some(0xfff1eee8), Some(0xff204060)] {
-                SetWindowTextW(edit, wide("Search").as_ptr());
-                let backdrop = EditBackdrop {
-                    width: 240,
-                    height: 30,
-                    pixels: (0..7200)
-                        .map(|i| solid.unwrap_or(0x80101010 + ((i % 240) / 4) as u32))
-                        .collect(),
-                };
-                paint_search_edit(edit, dc, bits.cast(), 240, &backdrop, rgb(240, 240, 240));
-                let pixels = std::slice::from_raw_parts(bits.cast::<u32>(), 7200);
-                assert!(
-                    pixels.iter().zip(&backdrop.pixels).any(|(a, b)| a != b),
-                    "native text was not drawn"
-                );
-                for y in 0..30 {
-                    for x in 200..240 {
-                        let i = y * 240 + x;
-                        assert_eq!(
-                            pixels[i], backdrop.pixels[i],
-                            "solid editor rectangle returned"
-                        );
-                    }
-                }
-                SetWindowTextW(edit, wide("").as_ptr());
-                paint_search_edit(edit, dc, bits.cast(), 240, &backdrop, rgb(240, 240, 240));
-                assert_eq!(
-                    std::slice::from_raw_parts(bits.cast::<u32>(), 7200),
-                    backdrop.pixels.as_slice(),
-                    "clearing text left stale pixels"
-                );
-                SendMessageW(
-                    edit,
-                    EM_SETCUEBANNER,
-                    1,
-                    wide("Search...").as_ptr() as isize,
-                );
-                paint_search_edit(edit, dc, bits.cast(), 240, &backdrop, rgb(240, 240, 240));
-                let pixels = std::slice::from_raw_parts(bits.cast::<u32>(), 7200);
-                assert!(
-                    pixels.iter().zip(&backdrop.pixels).any(|(a, b)| a != b),
-                    "cue banner was not drawn"
-                );
-                for y in 0..30 {
-                    for x in 200..240 {
-                        let i = y * 240 + x;
-                        assert_eq!(
-                            pixels[i], backdrop.pixels[i],
-                            "cue banner painted an opaque background"
-                        );
-                    }
-                }
-                SendMessageW(edit, EM_SETCUEBANNER, 1, wide("").as_ptr() as isize);
-            }
-            SelectObject(dc, previous);
-            DeleteObject(bitmap);
-            DeleteDC(dc);
-            DestroyWindow(parent);
-            UnregisterClassW(name.as_ptr(), instance);
-        }
-    }
-
     #[test]
     fn backdrop_copy_supports_packed_and_padded_buffers() {
         let source = [1, 2, 3, 4, 5, 6];

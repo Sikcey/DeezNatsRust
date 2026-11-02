@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1
+
+- Render search and playlist text fields directly in the application canvas so text, selections and the caret remain visible under DirectComposition.
+- Add Unicode-aware editing, clipboard commands, undo/redo, input method composition, keyboard navigation and multiline playlist descriptions.
+- Preserve playlist drafts through cover editing and keep FlowTune filtering live as search text changes.
+- Reduce allocations when resizing large playlist and album artwork.
+- Include Spotify integration, GPU rendering, in-app updates and smoother visualization from the preceding application updates.
+
 ## 0.1.0 ? Rust edition
 
 - Introduce a native Rust Windows application with Win32 controls and GDI+ rendering.

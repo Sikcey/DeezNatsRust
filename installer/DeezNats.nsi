@@ -2,7 +2,7 @@ Unicode True
 !include "MUI2.nsh"
 !include "FileFunc.nsh"
 !ifndef APPVERSION
-!define APPVERSION "0.1.0"
+!define APPVERSION "0.1.1"
 !endif
 !ifndef PRODUCTVERSION
 !define PRODUCTVERSION "${APPVERSION}.0"

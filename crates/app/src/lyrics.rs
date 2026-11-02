@@ -11,6 +11,8 @@ pub(crate) mod http;
 mod kugou;
 #[path = "lyrics/providers.rs"]
 mod providers;
+#[path = "lyrics/spotify.rs"]
+mod spotify_native;
 
 #[derive(Clone, Debug, Default)]
 pub struct Syllable {
@@ -49,9 +51,33 @@ pub fn fetch_best_lyrics(
     id: &str,
     enabled_sources: u32,
 ) -> Result<(String, Vec<LyricLine>), String> {
+    fetch_best_inner(Some(engine), track, id, enabled_sources)
+}
+pub(crate) fn fetch_spotify_lyrics(
+    track: &Entry,
+    id: &str,
+    enabled_sources: u32,
+) -> Result<(String, Vec<LyricLine>), String> {
+    fetch_best_inner(None, track, id, enabled_sources)
+}
+fn fetch_best_inner(
+    engine: Option<&Engine>,
+    track: &Entry,
+    id: &str,
+    enabled_sources: u32,
+) -> Result<(String, Vec<LyricLine>), String> {
     let key = format!(
-        "{}\0{}\0{}\0{}\0{}",
-        id, track.title, track.subtitle, track.duration, enabled_sources
+        "{}\0{}\0{}\0{}\0{}\0{}",
+        if engine.is_none() {
+            "spotify"
+        } else {
+            "deezer"
+        },
+        id,
+        track.title,
+        track.subtitle,
+        track.duration,
+        enabled_sources
     );
     if let Some(cached) = lyric_cache().lock().unwrap().get(&key) {
         return Ok(cached);
@@ -65,7 +91,7 @@ pub fn fetch_best_lyrics(
             .map(|source| {
                 (
                     source,
-                    scope.spawn(move || fetch_provider(engine, track, id, source)),
+                    scope.spawn(move || fetch_provider_inner(engine, track, id, source)),
                 )
             })
             .collect();
@@ -82,7 +108,7 @@ pub fn fetch_best_lyrics(
             .collect::<std::collections::HashMap<_, _>>()
     });
     let mut results = results;
-    let result = fetch_sources(track, id, enabled_sources, |source| {
+    let result = fetch_sources(track, id, enabled_sources, engine.is_none(), |source| {
         results
             .remove(&source)
             .unwrap_or_else(|| Err("Lyrics provider unavailable".into()))
@@ -159,8 +185,21 @@ fn fetch_provider(
     id: &str,
     source: usize,
 ) -> Result<Value, String> {
+    fetch_provider_inner(Some(engine), track, id, source)
+}
+fn fetch_provider_inner(
+    engine: Option<&Engine>,
+    track: &Entry,
+    id: &str,
+    source: usize,
+) -> Result<Value, String> {
     let mut json_fetch = |url: &str| {
-        serde_json::from_slice::<Value>(&engine.fetch(url)?).map_err(|error| error.to_string())
+        let bytes = if let Some(engine) = engine {
+            engine.fetch(url)?
+        } else {
+            http::request("GET", url, &[], &[])?
+        };
+        serde_json::from_slice::<Value>(&bytes).map_err(|error| error.to_string())
     };
     match source {
         2 => extras::musixmatch(track),
@@ -170,7 +209,18 @@ fn fetch_provider(
         7 => kugou::fetch(track, &mut json_fetch),
         3 => providers::amll(track, &mut json_fetch),
         4 => providers::netease(track, &mut json_fetch),
-        0 => engine.invoke("DZLyricsJSON", &[serde_json::json!(id)]),
+        0 => {
+            if engine.is_none() {
+                spotify_native::fetch(id)
+            } else if let Some(engine) = engine {
+                if id.starts_with("spotify:") {
+                    return Err("Deezer lyrics require a Deezer track".into());
+                }
+                engine.invoke("DZLyricsJSON", &[serde_json::json!(id)])
+            } else {
+                Err("Spotify does not expose lyrics through the catalog API".into())
+            }
+        }
         1 => {
             let title = url_encode(&track.title);
             let artist = url_encode(
@@ -200,6 +250,7 @@ fn fetch_sources(
     track: &Entry,
     id: &str,
     enabled_sources: u32,
+    spotify_native: bool,
     mut fetch: impl FnMut(usize) -> Result<Value, String>,
 ) -> Result<(String, Vec<LyricLine>), String> {
     if enabled_sources == 0 {
@@ -213,7 +264,11 @@ fn fetch_sources(
     let mut best_score = (0, 0, 0);
     let mut errors = Vec::new();
     for source in [0, 3, 8, 5, 7, 2, 4, 1, 9] {
-        let name = LYRIC_SOURCES[source];
+        let name = if source == 0 && spotify_native {
+            "Spotify"
+        } else {
+            LYRIC_SOURCES[source]
+        };
         if enabled_sources & (1 << source) == 0
             || (source == 0 && id.is_empty())
             || (source != 0 && track.title.is_empty())
@@ -223,6 +278,7 @@ fn fetch_sources(
         match fetch(source) {
             Ok(value) => {
                 let mut lines = match source {
+                    0 if spotify_native => spotify_native::parse(&value),
                     0 => parse_deezer_lyrics(&value),
                     7 => kugou::parse(value["krc"].as_str().unwrap_or_default()),
                     3 | 8 => formats::ttml(value["ttml"].as_str().unwrap_or_default()),
@@ -268,7 +324,7 @@ fn fetch_sources(
     Ok(best)
 }
 
-pub const SUPPORTED_SOURCES: u32 = 0x3bf;
+pub const SUPPORTED_SOURCES: u32 = 0x3bb;
 pub const DEFAULT_SOURCES: u32 = SUPPORTED_SOURCES;
 
 fn quality(lines: &[LyricLine]) -> (u8, usize, usize) {
@@ -965,7 +1021,7 @@ mod tests {
             ..Default::default()
         };
         let mut requested = Vec::new();
-        let (source,lines)=fetch_sources(&track,"1",SUPPORTED_SOURCES,|source| {
+        let (source,lines)=fetch_sources(&track,"1",SUPPORTED_SOURCES,false,|source| {
             requested.push(source);
             Ok(match source {
                 0=>json!({"plain":"Plain fallback"}),
@@ -974,7 +1030,7 @@ mod tests {
                 _=>json!({"syncedLyrics":"[00:01]A\n[00:03]B\n[00:04]C"}),
             })
         }).unwrap();
-        assert_eq!(requested, [0, 3, 8, 5, 7, 2, 4, 1, 9]);
+        assert_eq!(requested, [0, 3, 8, 5, 7, 4, 1, 9]);
         assert_eq!(source, "NetEase");
         assert_eq!(lines.len(), 2);
         assert_eq!(score_lyrics(&lines), 3);
@@ -986,7 +1042,7 @@ mod tests {
             title: "Song".into(),
             ..Default::default()
         };
-        let (source, lines) = fetch_sources(&track, "1", SUPPORTED_SOURCES, |source| {
+        let (source, lines) = fetch_sources(&track, "1", SUPPORTED_SOURCES, false, |source| {
             if source == 0 {
                 Ok(json!({"plain":"Fallback"}))
             } else {
@@ -1022,7 +1078,7 @@ mod tests {
             };
             let value = fetch_provider(&engine, &track, "", source).unwrap();
             let (name, lines) =
-                fetch_sources(&track, "", 1 << source, |_| Ok(value.clone())).unwrap();
+                fetch_sources(&track, "", 1 << source, false, |_| Ok(value.clone())).unwrap();
             assert!(!lines.is_empty(), "{name}: no parsed lyrics");
             let score = quality(&lines);
             assert!(score.0 >= 2, "{name}: no timing");
@@ -1045,7 +1101,7 @@ mod tests {
             ..Default::default()
         };
         let mut requested = Vec::new();
-        let (source, lines) = fetch_sources(&track, "1", 2, |index| {
+        let (source, lines) = fetch_sources(&track, "1", 2, false, |index| {
             requested.push(index);
             Ok(json!({"plainLyrics":"One\nTwo"}))
         })
@@ -1054,9 +1110,10 @@ mod tests {
         assert_eq!(source, "LRCLIB");
         assert!(!has_timing(&lines));
         for mask in [0, 64] {
-            assert!(
-                fetch_sources(&track, "1", mask, |_| panic!("disabled provider called")).is_err()
-            );
+            assert!(fetch_sources(&track, "1", mask, false, |_| panic!(
+                "disabled provider called"
+            ))
+            .is_err());
         }
     }
 

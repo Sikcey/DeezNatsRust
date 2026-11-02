@@ -42,15 +42,26 @@ fn session() -> Result<&'static Handle, String> {
 }
 fn artwork_session() -> Result<&'static Handle, String> {
     static SESSION: OnceLock<Result<Handle, String>> = OnceLock::new();
-    SESSION.get_or_init(|| unsafe {
-        let handle=WinHttpOpen(wide("DeezNatsArtwork/1").as_ptr(),WINHTTP_ACCESS_TYPE_NO_PROXY,null(),null(),0);
-        if handle.is_null(){return Err("Artwork HTTP initialization failed".into());}
-        WinHttpSetTimeouts(handle,3000,3000,4000,6000);
-        Ok(Handle(handle))
-    }).as_ref().map_err(Clone::clone)
+    SESSION
+        .get_or_init(|| unsafe {
+            let handle = WinHttpOpen(
+                wide("DeezNatsArtwork/1").as_ptr(),
+                WINHTTP_ACCESS_TYPE_NO_PROXY,
+                null(),
+                null(),
+                0,
+            );
+            if handle.is_null() {
+                return Err("Artwork HTTP initialization failed".into());
+            }
+            WinHttpSetTimeouts(handle, 3000, 3000, 4000, 6000);
+            Ok(Handle(handle))
+        })
+        .as_ref()
+        .map_err(Clone::clone)
 }
 pub(crate) fn artwork(url: &str) -> Result<Vec<u8>, String> {
-    request_transport("GET",url,&[],&[],16*1024*1024,true)
+    request_transport("GET", url, &[], &[], 16 * 1024 * 1024, true)
 }
 pub(crate) fn request(
     method: &str,
@@ -68,9 +79,79 @@ fn request_bounded(
     body: &[u8],
     limit: usize,
 ) -> Result<Vec<u8>, String> {
-    request_transport(method,url,headers,body,limit,false)
+    request_transport(method, url, headers, body, limit, false)
 }
-fn request_transport(method:&str,url:&str,headers:&[(&str,&str)],body:&[u8],limit:usize,direct:bool)->Result<Vec<u8>,String>{
+/// Bounded response metadata for clients that need auth/rate-limit handling.
+pub(crate) struct Response {
+    pub status: u32,
+    pub retry_after: Option<u64>,
+    pub body: Vec<u8>,
+}
+pub(crate) fn response(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Result<Response, String> {
+    response_transport(method, url, headers, body, 2 * 1024 * 1024, false)
+}
+/// Public Spotify bootstrap scripts can exceed the normal API response limit.
+pub(crate) fn spotify_script(url: &str) -> Result<Response, String> {
+    let parsed = url::Url::parse(url).map_err(|_| "Invalid Spotify script URL")?;
+    if parsed.scheme() != "https"
+        || parsed.host_str() != Some("open.spotifycdn.com")
+        || parsed.port().is_some()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || !(parsed
+            .path()
+            .starts_with("/cdn/build/web-player/web-player.")
+            || parsed
+                .path()
+                .starts_with("/cdn/build/mobile-web-player/mobile-web-player."))
+        || !parsed.path().ends_with(".js")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err("Spotify script destination rejected".into());
+    }
+    let mut response = response_transport("GET", url, &[], &[], 8 * 1024 * 1024, false)?;
+    if response.body.starts_with(&[0x1f, 0x8b]) {
+        use std::io::Read;
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(response.body.as_slice())
+            .take(8 * 1024 * 1024 + 1)
+            .read_to_end(&mut decoded)
+            .map_err(|_| "Invalid compressed Spotify script")?;
+        if decoded.len() > 8 * 1024 * 1024 {
+            return Err("Spotify script is too large".into());
+        }
+        response.body = decoded;
+    }
+    Ok(response)
+}
+fn request_transport(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    limit: usize,
+    direct: bool,
+) -> Result<Vec<u8>, String> {
+    let response = response_transport(method, url, headers, body, limit, direct)?;
+    if !(200..300).contains(&response.status) {
+        return Err(format!("Provider HTTP {}", response.status));
+    }
+    Ok(response.body)
+}
+fn response_transport(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    limit: usize,
+    direct: bool,
+) -> Result<Response, String> {
     let rest = url
         .strip_prefix("https://")
         .ok_or("Provider URL must use HTTPS")?;
@@ -97,7 +178,11 @@ fn request_transport(method:&str,url:&str,headers:&[(&str,&str)],body:&[u8],limi
     }
     unsafe {
         let server = wide(host);
-        let transport=if direct{artwork_session()?}else{session()?};
+        let transport = if direct {
+            artwork_session()?
+        } else {
+            session()?
+        };
         let connect = Handle(WinHttpConnect(transport.0, server.as_ptr(), 443, 0));
         if connect.0.is_null() {
             return Err("Provider connection failed".into());
@@ -155,9 +240,26 @@ fn request_transport(method:&str,url:&str,headers:&[(&str,&str)],body:&[u8],limi
         {
             return Err("Invalid provider response".into());
         }
-        if !(200..300).contains(&status) {
-            return Err(format!("Provider HTTP {status}"));
-        }
+        let mut retry = [0u16; 64];
+        let mut retry_size = std::mem::size_of_val(&retry) as u32;
+        let retry_after = if WinHttpQueryHeaders(
+            request.0,
+            WINHTTP_QUERY_CUSTOM,
+            wide("Retry-After").as_ptr(),
+            retry.as_mut_ptr().cast(),
+            &mut retry_size,
+            null_mut(),
+        ) != 0
+        {
+            String::from_utf16_lossy(
+                &retry[..retry.iter().position(|c| *c == 0).unwrap_or(retry.len())],
+            )
+            .trim()
+            .parse::<u64>()
+            .ok()
+        } else {
+            None
+        };
         let started = Instant::now();
         let mut result = Vec::new();
         let mut chunk = [0u8; 16384];
@@ -183,7 +285,11 @@ fn request_transport(method:&str,url:&str,headers:&[(&str,&str)],body:&[u8],limi
             }
             result.extend_from_slice(&chunk[..count as usize]);
         }
-        Ok(result)
+        Ok(Response {
+            status,
+            retry_after,
+            body: result,
+        })
     }
 }
 pub(super) fn json(url: &str, headers: &[(&str, &str)]) -> Result<serde_json::Value, String> {

@@ -18,6 +18,7 @@ impl Worker {
         let (requests, rx) = mpsc::sync_channel::<Request>(1);
         let (tx, updates) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
+            crate::catalog::artwork_background_priority();
             while let Ok(mut request) = rx.recv() {
                 while let Ok(newer) = rx.try_recv() {
                     request = newer;
@@ -268,36 +269,52 @@ pub fn colorref_luminance(color: u32) -> f32 {
     0.2126 * r + 0.7152 * g + 0.0722 * b
 }
 
+/// Keep a preferred foreground when it is readable across a gradient; otherwise
+/// choose the black or white foreground with the best worst-case contrast.
+pub fn gradient_foreground(preferred: u32, start: u32, end: u32) -> u32 {
+    fn luminance(color: u32) -> f64 {
+        [0, 8, 16].into_iter().zip([0.2126, 0.7152, 0.0722]).map(|(shift, weight)| {
+            let channel = ((color >> shift) & 255) as f64 / 255.0;
+            weight * if channel <= 0.04045 { channel / 12.92 } else { ((channel + 0.055) / 1.055).powf(2.4) }
+        }).sum()
+    }
+    let contrast = |fg: u32, bg: u32| {
+        let (a, b) = (luminance(fg), luminance(bg));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    };
+    let worst = |fg| contrast(fg, start).min(contrast(fg, end));
+    if worst(preferred) >= 4.5 { preferred } else if worst(0x00000000) > worst(0x00ffffff) { 0x00000000 } else { 0x00ffffff }
+}
+
 /// Shared desktop/browser text protection for the actual backdrop lightness.
 pub fn readable_palette(mut palette: [u32; 6], light: bool, brightness: u32) -> [u32; 6] {
-    let rgb = |r:u32,g:u32,b:u32| r | (g<<8) | (b<<16);
-        if light {
-            for color in &mut palette[..4] {
-                let mut adjusted = 0;
-                for shift in [0, 8, 16] {
-                    adjusted |=
-                        (((*color >> shift) & 255) * brightness / 100).min(255) << shift;
-                }
-                *color = adjusted;
+    let rgb = |r: u32, g: u32, b: u32| r | (g << 8) | (b << 16);
+    if light {
+        for color in &mut palette[..4] {
+            let mut adjusted = 0;
+            for shift in [0, 8, 16] {
+                adjusted |= (((*color >> shift) & 255) * brightness / 100).min(255) << shift;
             }
-            let text_lum = crate::appearance::colorref_luminance(palette[4]);
-            if text_lum > 0.30 {
-                palette[4] = rgb(20, 20, 24);
-            }
-            let muted_lum = crate::appearance::colorref_luminance(palette[5]);
-            if muted_lum > 0.52 || muted_lum < 0.15 {
-                palette[5] = rgb(94, 102, 118);
-            }
-        } else {
-            let text_lum = crate::appearance::colorref_luminance(palette[4]);
-            if text_lum < 0.70 {
-                palette[4] = rgb(248, 248, 248);
-            }
-            let muted_lum = crate::appearance::colorref_luminance(palette[5]);
-            if muted_lum < 0.38 || muted_lum > 0.85 {
-                palette[5] = rgb(190, 190, 190);
-            }
+            *color = adjusted;
         }
+        let text_lum = crate::appearance::colorref_luminance(palette[4]);
+        if text_lum > 0.30 {
+            palette[4] = rgb(20, 20, 24);
+        }
+        let muted_lum = crate::appearance::colorref_luminance(palette[5]);
+        if muted_lum > 0.52 || muted_lum < 0.15 {
+            palette[5] = rgb(94, 102, 118);
+        }
+    } else {
+        let text_lum = crate::appearance::colorref_luminance(palette[4]);
+        if text_lum < 0.70 {
+            palette[4] = rgb(248, 248, 248);
+        }
+        let muted_lum = crate::appearance::colorref_luminance(palette[5]);
+        if muted_lum < 0.38 || muted_lum > 0.85 {
+            palette[5] = rgb(190, 190, 190);
+        }
+    }
     palette
 }
 
@@ -358,24 +375,37 @@ mod tests {
     use super::*;
     #[test]
     fn shared_palette_guards_repair_unreadable_text_without_changing_surfaces() {
-        let dark=[0x00101010,0x00202020,0x00303030,0x00404040,0x00000000,0x00ffffff];
-        let guarded=readable_palette(dark,false,100);
-        assert_eq!(&guarded[..4],&dark[..4]);
-        assert_eq!(guarded[4],0x00f8f8f8);
-        assert_eq!(guarded[5],0x00bebebe);
-        let light=[0x00ffffff,0x00eeeeee,0x00dddddd,0x00cccccc,0x00ffffff,0x00000000];
-        let guarded=readable_palette(light,true,100);
-        assert_eq!(&guarded[..4],&light[..4]);
-        assert_eq!(guarded[4],0x00181414);
-        assert_eq!(guarded[5],0x0076665e);
+        let dark = [
+            0x00101010, 0x00202020, 0x00303030, 0x00404040, 0x00000000, 0x00ffffff,
+        ];
+        let guarded = readable_palette(dark, false, 100);
+        assert_eq!(&guarded[..4], &dark[..4]);
+        assert_eq!(guarded[4], 0x00f8f8f8);
+        assert_eq!(guarded[5], 0x00bebebe);
+        let light = [
+            0x00ffffff, 0x00eeeeee, 0x00dddddd, 0x00cccccc, 0x00ffffff, 0x00000000,
+        ];
+        let guarded = readable_palette(light, true, 100);
+        assert_eq!(&guarded[..4], &light[..4]);
+        assert_eq!(guarded[4], 0x00181414);
+        assert_eq!(guarded[5], 0x0076665e);
     }
 
     #[test]
     fn downscale_keeps_bounds_and_extreme_aspect_ratios() {
         let reduced = prepare(&Bitmap::new(1024, 1024, vec![0xff808080; 1024 * 1024]), 40);
-        assert_eq!((reduced.width, reduced.height), (PREPARE_LIMIT, PREPARE_LIMIT));
+        assert_eq!(
+            (reduced.width, reduced.height),
+            (PREPARE_LIMIT, PREPARE_LIMIT)
+        );
         assert!(reduced.pixels.iter().all(|&p| p == 0xff808080));
-        for (w, h) in [(1, 6000), (6000, 1), (1, 1), (PREPARE_LIMIT, PREPARE_LIMIT), (PREPARE_LIMIT + 1, 96)] {
+        for (w, h) in [
+            (1, 6000),
+            (6000, 1),
+            (1, 1),
+            (PREPARE_LIMIT, PREPARE_LIMIT),
+            (PREPARE_LIMIT + 1, 96),
+        ] {
             let source = Bitmap::new(w, h, vec![0xff2878c8; (w * h) as usize]);
             let result = prepare(&source, 100);
             assert!(result.width > 0 && result.height > 0);
@@ -521,13 +551,20 @@ mod tests {
         assert!(colorref_luminance(0x00000000) < 0.05);
         assert!(colorref_luminance(0x00141418) < 0.15);
     }
+
+    #[test]
+    fn gradient_foreground_checks_both_ends() {
+        assert_eq!(super::gradient_foreground(0x00141418, 0x0033152c, 0x00200d1c), 0x00ffffff);
+        assert_eq!(super::gradient_foreground(0x00ffffff, 0x00eeeeee, 0x00ffffff), 0x00000000);
+        assert_eq!(super::gradient_foreground(0x00eeeeee, 0x00000000, 0x00202020), 0x00eeeeee);
+    }
     #[test]
     fn cover_crops_the_center_instead_of_stretching() {
         let image = Bitmap {
             id: 0,
             width: 4,
             height: 2,
-            pixels: vec![0, 1, 2, 3, 4, 5, 6, 7],
+            pixels: Arc::new(vec![0, 1, 2, 3, 4, 5, 6, 7]),
         };
         assert_eq!(cover_sample(&image, 0, 0, 2, 2), 1);
         assert_eq!(cover_sample(&image, 1, 1, 2, 2), 6);
@@ -538,15 +575,16 @@ mod tests {
             id: 1,
             width: 8,
             height: 8,
-            pixels: vec![0xff2878c8; 64],
+            pixels: Arc::new(vec![0xff2878c8; 64]),
         };
         assert!(prepare(&image, 100).pixels.iter().all(|p| *p == 0xff2878c8));
         let detail = Bitmap {
             id: 2,
             width: 2,
             height: 1,
-            pixels: vec![0xff000000, 0xffffffff],
+            pixels: Arc::new(vec![0xff000000, 0xffffffff]),
         };
         assert_eq!(prepare(&detail, 0).pixels, detail.pixels);
+        assert!(Arc::ptr_eq(&prepare(&detail, 0).pixels, &detail.pixels));
     }
 }

@@ -3,6 +3,25 @@ use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, RgbImage};
 use serde_json::{json, Value};
 use std::{path::Path, sync::Arc};
 
+pub fn can_edit(entry: &Entry, account: &Value) -> bool {
+    if entry.kind != "playlist" {
+        return false;
+    }
+    let account_id = crate::catalog::string(account, &["userId", "id", "uri"]);
+    let owner = ["owner", "creator", "user"]
+        .iter()
+        .find_map(|key| {
+            let value = entry.raw.get(*key)?;
+            let id = crate::catalog::string(value, &["id", "userId", "uri"]);
+            (!id.is_empty()).then_some(id)
+        })
+        .unwrap_or_else(|| {
+            crate::catalog::string(&entry.raw, &["creator_id", "owner_id", "USER_ID"])
+        });
+    let normalize = |id: String| id.strip_prefix("spotify:user:").unwrap_or(&id).to_owned();
+    !account_id.is_empty() && !owner.is_empty() && normalize(account_id) == normalize(owner)
+}
+
 #[derive(Clone, Default)]
 pub struct Draft {
     pub id: String,
@@ -99,6 +118,9 @@ fn accepted(value: Value) -> Result<(), String> {
 pub fn execute(engine: &Engine, mutation: &mut Mutation) -> Result<Outcome, String> {
     execute_with(mutation, |name, args| engine.invoke(name, args))
 }
+pub fn execute_spotify(mutation: &mut Mutation) -> Result<Outcome, String> {
+    execute_with(mutation, crate::spotify::catalog_invoke)
+}
 fn execute_with(
     mutation: &mut Mutation,
     mut call: impl FnMut(&str, &[Value]) -> Result<Value, String>,
@@ -188,6 +210,24 @@ fn execute_with(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn edit_requires_matching_playlist_owner() {
+        let mut entry = super::Entry {
+            kind: "playlist".into(),
+            raw: serde_json::json!({"creator":{"id":42}}),
+            ..Default::default()
+        };
+        assert!(super::can_edit(&entry, &serde_json::json!({"userId":"42"})));
+        assert!(!super::can_edit(
+            &entry,
+            &serde_json::json!({"userId":"43"})
+        ));
+        entry.raw = serde_json::json!({"owner":{"uri":"spotify:user:alice"}});
+        assert!(super::can_edit(&entry, &serde_json::json!({"id":"alice"})));
+        assert!(!super::can_edit(&entry, &serde_json::json!({})));
+        entry.raw = serde_json::json!({});
+        assert!(!super::can_edit(&entry, &serde_json::json!({"id":"alice"})));
+    }
     use super::*;
 
     #[test]

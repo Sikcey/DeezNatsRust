@@ -193,8 +193,18 @@ impl Visualizer {
         *self.scene_levels.lock().unwrap() = bands;
         *self.render_levels.lock().unwrap() = (bands, Instant::now());
         *self.last_update.lock().unwrap() = Instant::now();
-        let now=Instant::now();let start=now-std::time::Duration::from_secs(1);let mut state=self.trap_state.lock().unwrap();state.last=start;
-        for frame in 1..=60{state.frame(bands,start+std::time::Duration::from_millis(frame*16),199,80.);}
+        let now = Instant::now();
+        let start = now - std::time::Duration::from_secs(1);
+        let mut state = self.trap_state.lock().unwrap();
+        state.last = start;
+        for frame in 1..=60 {
+            state.frame(
+                bands,
+                start + std::time::Duration::from_millis(frame * 16),
+                199,
+                80.,
+            );
+        }
     }
     fn spectrum(&self) -> [f32; 32] {
         let fresh = self
@@ -233,7 +243,18 @@ impl Visualizer {
                 let low = at.floor() as usize;
                 let high = (low + 1).min(31);
                 let magnitude = if playing {
-                    bands[low] * (1. - at.fract()) + bands[high] * at.fract()
+                    let smooth = |index: usize| {
+                        let mut sum = 0.;
+                        let mut weight_sum = 0.;
+                        for offset in -3i32..=3 {
+                            let weight = (4 - offset.abs()) as f32;
+                            let band = (index as i32 + offset).clamp(0, 31) as usize;
+                            sum += bands[band] * weight;
+                            weight_sum += weight;
+                        }
+                        sum / weight_sum
+                    };
+                    smooth(low) * (1. - at.fract()) + smooth(high) * at.fract()
                 } else {
                     0.
                 };
@@ -245,7 +266,10 @@ impl Visualizer {
         let bands = self.spectrum();
         (0..count)
             .map(|i| {
-                let at = i as f32 / (count.max(2) - 1) as f32 * 31.;
+                // Mirror the spectrum around the center: bass in the middle,
+                // treble at both edges.
+                let position = i as f32 / (count.max(2) - 1) as f32;
+                let at = (position * 2. - 1.).abs() * 31.;
                 let low = at.floor() as usize;
                 bands[low] * (1. - at.fract()) + bands[(low + 1).min(31)] * at.fract()
             })
@@ -278,6 +302,9 @@ struct TrapResponse {
     beat: f32,
     last: Instant,
     history: VecDeque<(Instant, [f32; 32])>,
+    kernel_count: Option<usize>,
+    kernels: [(Vec<f32>, f32); 5],
+    outline_scratch: Vec<f32>,
 }
 impl TrapResponse {
     fn new() -> Self {
@@ -286,6 +313,9 @@ impl TrapResponse {
             beat: 0.,
             last: Instant::now(),
             history: VecDeque::new(),
+            kernel_count: None,
+            kernels: std::array::from_fn(|_| (Vec::new(), 0.)),
+            outline_scratch: Vec::new(),
         }
     }
     fn frame(
@@ -300,6 +330,10 @@ impl TrapResponse {
             .as_secs_f32()
             .min(0.1);
         self.last = now;
+        let mut raw = raw;
+        for bass in &mut raw[..5] {
+            *bass = (*bass * 1.5).clamp(0., 1.);
+        }
         follow_levels(&mut self.levels, &raw, dt);
         let bass = self.levels[..5].iter().copied().fold(0., f32::max);
         self.beat += (bass - self.beat) * (1. - 0.6f32.powf(dt * 60.));
@@ -312,15 +346,33 @@ impl TrapResponse {
         {
             self.history.pop_front();
         }
+        if self.kernel_count != Some(count) {
+            for (layer, (weights, sum)) in self.kernels.iter_mut().enumerate() {
+                let radius = (10 + layer * 2).min(count.saturating_sub(1));
+                let sigma = (radius as f32 / 2.4).max(1.);
+                weights.clear();
+                weights.extend(
+                    (-(radius as isize)..=radius as isize)
+                        .map(|offset| (-(offset as f32).powi(2) / (2. * sigma * sigma)).exp()),
+                );
+                *sum = weights.iter().sum();
+            }
+            self.kernel_count = Some(count);
+        }
         let layers = (0..5)
             .map(|layer| {
                 let target = now
                     .checked_sub(std::time::Duration::from_millis(layer * 50))
                     .unwrap_or(now);
                 let levels = delayed_levels(&self.history, target);
-                let radius = 10 + layer as usize * 2;
                 let gain = (3.5 + layer as f32 * 0.5) / 3.5;
-                scene_contour(&levels, count, max_spike * gain, radius)
+                scene_contour(
+                    &levels,
+                    count,
+                    max_spike * gain,
+                    &self.kernels[layer as usize],
+                    &mut self.outline_scratch,
+                )
             })
             .collect();
         (layers, self.beat)
@@ -348,17 +400,19 @@ fn delayed_levels(history: &VecDeque<(Instant, [f32; 32])>, target: Instant) -> 
     }
     history.back().unwrap().1
 }
-fn scene_contour(bands: &[f32; 32], count: usize, height: f32, radius: usize) -> Vec<f32> {
-    let raw = trap_outline(bands, count, height);
+fn scene_contour(
+    bands: &[f32; 32],
+    count: usize,
+    height: f32,
+    kernel: &(Vec<f32>, f32),
+    scratch: &mut Vec<f32>,
+) -> Vec<f32> {
+    let raw = trap_outline_with_scratch(bands, count, height, scratch);
     if count == 0 {
         return raw;
     }
-    let radius = radius.min(count.saturating_sub(1));
-    let sigma = (radius as f32 / 2.4).max(1.);
-    let weights: Vec<_> = (-(radius as isize)..=radius as isize)
-        .map(|offset| (-(offset as f32).powi(2) / (2. * sigma * sigma)).exp())
-        .collect();
-    let sum = weights.iter().sum::<f32>();
+    let (weights, sum) = kernel;
+    let radius = weights.len() / 2;
     (0..count)
         .map(|index| {
             weights
@@ -366,7 +420,7 @@ fn scene_contour(bands: &[f32; 32], count: usize, height: f32, radius: usize) ->
                 .enumerate()
                 .map(|(offset, weight)| raw[(index + count + offset - radius) % count] * weight)
                 .sum::<f32>()
-                / sum
+                / *sum
         })
         .collect()
 }
@@ -377,7 +431,16 @@ fn follow_levels(levels: &mut [f32; 32], targets: &[f32; 32], dt: f32) {
         *level += (target - *level) * (1. - (-dt.max(0.) / tau).exp());
     }
 }
+#[cfg(test)]
 fn trap_outline(bands: &[f32; 32], count: usize, max_spike: f32) -> Vec<f32> {
+    trap_outline_with_scratch(bands, count, max_spike, &mut Vec::new())
+}
+fn trap_outline_with_scratch(
+    bands: &[f32; 32],
+    count: usize,
+    max_spike: f32,
+    raw: &mut Vec<f32>,
+) -> Vec<f32> {
     if count < 4 {
         return vec![0.; count];
     }
@@ -385,14 +448,13 @@ fn trap_outline(bands: &[f32; 32], count: usize, max_spike: f32) -> Vec<f32> {
         let low = band.floor().clamp(0., 31.) as usize;
         bands[low] * (1. - band.fract()) + bands[(low + 1).min(31)] * band.fract()
     };
-    let raw: Vec<_> = (0..count)
-        .map(|k| {
-            let angle = k as f32 / count as f32 * std::f32::consts::TAU;
-            let band =
-                (1. - angle.abs().min(std::f32::consts::TAU - angle) / std::f32::consts::PI) * 31.;
-            sample(band.clamp(0., 31.)) * max_spike
-        })
-        .collect();
+    raw.clear();
+    raw.extend((0..count).map(|k| {
+        let angle = k as f32 / count as f32 * std::f32::consts::TAU;
+        let band =
+            (1. - angle.abs().min(std::f32::consts::TAU - angle) / std::f32::consts::PI) * 31.;
+        sample(band.clamp(0., 31.)) * max_spike
+    }));
     (0..count)
         .map(|k| {
             (raw[(k + count - 2) % count]
@@ -422,8 +484,43 @@ unsafe fn run_wasapi_capture(
     output_volume: Arc<AtomicU32>,
     scene_levels: Arc<Mutex<[f32; 32]>>,
 ) {
-    CoInitializeEx(std::ptr::null_mut(), 0);
+    let com_result = CoInitializeEx(std::ptr::null_mut(), 0);
+    if com_result < 0 {
+        return;
+    }
+    loop {
+        if active.load(Ordering::Relaxed) {
+            capture_session(
+                &levels,
+                &has_live_signal,
+                &last_update,
+                &active,
+                &output_volume,
+                &scene_levels,
+            );
+        }
+        if let Ok(mut value) = levels.lock() {
+            *value = [0.; 32];
+        }
+        if let Ok(mut value) = scene_levels.lock() {
+            *value = [0.; 32];
+        }
+        if let Ok(mut value) = has_live_signal.lock() {
+            *value = false;
+        }
+        // Retry failed/invalidated endpoints, and reopen after a window restore.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
 
+unsafe fn capture_session(
+    levels: &Mutex<[f32; 32]>,
+    has_live_signal: &Mutex<bool>,
+    last_update: &Mutex<Instant>,
+    active: &AtomicBool,
+    output_volume: &AtomicU32,
+    scene_levels: &Mutex<[f32; 32]>,
+) {
     let mut enumerator: *mut c_void = std::ptr::null_mut();
     let hr = CoCreateInstance(
         &CLSID_MM_DEVICE_ENUMERATOR as *const _ as _,
@@ -498,7 +595,6 @@ unsafe fn run_wasapi_capture(
     }
 
     let capture_vtbl = *(capture_ptr as *mut *mut IAudioCaptureClientVtbl);
-    let mut capture_running = false;
 
     let mut smoothed = [0.0f32; 64];
     let mut mono_ring: Vec<f32> = Vec::with_capacity(8192);
@@ -531,32 +627,28 @@ unsafe fn run_wasapi_capture(
             )
         })
         .collect();
-    loop {
+    if ((*client_vtbl).start)(audio_client) < 0 {
+        ((*capture_vtbl).release)(capture_ptr);
+        ((*client_vtbl).release)(audio_client);
+        return;
+    }
+    'capture: loop {
         if !active.load(Ordering::Relaxed) {
-            if capture_running {
-                let _ = ((*client_vtbl).stop)(audio_client);
-                capture_running = false;
-                mono_ring.clear();
-                smoothed.fill(0.);
-                if let Ok(mut value) = levels.lock() {
-                    *value = [0.; 32];
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(250));
-            continue;
-        }
-        if !capture_running {
-            let _ = ((*client_vtbl).start)(audio_client);
-            capture_running = true;
+            break;
         }
         std::thread::sleep(std::time::Duration::from_millis(15));
 
         let mut packet_length = 0u32;
         let mut got_audio = false;
 
-        while ((*capture_vtbl).get_next_packet_size)(capture_ptr, &mut packet_length) == 0
-            && packet_length > 0
-        {
+        loop {
+            let hr = ((*capture_vtbl).get_next_packet_size)(capture_ptr, &mut packet_length);
+            if hr < 0 {
+                break 'capture;
+            }
+            if packet_length == 0 {
+                break;
+            }
             let mut data_ptr: *mut u8 = std::ptr::null_mut();
             let mut num_frames = 0u32;
             let mut flags = 0u32;
@@ -600,38 +692,40 @@ unsafe fn run_wasapi_capture(
                         mono_ring.drain(0..excess);
                     }
 
-                    if mono_ring.len() >= N {
-                        let window_start = mono_ring.len() - N;
-                        let window = &mono_ring[window_start..];
-                        let gain =
-                            analysis_gain(f32::from_bits(output_volume.load(Ordering::Relaxed)));
-
-                        for b in 0..64 {
-                            let (cosine, sine) = &coefficients[b];
-                            let mut re = 0.;
-                            let mut im = 0.;
-                            for n in 0..N {
-                                let sample = window[n] * gain;
-                                re += sample * cosine[n];
-                                im += sample * sine[n];
-                            }
-                            let magnitude = (re * re + im * im).sqrt() / (N as f32 * 0.25);
-                            let db = if magnitude > 0. {
-                                20. * magnitude.log10()
-                            } else {
-                                -120.
-                            };
-                            smoothed[b] = crate::connect::dynamic_level(db);
-                        }
-                        got_audio = true;
-                    }
+                    got_audio = true;
                 }
-                ((*capture_vtbl).release_buffer)(capture_ptr, num_frames);
+                if ((*capture_vtbl).release_buffer)(capture_ptr, num_frames) < 0 {
+                    break 'capture;
+                }
             } else {
-                break;
+                break 'capture;
             }
         }
 
+        // Release queued packets before analyzing only the newest audio window.
+        if got_audio && mono_ring.len() >= N {
+            let window_start = mono_ring.len() - N;
+            let window = &mono_ring[window_start..];
+            let gain =
+                analysis_gain(f32::from_bits(output_volume.load(Ordering::Relaxed)));
+            for b in 0..64 {
+                let (cosine, sine) = &coefficients[b];
+                let mut re = 0.;
+                let mut im = 0.;
+                for n in 0..N {
+                    let sample = window[n] * gain;
+                    re += sample * cosine[n];
+                    im += sample * sine[n];
+                }
+                let magnitude = (re * re + im * im).sqrt() / (N as f32 * 0.25);
+                let db = if magnitude > 0. {
+                    20. * magnitude.log10()
+                } else {
+                    -120.
+                };
+                smoothed[b] = crate::connect::dynamic_level(db);
+            }
+        }
         if !got_audio {
             for b in smoothed.iter_mut() {
                 *b *= 0.88;
@@ -656,11 +750,51 @@ unsafe fn run_wasapi_capture(
             }
         }
     }
+    let _ = ((*client_vtbl).stop)(audio_client);
+    ((*capture_vtbl).release)(capture_ptr);
+    ((*client_vtbl).release)(audio_client);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cached_kernels_match_fresh_smoothing_after_size_changes() {
+        let mut state = TrapResponse::new();
+        let bands = std::array::from_fn(|i| i as f32 / 32.);
+        for count in [0, 1, 3, 17, 199, 17] {
+            state.frame(bands, Instant::now(), count, 100.);
+            for layer in 0..5 {
+                let radius = (10 + layer * 2).min(count.saturating_sub(1));
+                let sigma = (radius as f32 / 2.4).max(1.);
+                let weights: Vec<_> = (-(radius as isize)..=radius as isize)
+                    .map(|offset| (-(offset as f32).powi(2) / (2. * sigma * sigma)).exp())
+                    .collect();
+                let sum: f32 = weights.iter().sum();
+                let raw = trap_outline(&bands, count, 100.);
+                let expected: Vec<_> = (0..count)
+                    .map(|index| {
+                        weights
+                            .iter()
+                            .enumerate()
+                            .map(|(offset, weight)| {
+                                raw[(index + count + offset - radius) % count] * weight
+                            })
+                            .sum::<f32>()
+                            / sum
+                    })
+                    .collect();
+                let actual = scene_contour(
+                    &bands,
+                    count,
+                    100.,
+                    &state.kernels[layer],
+                    &mut state.outline_scratch,
+                );
+                assert_eq!(actual, expected);
+            }
+        }
+    }
     #[test]
     fn scene_layers_trail_a_hit_then_return_to_rest() {
         let mut state = TrapResponse::new();

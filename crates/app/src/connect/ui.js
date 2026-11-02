@@ -1,4 +1,32 @@
 /* Browser preferences stay on this device; playback remains on the host. */
+// Never reuse guest selections after the host changes its catalog provider.
+(() => {
+  const hostFetch = window.fetch.bind(window);
+  let provider = null;
+  window.fetch = async (input, init = {}) => {
+    const url = new URL(typeof input === 'string' ? input : input.url, location.href);
+    if (url.origin !== location.origin || !url.pathname.startsWith('/api/')) return hostFetch(input, init);
+    const captured = provider;
+    const method = String(init.method || 'GET').toUpperCase();
+    if (captured && url.pathname !== '/api/state') url.searchParams.set('host_provider', captured);
+    if (method === 'POST' && captured) {
+      const payload = init.body ? JSON.parse(init.body) : {};
+      init = {...init, headers: {...init.headers, 'Content-Type': 'application/json'}, body: JSON.stringify({...payload, provider: captured})};
+    }
+    const response = await hostFetch(url, init);
+    if (url.pathname === '/api/state' && response.ok) {
+      const state = await response.clone().json();
+      if (provider && state.provider && provider !== state.provider) {
+        location.reload();
+        throw new Error('Host provider changed');
+      }
+      provider = state.provider || provider;
+    } else if (captured && captured !== provider) {
+      throw new Error('Host provider changed');
+    }
+    return response;
+  };
+})();
 (() => {
   let language = localStorage.getItem('deeznats_language') === 'tr' ? 'tr' : 'en';
   let translations = {};
@@ -135,7 +163,7 @@
     root.style.colorScheme = effectiveLight ? 'light' : 'dark';
     document.body.classList.toggle('light-theme',effectiveLight);
     const backdrop = document.getElementById('song-backdrop');
-    backdrop.style.backgroundImage = artwork ? `url(${JSON.stringify(artwork)})` : 'none';
+    backdrop.style.backgroundImage = artwork && !artwork.includes("/images/cover/d41d8cd98f00b204e9800998ecf8427e/") ? `url(${JSON.stringify(artwork)})` : 'none';
     const backpanel=document.getElementById('theme-backpanel');
     backpanel.style.backgroundColor=rgba(palette.Background,appearance.opacity/100);
     backpanel.style.backdropFilter=`blur(${appearance.blur*.5}px)`;

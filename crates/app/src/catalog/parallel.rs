@@ -8,13 +8,23 @@ use std::sync::{
 pub(crate) fn load<T: Send>(
     count: usize,
     fetch: impl Fn(usize) -> T + Sync,
+    ready: impl FnMut(usize, T) -> Result<(), String>,
+) -> Result<(), String> {
+    load_with(3, count, fetch, ready)
+}
+
+pub(crate) fn load_with<T: Send>(
+    workers: usize,
+    count: usize,
+    fetch: impl Fn(usize) -> T + Sync,
     mut ready: impl FnMut(usize, T) -> Result<(), String>,
 ) -> Result<(), String> {
+    let workers = workers.max(1);
     let next = AtomicUsize::new(0);
     let cancelled = AtomicBool::new(false);
-    let (tx, rx) = mpsc::sync_channel(3);
+    let (tx, rx) = mpsc::sync_channel(workers);
     std::thread::scope(|scope| {
-        for _ in 0..count.min(3) {
+        for _ in 0..count.min(workers) {
             let tx = tx.clone();
             let fetch = &fetch;
             let next = &next;

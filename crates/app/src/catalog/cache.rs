@@ -28,6 +28,12 @@ impl Cache {
             budget,
         }
     }
+    pub(super) fn expire(&self) {
+        let now = Instant::now();
+        let mut state = self.state.lock().unwrap();
+        state.entries.retain(|entry| entry.expires > now);
+        state.bytes = state.entries.iter().map(|entry| entry.weight).sum();
+    }
     pub(super) fn load(
         &self,
         key: &str,
@@ -78,7 +84,7 @@ impl Cache {
                 state.bytes -= state.entries.remove(index).unwrap().weight;
             }
             while !state.entries.is_empty()
-                && (state.bytes + weight > self.budget || state.entries.len() >= 32)
+                && (state.bytes + weight > self.budget || state.entries.len() >= 256)
             {
                 state.bytes -= state.entries.pop_front().unwrap().weight;
             }
@@ -99,6 +105,21 @@ mod tests {
     use super::*;
     fn decode(bytes: &[u8]) -> Result<Value, String> {
         serde_json::from_slice(bytes).map_err(|e| e.to_string())
+    }
+    #[test]
+    fn expire_releases_only_expired_entries_and_updates_accounting() {
+        let cache = Cache::new(4096);
+        for key in ["old", "current"] {
+            cache
+                .load(key, Duration::from_secs(30), || Ok(b"{}".to_vec()), decode)
+                .unwrap();
+        }
+        cache.state.lock().unwrap().entries[0].expires = Instant::now();
+        cache.expire();
+        let state = cache.state.lock().unwrap();
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries[0].key, "current");
+        assert_eq!(state.bytes, state.entries[0].weight);
     }
     #[test]
     fn revisits_skip_download_and_parsing_but_expired_entries_refresh() {

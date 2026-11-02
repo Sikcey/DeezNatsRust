@@ -7,11 +7,18 @@ OpenDeezer audio engine. Unofficial; not affiliated with Deezer.
 
 - Personalized home shelves, discovery, search, artist pages, albums and playlists.
 - Favorites, liked albums, podcasts, Flow and a playback queue.
+- Flow's **Style Mix** button starts with languages, checks Deezer for playable matching playlists, then shows the available genres. Pick a genre to build a mix such as Turkish Pop or Japanese Rock. Playlist labels guide the selection; individual tracks are not language-verified.
 - Synchronized lyrics, equalizer, ReplayGain, gapless and crossfade controls.
-- Background downloads with progress, cancellation and offline library entries.
+- Background downloads with persistent pending jobs, automatic retries, cancellation and verified offline library entries.
+  Music is stored as encrypted files in `mediacache` inside the active data folder, with playback metadata in `mediacache/index.json`; it is not exported as MP3/FLAC files. Podcast episodes use the engine download folder (`Podcasts/<id>.mp3`). Unfinished and failed tracks resume after Deezer connects on the next launch.
 - Acrylic, artwork backgrounds, custom images, gradients and importable [themes](THEMES.md).
 - English, Turkish and Azerbaijani interface, plus Discord presence.
-- Connect hosting and a separate [native Connect client](crates/jam-client/README.md).
+- Windows media controls with track details, artwork and seeking; standard keyboard
+  media keys work automatically. Optional global shortcuts can be assigned in
+  Settings > Keyboard shortcuts and reset individually to the media-key defaults.
+- In-app updates with binary delta downloads and restart-to-apply controls in
+  Settings > General. Release update assets must be published to enable delivery.
+- Connect hosting with a browser client.
 
 Full playback and available quality depend on your account's entitlements.
 Saved sessions are encrypted for the current Windows user with DPAPI.
@@ -42,7 +49,8 @@ See [building and testing](docs/BUILDING.md) for engine and installer instructio
 Settings and session data live in `%LOCALAPPDATA%\DeezNatsRust`.
 After moving data in Settings, this AppData folder retains `storage-location.json`
 and its `.bak` recovery copy. Installed and standalone builds use this shared
-pointer automatically; upgrades and uninstalling preserve it and your data.
+pointer automatically; upgrades preserve it and your data. Uninstalling removes
+the current DeezNats data folder, including its managed Soloist installation.
 If the destination drive is disconnected, reconnect it before starting the app.
 The application can read a current-user legacy DeezNats session or a profile
 selected with `DEEZNATS_PROFILE`. Profiles and downloaded media are not included

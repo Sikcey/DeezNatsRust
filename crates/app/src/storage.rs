@@ -25,7 +25,8 @@ fn read(base: &Path) -> Result<Location, String> {
     let backup = primary.with_extension("json.bak");
     let bytes = match fs::read(&primary) {
         Ok(bytes) if serde_json::from_slice::<Location>(&bytes).is_ok() => Ok(bytes),
-        Ok(_) => fs::read(&backup).map_err(|e| format!("Invalid storage location; backup unavailable: {e}")),
+        Ok(_) => fs::read(&backup)
+            .map_err(|e| format!("Invalid storage location; backup unavailable: {e}")),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => match fs::read(&backup) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Location::default()),
             result => result.map_err(|e| e.to_string()),
@@ -48,7 +49,8 @@ fn write(base: &Path, location: &Location) -> Result<(), String> {
 pub fn data_dir_at(base: &Path) -> Result<PathBuf, String> {
     match read(base)?.active {
         Some(path) if !path.is_absolute() || !path.is_dir() => Err(format!(
-            "The configured data folder is unavailable: {}. Reconnect its drive and try again.", path.display()
+            "The configured data folder is unavailable: {}. Reconnect its drive and try again.",
+            path.display()
         )),
         Some(path) => Ok(path),
         None => Ok(base.join("DeezNatsRust")),
@@ -239,7 +241,8 @@ fn copy_tree(
                 || name == "storage-location.json.tmp"
                 || name == "storage-location.json.bak"
                 || name == "storage-location.json.bak.tmp"
-                || name == ".deeznats-migration.json" || name == "page-cache")
+                || name == ".deeznats-migration.json"
+                || name == "page-cache")
         {
             continue;
         }
@@ -303,7 +306,14 @@ mod tests {
         let base = fixture();
         let target = base.join("external/data");
         fs::create_dir_all(&target).unwrap();
-        write(&base, &Location { active: Some(target.clone()), ..Default::default() }).unwrap();
+        write(
+            &base,
+            &Location {
+                active: Some(target.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         fs::remove_file(manifest(&base)).unwrap();
         assert_eq!(data_dir_at(&base).unwrap(), target);
         initialize_at(&base).unwrap();
@@ -322,7 +332,11 @@ mod tests {
         let target = base.join("external/data");
         fs::create_dir_all(&target).unwrap();
         fs::create_dir_all(manifest(&base).parent().unwrap()).unwrap();
-        fs::write(manifest(&base), serde_json::to_vec(&serde_json::json!({"active":target})).unwrap()).unwrap();
+        fs::write(
+            manifest(&base),
+            serde_json::to_vec(&serde_json::json!({"active":target})).unwrap(),
+        )
+        .unwrap();
         initialize_at(&base).unwrap();
         fs::remove_file(manifest(&base)).unwrap();
         assert_eq!(data_dir_at(&base).unwrap(), target);
@@ -332,7 +346,14 @@ mod tests {
     fn unavailable_relocated_data_does_not_fall_back_to_an_empty_profile() {
         let base = fixture();
         let target = base.join("disconnected-drive/data");
-        write(&base, &Location { active: Some(target.clone()), ..Default::default() }).unwrap();
+        write(
+            &base,
+            &Location {
+                active: Some(target.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(data_dir_at(&base).is_err());
         assert!(initialize_at(&base).is_err());
         assert!(!target.exists());

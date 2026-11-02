@@ -32,6 +32,17 @@ pub(super) struct Autoplay {
     radio_version: i64,
 }
 
+fn manual_radio(s: &Snapshot, in_radio: bool) -> bool {
+    s.autoplay
+        && s.connected
+        && s.now.kind == "track"
+        && !s.now.id.is_empty()
+        && s.queue
+            .get(s.queue_index)
+            .is_some_and(|item| item.id == s.now.id)
+        && (in_radio || (s.repeat == 0 && s.queue_index + 1 == s.queue.len()))
+}
+
 fn eligible(s: &Snapshot, manual: bool) -> bool {
     s.autoplay
         && s.connected
@@ -108,6 +119,9 @@ impl Autoplay {
         if !self.valid(stamp, s, *version) {
             return Ok(());
         }
+        if item.id.starts_with("spotify:") {
+            return Err("Spotify radio must use the Spotify playback queue".into());
+        }
         // Insert exactly one row, preserving the native shuffle cycle/history.
         let index = s.queue_index + 1;
         dz.invoke(
@@ -115,6 +129,9 @@ impl Autoplay {
             &[serde_json::json!(item.wire().to_string())],
         )?;
         dz.invoke("DZQueueSetIndex", &[serde_json::json!(index)])?;
+        let mut queue = (*s.queue).clone();
+        queue.insert(index.min(queue.len()), item.clone());
+        s.queue = Arc::new(queue);
         sync_queue(dz, s, version)?;
         if dz
             .invoke(
@@ -144,17 +161,17 @@ impl Autoplay {
         s: &mut Snapshot,
         version: &mut i64,
     ) -> Result<bool, String> {
-        if !s.autoplay
-            || self.radio_id != s.now.id
-            || self.radio_id.is_empty()
-            || self.radio_version != *version
-        {
+        let in_radio = self.radio_id == s.now.id
+            && !self.radio_id.is_empty()
+            && self.radio_version == *version;
+        if !manual_radio(s, in_radio) {
             return Ok(false);
         }
         unsafe {
             (dz.stop)();
         }
         s.state = "Stopped".into();
+        self.remember(&s.now);
         self.begin_next(dz, s, version, true);
         Ok(true)
     }
@@ -231,10 +248,25 @@ impl Autoplay {
         self.pending = Some(Pending { stamp, result });
         std::thread::spawn(move || {
             let fetch = |name, id| {
-                engine
-                    .invoke(name, &[serde_json::json!(id)])
-                    .map(|v| crate::catalog::entries(&v, "track"))
+                let value = if seed.id.starts_with("spotify:") {
+                    crate::spotify::catalog_invoke(name, &[serde_json::json!(id)])
+                } else {
+                    engine.invoke(name, &[serde_json::json!(id)])
+                };
+                value.map(|v| crate::catalog::entries(&v, "track"))
             };
+            // A country/genre station must never widen into generic track radio.
+            if let Some(key) = seed.raw[crate::style_mix::MARKER].as_str() {
+                let tracks = if seed.id.starts_with("spotify:") {
+                    crate::catalog::spotify_style_mix(key)
+                        .map(|value| crate::catalog::entries(&value, "track"))
+                } else {
+                    crate::style_mix::Selection::parse(key)
+                        .and_then(|selection| crate::style_mix::tracks(&engine, selection))
+                };
+                let _ = tx.send(tracks);
+                return;
+            }
             let mut tracks = fetch("DZTrackMixJSON", &seed.id);
             if !seed.artist_id.is_empty()
                 && tracks.as_ref().map_or(true, |items| {
@@ -272,6 +304,29 @@ mod tests {
     }
 
     #[test]
+    fn manual_skip_starts_radio_only_at_non_looping_queue_end() {
+        let mut s = stopped();
+        s.state = "Playing".into();
+        assert!(manual_radio(&s, false));
+        for repeat in [1, 2] {
+            s.repeat = repeat;
+            assert!(!manual_radio(&s, false));
+            assert!(manual_radio(&s, true));
+        }
+        s.repeat = 0;
+        Arc::make_mut(&mut s.queue).push(track("next"));
+        assert!(!manual_radio(&s, false));
+        s.queue_index = 1;
+        s.now = track("next");
+        assert!(manual_radio(&s, false));
+        s.autoplay = false;
+        assert!(!manual_radio(&s, false));
+        s.autoplay = true;
+        s.now.kind = "episode".into();
+        assert!(!manual_radio(&s, false));
+    }
+
+    #[test]
     fn radio_is_consumed_one_by_one_without_reseeding_or_queue_pollution() {
         let mut a = Autoplay::default();
         let mut s = stopped();
@@ -303,8 +358,11 @@ mod tests {
         for mode in [1, 2] {
             s.repeat = mode;
             assert!(!a.valid(&stamp, &s, 10));
-            let manual = Stamp{manual:true,..stamp.clone()};
-            assert!(a.valid(&manual,&s,10));
+            let manual = Stamp {
+                manual: true,
+                ..stamp.clone()
+            };
+            assert!(a.valid(&manual, &s, 10));
         }
         s.repeat = 0;
         s.autoplay = false;

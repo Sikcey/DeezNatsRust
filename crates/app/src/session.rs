@@ -4,7 +4,30 @@ use std::{
     ptr::{null, null_mut},
 };
 use windows_sys::Win32::{Foundation::LocalFree, Security::Cryptography::*};
+pub(crate) fn deezer_saved_exists() -> bool {
+    if crate::storage::data_dir().is_ok_and(|dir| dir.join("deezer-signed-out").exists()) {
+        return false;
+    }
+    if crate::storage::data_dir().is_ok_and(|dir| dir.join("session.dat").is_file()) {
+        return true;
+    }
+    if let Some(dir) = std::env::var_os("DEEZNATS_PROFILE") {
+        return PathBuf::from(dir).join("session.dat").is_file();
+    }
+    std::env::var_os("LOCALAPPDATA").is_some_and(|base| {
+        let base = PathBuf::from(base);
+        base.join("DeezNats").join("session.dat").is_file()
+            || base.join("DeezerNative").join("session.dat").is_file()
+    })
+}
+
 pub fn saved() -> Result<String, String> {
+    if crate::storage::data_dir()?
+        .join("deezer-signed-out")
+        .exists()
+    {
+        return Err("No saved session found. Paste your ARL below and choose Connect.".into());
+    }
     let base =
         PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("User data directory unavailable")?);
     let own = crate::storage::data_dir()?.join("session.dat");
@@ -23,7 +46,22 @@ pub fn saved() -> Result<String, String> {
     read(directory.join("session.dat"))
 }
 pub fn save(session: &str) -> Result<(), String> {
-    save_file("session.dat", session)
+    save_file("session.dat", session)?;
+    remove_if_present(&crate::storage::data_dir()?.join("deezer-signed-out"))
+}
+pub(crate) fn logout() -> Result<(), String> {
+    let dir = crate::storage::data_dir()?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // Prevent legacy profiles from being silently imported again after sign-out.
+    std::fs::write(dir.join("deezer-signed-out"), []).map_err(|e| e.to_string())?;
+    remove_if_present(&dir.join("session.dat"))
+}
+fn remove_if_present(path: &std::path::Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 fn save_file(file: &str, session: &str) -> Result<(), String> {
     let directory = crate::storage::data_dir()?;
@@ -51,7 +89,11 @@ fn save_file(file: &str, session: &str) -> Result<(), String> {
             return Err("Windows could not protect the session".into());
         }
         let protected = std::slice::from_raw_parts(output.pbData, output.cbData as usize);
-        let result = std::fs::write(directory.join(file), protected).map_err(|e| e.to_string());
+        let result = if file.starts_with("spotify") {
+            atomic_write(&directory.join(file), protected)
+        } else {
+            std::fs::write(directory.join(file), protected).map_err(|e| e.to_string())
+        };
         LocalFree(output.pbData.cast());
         bytes.fill(0);
         result
@@ -94,12 +136,16 @@ fn read(path: PathBuf) -> Result<String, String> {
 }
 
 fn provider_path(name: &str) -> Result<PathBuf, String> {
-    if !matches!(name, "musixmatch") {
+    if !matches!(
+        name,
+        "musixmatch" | "spotify" | "spotify-soloist" | "spotify-web" | "spotify-web-api"
+    ) {
         return Err("Unknown credential provider".into());
     }
-    Ok(
-        crate::storage::data_dir()?.join(format!("{name}-lyrics.dat")),
-    )
+    Ok(crate::storage::data_dir()?.join(format!("{name}-lyrics.dat")))
+}
+pub(crate) fn provider_exists(name: &str) -> bool {
+    provider_path(name).is_ok_and(|path| path.is_file())
 }
 pub fn provider_saved(name: &str) -> Result<String, String> {
     read(provider_path(name)?).map_err(|_| "No protected provider session is available".into())
@@ -118,5 +164,60 @@ pub fn provider_remove(name: &str) -> Result<(), String> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(_) => Err("Could not remove provider session".into()),
+    }
+}
+
+// Replace protected Spotify credentials only after the complete new file reaches disk.
+fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    use std::{
+        io::Write,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let temporary = path.with_extension(format!(
+        "{}.{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|_| "Could not stage protected Spotify credentials")?;
+    let result = (|| {
+        file.write_all(bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|_| "Could not write protected Spotify credentials")?;
+        drop(file);
+        std::fs::rename(&temporary, path)
+            .map_err(|_| "Could not replace protected Spotify credentials".to_owned())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(test)]
+mod spotify_tests {
+    use super::*;
+    #[test]
+    fn spotify_atomic_replace_writes_complete_credentials() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "deeznats-spotify-session-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let file = directory.join("session.dat");
+        atomic_write(&file, b"old protected value").unwrap();
+        atomic_write(&file, b"new protected value").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"new protected value");
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        std::fs::remove_file(file).unwrap();
+        std::fs::remove_dir(directory).unwrap();
     }
 }

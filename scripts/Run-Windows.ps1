@@ -1,5 +1,5 @@
 param(
-    [string]$EnginePath = 'E:\DeezerNative\windows\DeezNats\native\libdeezercore.dll',
+    [string]$EnginePath = '',
     [switch]$Release,
     [switch]$BuildOnly,
     [string]$AppearanceProfile = ''
@@ -14,9 +14,17 @@ if ($Release) { $buildArgs += '--release'; $profile = 'release' }
 & $cargo @buildArgs
 if ($LASTEXITCODE -ne 0) { throw 'Rust build failed' }
 $output = Join-Path $PWD "target\$profile"
-if (Test-Path -LiteralPath $EnginePath) {
-    Copy-Item -LiteralPath $EnginePath -Destination (Join-Path $output 'libdeezercore.dll') -Force
-} else { Write-Warning 'Deezer engine DLL unavailable. Account playback requires the Deezer engine.' }
+$outputEngine = Join-Path $output 'libdeezercore.dll'
+if (!$EnginePath -and !(Test-Path -LiteralPath $outputEngine)) {
+    $EnginePath = 'E:\DeezerNative\windows\DeezNats\native\libdeezercore.dll'
+}
+if ($EnginePath -and (Test-Path -LiteralPath $EnginePath)) {
+    if ((Resolve-Path -LiteralPath $EnginePath).Path -ne $outputEngine) {
+        Copy-Item -LiteralPath $EnginePath -Destination $outputEngine -Force
+    }
+} elseif (!(Test-Path -LiteralPath $outputEngine)) {
+    Write-Warning 'Deezer engine DLL unavailable. Account playback requires the Deezer engine.'
+}
 Copy-Item -LiteralPath (Join-Path $PWD 'assets\DeezNats.ico') -Destination (Join-Path $output 'DeezNats.ico') -Force
 if (-not $BuildOnly) {
     # This is the interactive window the user is launching.

@@ -25,6 +25,19 @@ pub(crate) struct Engine {
     pub(crate) logout: unsafe extern "C" fn(),
 }
 impl Engine {
+    pub(crate) fn init_offline(&self, secret: &CString) -> Result<(), String> {
+        unsafe {
+            let initialize = self
+                .library
+                .get::<unsafe extern "C" fn(*const c_char) -> i32>(b"DZInitOffline\0")
+                .map_err(|e| format!("Offline playback unavailable: {e}"))?;
+            if initialize(secret.as_ptr()) == 0 {
+                return Err("The audio engine could not initialize offline playback".into());
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn apply_eq(&self, args: &[serde_json::Value]) -> Result<serde_json::Value, String> {
         let update = normalize_eq(args)?;
         if self

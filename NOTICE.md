@@ -18,10 +18,24 @@ The application license is retained at [LICENSE](LICENSE).
 
 ## Build and runtime dependencies
 
+The artwork thumbnail resizing routine adapts Sonora's `artwork_frame`, from
+[Sonora](https://github.com/sonorahq/sonora) commit `b525b2a` (0.45.0),
+Copyright (C) 2026 Sonora Contributors, GPL-3.0-or-later. The adapted code is in
+`crates/app/src/catalog/artwork_resize.rs`; changes are documented there.
+Its license is retained in [sonora-GPL-3.0.txt](assets/licenses/sonora-GPL-3.0.txt).
+
 Rust dependency versions are recorded in `Cargo.lock`; each crate retains its own
 license. Windows bindings use the Microsoft windows and windows-sys crates
 (MIT OR Apache-2.0); libloading uses ISC. WebView2 is subject to Microsoft's
 applicable SDK and runtime terms. NSIS builds the Windows installer.
+
+## Binary update patches
+
+Binary deltas use [qbsdiff](https://github.com/hucsmn/qbsdiff) under the MIT
+license. Its copyright and permission notice is retained in
+[assets/licenses/qbsdiff.txt](assets/licenses/qbsdiff.txt), included in source
+distributions and installed as `qbsdiff.LICENSE`. RustCrypto SHA-256 and semver
+are MIT OR Apache-2.0; exact dependency versions remain in `Cargo.lock`.
 
 ## KuGou protocol reference
 

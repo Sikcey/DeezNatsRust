@@ -1,4 +1,12 @@
 @font-face {font-family:DeezNatsIcons;src:url('/native-icons.ttf') format('truetype');font-display:swap;}
+#view-style-mix select option {background:var(--panel-solid);color:var(--text-main);}
+.style-mix-choices {display:grid;grid-template-columns:repeat(auto-fit,minmax(125px,1fr));gap:10px;}
+.style-mix-more {display:block;margin:14px auto 0;min-width:130px;text-align:center;}
+#view-style-mix [hidden] {display:none!important;}
+#style-mix-genre-section h3 {margin-bottom:12px;}
+.style-mix-spinner {display:inline-block;width:14px;height:14px;margin-right:10px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:style-mix-spin .8s linear infinite;vertical-align:middle;}
+.style-mix-spinner[hidden] {display:none;}
+@keyframes style-mix-spin {to {transform:rotate(360deg);}}
 .profile-name {white-space:normal;overflow-wrap:anywhere;min-width:0;}
 #nickname-dialog {box-sizing:border-box;width:min(440px,calc(100vw - 32px));max-height:calc(100dvh - 32px);overflow:auto;margin:auto;border:1px solid var(--border);border-radius:16px;padding:24px;background:var(--panel-solid,var(--bg,#190f19));color:var(--text-main);}
 #nickname-dialog::backdrop {background:rgba(0,0,0,.8);}
@@ -17,8 +25,6 @@
 #bottom-queue-btn {width:38px;height:38px;}
 [aria-pressed=true] {border-color:var(--accent)!important;}
 #bottom-queue-btn[aria-pressed=true],#settings-btn[aria-pressed=true] {color:var(--accent);}
-#view-lyrics #lyrics-lines.untimed {padding-top:24px;padding-bottom:32px;scroll-behavior:auto;}
-.lyric-line.untimed {filter:none!important;color:#fff!important;transform:none!important;}
 
 .lyric-line.current .line-karaoke {background:linear-gradient(90deg,var(--lyrics-active,var(--text-main)) var(--line-fill,0%),var(--lyrics-inactive,var(--text-sub)) var(--line-fill,0%));background-clip:text;-webkit-background-clip:text;color:transparent;}
 @media(max-width:640px) {
@@ -129,7 +135,8 @@ body .btn-main-stream.streaming {background:var(--raised-bg);color:var(--text-ma
   background:none!important;box-shadow:none!important;border:0;outline:0;color:#fff;
 }
 #view-lyrics .lyric-line {padding:0;border-radius:0;color:#c5c5ca;}
-#view-lyrics .lyric-line.current,#view-lyrics .lyric-line.untimed {color:#fff!important;}
+#view-lyrics .lyric-line.current {color:#fff!important;}
+#view-lyrics .lyric-line.current {transform:none;}
 #view-lyrics .lyric-line,#view-lyrics .lyric-frost,#view-lyrics .lyric-text,#view-lyrics .lyric-word {text-shadow:none!important;-webkit-text-stroke:0;}
 #view-lyrics .lyric-text {color:inherit;-webkit-text-fill-color:currentColor;}
 #view-lyrics .lyric-word {color:transparent;-webkit-text-fill-color:transparent;}
@@ -141,7 +148,6 @@ body .btn-main-stream.streaming {background:var(--raised-bg);color:var(--text-ma
 #view-lyrics .lyric-word {background:linear-gradient(90deg,#fff var(--fill,0%),#c5c5ca var(--fill,0%));background-clip:text;-webkit-background-clip:text;}
 #view-lyrics .lyric-translation,#view-lyrics #lyrics-provider {color:#c5c5ca;}
 #view-lyrics .lyric-gap.current {opacity:1;}
-#view-lyrics .lyric-line.untimed:first-child {margin-top:0;}
 /* Composite frosting after the glyphs are painted. Text shadows on clipped
    karaoke gradients can paint black over the foreground in some browsers. */
 #view-lyrics .lyric-frost,#view-lyrics .lyric-translation,#view-lyrics .lyric-gap,
@@ -149,6 +155,8 @@ body .btn-main-stream.streaming {background:var(--raised-bg);color:var(--text-ma
   text-shadow:none;-webkit-text-stroke:0;
   filter:drop-shadow(0 1px 2px #000) drop-shadow(0 0 8px #000c) drop-shadow(0 0 16px #000a);
 }
+#view-lyrics .lyric-line:not(.current) .lyric-word {background:none;color:inherit;-webkit-text-fill-color:currentColor;}
+#view-lyrics .lyric-line.blur-inactive:not(.current) .lyric-frost {filter:blur(2px) drop-shadow(0 1px 2px #000) drop-shadow(0 0 8px #000c) drop-shadow(0 0 16px #000a);}
 
 /* Playback is handled by the persistent player. */
 .player-left {cursor:default;}

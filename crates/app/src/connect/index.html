@@ -1001,7 +1001,7 @@
     #lyrics-lines { position:relative; height:58vh; overflow:auto; scroll-behavior:smooth; padding:20vh 12px; box-sizing:border-box; }
     .lyric-gap {font-size:30px;letter-spacing:14px;height:0;overflow:hidden;opacity:0;transition:opacity .2s;color:var(--text-sub);pointer-events:none;}
     .lyric-gap.current {height:54px;margin:20px 0;opacity:.7;}
-    .lyric-line {overflow-wrap:anywhere;white-space:pre-wrap; font-size:clamp(24px,4vw,42px); font-weight:800; margin:24px 0; color:rgba(255,255,255,.35); filter:blur(1px); transition:filter .3s,color .3s,transform .3s; transform-origin:left; }
+    .lyric-line {overflow-wrap:anywhere;white-space:pre-wrap; font-size:clamp(24px,4vw,42px); font-weight:800; margin:24px 0; color:rgba(255,255,255,.35); transition:color .3s,transform .3s; transform-origin:left; }
     .lyric-line.current { filter:none; color:white; transform:scale(1.025); }
     .lyric-word { background:linear-gradient(90deg,var(--accent,#ff334f) var(--fill,0%),rgba(255,255,255,.55) var(--fill,0%)); color:transparent; background-clip:text; -webkit-background-clip:text; }
     .lyric-translation { font-size:.55em; font-weight:500; margin-top:10px; color:rgba(255,255,255,.65); }
@@ -1077,6 +1077,31 @@
       </div>
     </div>
 
+    <div id="view-style-mix" class="view-panel">
+      <div class="card" style="padding:24px; display:grid; gap:16px;">
+        <button class="btn-act" style="justify-self:start;" onclick="switchTab('flow')">Back to Flow</button>
+        <h2>Style Mix</h2>
+        <p style="color:var(--text-sub);">Choose a language to see its available genres.</p>
+        <section id="style-mix-language-section">
+          <h3>Country / language</h3>
+          <div id="style-mix-region" class="style-mix-choices"></div>
+          <button id="style-mix-region-more" class="btn-act style-mix-more" onclick="toggleStyleMixChoices('region')" hidden>See more</button>
+        </section>
+        <div id="style-mix-language-selected" hidden>
+          <button class="btn-act" onclick="showStyleMixLanguages()">Change language</button>
+          <h3 id="style-mix-language-name" style="margin-top:16px;"></h3>
+        </div>
+        <p role="status"><span id="style-mix-spinner" class="style-mix-spinner" hidden aria-hidden="true"></span><span id="style-mix-status"></span></p>
+        <section id="style-mix-genre-section" hidden>
+          <h3>Genres</h3>
+          <div id="style-mix-genre" class="style-mix-choices"></div>
+          <button id="style-mix-genre-more" class="btn-act style-mix-more" onclick="toggleStyleMixChoices('genre')" hidden>See more</button>
+        </section>
+        <button id="style-mix-play" class="btn-act" onclick="startStyleMix()" hidden disabled>Play mix</button>
+        <div id="style-mix-tracks" style="display:grid; gap:8px;"></div>
+      </div>
+    </div>
+
     <!-- 4. FLOW VIEW -->
     <div id="view-flow" class="view-panel">
       <div class="card flow-hero">
@@ -1086,6 +1111,7 @@
           An endless mix of favorites and new discoveries. Choose your mood and let the music flow.
         </p>
         <div style="display:flex; gap:10px; flex-wrap:wrap; justify-content:center;">
+          <button class="btn-act" onclick="switchTab('style-mix')">Style Mix</button>
           <button class="btn-flow-start" onclick="startFlow(currentFlowId)">▶ Start Flow</button>
           <button class="btn-act" style="padding:14px 22px; border-radius:999px; font-weight:700; font-size:0.95rem; display:flex; align-items:center; gap:8px;" onclick="toggleTunerExpanded(true)">
             <span>🎛️ Customize Flow</span>
@@ -1469,6 +1495,30 @@
       row.replaceChildren(...fragments);
     }
     let lyricActive = -1;
+    let lyricFollowUntil = 0;
+    let lyricFollowPending = false;
+    function focusUntimedLyrics() {
+      if(lyricTimed || !lyricRows.length) return;
+      const container=document.getElementById('lyrics-lines');
+      const bounds=container.getBoundingClientRect();
+      const center=bounds.top+bounds.height/2;
+      let focused=null,distance=Infinity;
+      for(const row of lyricRows) {
+        if(!row.textContent.trim()) continue;
+        const rect=row.getBoundingClientRect();
+        const delta=Math.abs(rect.top+rect.height/2-center);
+        if(delta<distance) {distance=delta;focused=row;}
+      }
+      for(const row of lyricRows) row.classList.toggle('current',row===focused);
+    }
+    const lyricsScroller=document.getElementById('lyrics-lines');
+    lyricsScroller.addEventListener('scroll',focusUntimedLyrics,{passive:true});
+    for(const event of ['wheel','touchstart','pointerdown','keydown']) {
+      lyricsScroller.addEventListener(event,()=>{
+        lyricFollowUntil=performance.now()+4000;
+        lyricFollowPending=true;
+      },{passive:true});
+    }
     let lyricRequest = 0;
 function showLyricsError(message) {
   const container = document.getElementById('lyrics-lines');
@@ -1496,13 +1546,14 @@ function showLyricsError(message) {
     }
     if (lyricTrack === id) return;
       lyricTrack = id; lyricLines = []; lyricRows=[];lyricGaps=[];lyricFocus=null;lyricActive = -1;
+      lyricFollowUntil=0;lyricFollowPending=false;
       const request = ++lyricRequest;
       const container = document.getElementById('lyrics-lines');
       showLyricsStatus('Loading lyrics...');
       document.getElementById('lyrics-title').textContent = currentState.title || tr('Lyrics');
       document.getElementById('lyrics-provider').textContent = '';
       const backdrop = document.getElementById('lyrics-backdrop');
-      backdrop.style.backgroundImage = currentState.artwork ? `url(${JSON.stringify(currentState.artwork)})` : '';
+      backdrop.style.backgroundImage = currentState.artwork && !currentState.artwork.includes("/images/cover/d41d8cd98f00b204e9800998ecf8427e/") ? `url(${JSON.stringify(currentState.artwork)})` : '';
       try {
         const response = await fetch('/api/lyrics');
         if (!response.ok) throw new Error('Lyrics unavailable');
@@ -1514,7 +1565,7 @@ function showLyricsError(message) {
         lyricTimed=typeof data.timed==='boolean' ? data.timed : lyricLines.some(line=>Number(line.start_ms)>0 || Number(line.end_ms)>Number(line.start_ms) || line.syllables?.some(word=>Number(word.end_ms)>Number(word.start_ms)));
         container.replaceChildren();
         container.classList.toggle('untimed',!lyricTimed);
-        if(!lyricTimed) container.scrollTop=0;
+        container.scrollTop=0;
         document.getElementById('lyrics-provider').textContent = data.provider || '';
       if (!lyricLines.length) {
         if (data.error) showLyricsError(data.error);
@@ -1523,11 +1574,10 @@ function showLyricsError(message) {
         const blocks=[];
         lyricRows=lyricLines.map(line=>{
           const row=document.createElement('div');row.className='lyric-line';
-          if(!lyricBlur || !lyricTimed) row.style.filter='none';
+          row.classList.toggle('blur-inactive',lyricBlur);
           row.classList.toggle('untimed',!lyricTimed);
         const text=document.createElement('span');
         text.className='lyric-text';
-        if(lyricTimed && lyricKaraoke && !line.syllables?.length) text.classList.add('line-karaoke');
         appendTimedLyricText(text,line);
         const frost=document.createElement('div');frost.className='lyric-frost';
         frost.append(text);row.append(frost);
@@ -1539,6 +1589,11 @@ function showLyricsError(message) {
           blocks.push({start,row});return {start,end,row};
         });
         blocks.sort((a,b)=>a.start-b.start).forEach(block=>container.append(block.row));
+        if(!lyricTimed) {
+          const first=lyricRows.find(row=>row.textContent.trim());
+          if(first) first.scrollIntoView({block:'center',behavior:'instant'});
+          focusUntimedLyrics();
+        }
         updateLyrics(lyricsPlaybackPosition());
     } catch(e) { if (request === lyricRequest) showLyricsError(tr('Lyrics unavailable. Try again.')); }
     }
@@ -1553,15 +1608,13 @@ function showLyricsError(message) {
       if (index !== lyricActive || focused !== lyricFocus) {
         if (lyricRows[lyricActive]) {lyricRows[lyricActive].classList.remove('current');lyricRows[lyricActive].querySelectorAll('.lyric-word').forEach(w=>w.style.setProperty('--fill','0%'))}
         if(!gap && lyricRows[index]) lyricRows[index].classList.add('current');
-        if(focused && focused!==lyricFocus) focused.scrollIntoView({block:'center',behavior:waveReducedMotion.matches?'instant':'smooth'});
+        if(focused && focused!==lyricFocus) lyricFollowPending=true;
         lyricActive=index;lyricFocus=focused;
       }
-    if(index>=0 && !gap) {
-      const line=lyricLines[index];
-      const start=Number(line.start_ms);
-      const end=Number(line.end_ms)>start ? Number(line.end_ms) : Number(lyricLines[index+1]?.start_ms || curDuration);
-      lyricRows[index]?.style.setProperty('--line-fill',Math.max(0,Math.min(100,(position-start)/Math.max(1,end-start)*100))+'%');
-    }
+      if(focused && lyricFollowPending && performance.now()>=lyricFollowUntil) {
+        focused.scrollIntoView({block:'center',behavior:waveReducedMotion.matches?'instant':'smooth'});
+        lyricFollowPending=false;
+      }
     if(index>=0 && !gap) lyricRows[index]?.querySelectorAll('.lyric-word').forEach(word=>{
         const start=Number(word.dataset.start),end=Number(word.dataset.end);
         const percent=Math.max(0,Math.min(100,(position-start)/Math.max(1,end-start)*100));
@@ -1695,6 +1748,10 @@ function showLyricsError(message) {
     }
 
     function toggleLiveAudio() {
+      if (currentState?.stream_available === false) {
+        showToast('Live listening is unavailable for the selected host provider');
+        return;
+      }
       if (!streamWanted) {
         startLiveAudio();
       } else {
@@ -1804,7 +1861,7 @@ function showLyricsError(message) {
       document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
       document.querySelectorAll(".view-panel").forEach(p => p.classList.remove("active"));
 
-      const activeBtn = Array.from(document.querySelectorAll(".tab-btn")).find(b => b.getAttribute("onclick").includes(tabId));
+      const activeBtn = Array.from(document.querySelectorAll(".tab-btn")).find(b => b.getAttribute("onclick").includes(tabId === 'style-mix' ? 'flow' : tabId));
       if (activeBtn) activeBtn.classList.add("active");
 
       const panel = document.getElementById("view-" + tabId);
@@ -1814,10 +1871,167 @@ function showLyricsError(message) {
       refreshLyricsClock();
       if (tabId === "lyrics") { setLyricsVisualizer(lyricsVisualizerMode); loadLyrics(); }
       if (tabId === "discover") loadDiscover();
+      if (tabId === "style-mix") loadStyleMixOptions();
       if (tabId === "flow") {
         loadFlow(currentFlowId);
         loadFlowTuner(currentFlowId);
       }
+    }
+
+    let styleMixGeneration = 0;
+    let styleMixSelection = '';
+    let styleMixOptionsPromise;
+    let styleMixRegion = null;
+    let styleMixRegions = [];
+    let styleMixGenre = null;
+    let styleMixGenresRequest;
+    const styleMixExpanded = {region:false,genre:false};
+    function updateStyleMixChoices(kind) {
+      const grid = document.getElementById('style-mix-'+kind);
+      if (!grid.offsetWidth) return;
+      const columns = getComputedStyle(grid).gridTemplateColumns.split(' ').length;
+      const limit = columns*2;
+      Array.from(grid.children).forEach((button,index)=>button.hidden=!styleMixExpanded[kind] && index>=limit);
+      const more = document.getElementById('style-mix-'+kind+'-more');
+      more.hidden = grid.children.length<=limit;
+      more.textContent = tr(styleMixExpanded[kind]?'See less':'See more');
+      more.setAttribute('aria-expanded',String(styleMixExpanded[kind]));
+    }
+    function toggleStyleMixChoices(kind) {
+      styleMixExpanded[kind]=!styleMixExpanded[kind];
+      updateStyleMixChoices(kind);
+    }
+    window.addEventListener('resize',()=>{
+      updateStyleMixChoices('region'); updateStyleMixChoices('genre');
+    });
+    const styleMixKey = () => styleMixRegion + ':' + styleMixGenre;
+    function clearStyleMix() {
+      styleMixGeneration++;
+      styleMixSelection = '';
+      document.getElementById('style-mix-tracks').replaceChildren();
+      document.getElementById('style-mix-status').textContent = '';
+      document.getElementById('style-mix-play').disabled = true;
+      document.getElementById('style-mix-play').hidden = true;
+    }
+    async function loadStyleMixOptions() {
+      if (styleMixOptionsPromise) return styleMixOptionsPromise.then(()=>{
+        updateStyleMixChoices('region'); updateStyleMixChoices('genre');
+      });
+      styleMixOptionsPromise = (async () => {
+        const response = await fetch('/api/style-mix');
+        if (!response.ok) throw new Error('Could not load mix choices');
+        const data = await response.json();
+        styleMixRegions = data.regions;
+        document.getElementById('style-mix-region').replaceChildren(...data.regions.map((name,index) => {
+          const button = document.createElement('button');
+          button.className = 'btn-act'; button.textContent = tr(name);
+          button.dataset.region = String(index); button.setAttribute('aria-pressed','false');
+          button.onclick = () => loadStyleMixGenres(index);
+          return button;
+        }));
+        updateStyleMixChoices('region');
+      })().catch(error => {
+        styleMixOptionsPromise = null;
+        document.getElementById('style-mix-status').textContent = error.message;
+      });
+      return styleMixOptionsPromise;
+    }
+    function showStyleMixLanguages() {
+      styleMixGenresRequest?.abort();
+      styleMixRegion = null;
+      styleMixGenre = null;
+      clearStyleMix();
+      document.getElementById('style-mix-genre-section').hidden = true;
+      document.getElementById('style-mix-language-selected').hidden = true;
+      document.getElementById('style-mix-language-section').hidden = false;
+      updateStyleMixChoices('region');
+      document.getElementById('style-mix-spinner').hidden = true;
+    }
+    async function loadStyleMixGenres(region) {
+      styleMixGenresRequest?.abort();
+      styleMixGenresRequest = new AbortController();
+      styleMixRegion = region;
+      styleMixExpanded.genre = false;
+      styleMixGenre = null;
+      clearStyleMix();
+      document.getElementById('style-mix-language-section').hidden = true;
+      document.getElementById('style-mix-language-selected').hidden = false;
+      document.getElementById('style-mix-language-name').textContent = tr(styleMixRegions[region]);
+      const generation = styleMixGeneration;
+      document.querySelectorAll('#style-mix-region button').forEach(button => button.setAttribute('aria-pressed',String(Number(button.dataset.region)===region)));
+      const section = document.getElementById('style-mix-genre-section');
+      const choices = document.getElementById('style-mix-genre');
+      section.hidden = true; choices.replaceChildren();
+      const status = document.getElementById('style-mix-status');
+      const spinner = document.getElementById('style-mix-spinner');
+      spinner.hidden = false;
+      status.textContent = tr('Checking available genres...');
+      try {
+        const response = await fetch('/api/style-mix/genres?region='+region,{signal:styleMixGenresRequest.signal});
+        const data = await response.json();
+        if (generation !== styleMixGeneration) return;
+        if (!response.ok || data.error) throw new Error(data.error || 'Could not check genres. Please try again.');
+        choices.replaceChildren(...data.genres.map(genre => {
+          const button = document.createElement('button');
+          button.className='btn-act'; button.textContent=tr(genre.title);
+          button.dataset.genre=String(genre.id); button.setAttribute('aria-pressed','false');
+          button.onclick=()=>buildStyleMix(genre.id);
+          return button;
+        }));
+        section.hidden = !data.genres.length;
+        updateStyleMixChoices('genre');
+        status.textContent = !data.genres.length ? tr('No matching genres found. Try another language.') :
+          data.partial ? tr('Some genres could not be checked. Select the language to retry.') : '';
+      } catch(error) {
+        if (generation === styleMixGeneration) status.textContent = error.message;
+      } finally {
+        if (generation === styleMixGeneration) spinner.hidden = true;
+      }
+    }
+    async function buildStyleMix(genre) {
+      if (styleMixRegion === null) return;
+      styleMixGenre = genre;
+      clearStyleMix();
+      const generation = styleMixGeneration;
+      const selection = styleMixKey();
+      const status = document.getElementById('style-mix-status');
+      document.querySelectorAll('#style-mix-genre button').forEach(button=>button.setAttribute('aria-pressed',String(Number(button.dataset.genre)===genre)));
+      const spinner=document.getElementById('style-mix-spinner');
+      spinner.hidden=false;
+      status.textContent = tr('Finding matching music...');
+      try {
+        const response = await fetch('/api/style-mix?selection=' + encodeURIComponent(selection));
+        const data = await response.json();
+        if (generation !== styleMixGeneration) return;
+        if (!response.ok || data.error) throw new Error(data.error || 'Could not build this mix');
+        styleMixSelection = selection;
+        status.textContent = data.tracks.length ? data.title + ' · ' + data.tracks.length + ' songs' : tr('No playable tracks found in matching playlists. Try another language or genre.');
+        document.getElementById('style-mix-tracks').replaceChildren(...data.tracks.map(track => {
+          const button = document.createElement('button');
+          button.className = 'btn-act'; button.style.textAlign = 'left';
+          button.textContent = track.title + ' — ' + track.artist;
+          button.onclick = () => startStyleMix(track.id);
+          return button;
+        }));
+        document.getElementById('style-mix-play').disabled = !data.tracks.length;
+        document.getElementById('style-mix-play').hidden = !data.tracks.length;
+      } catch (error) {
+        if (generation === styleMixGeneration) status.textContent = error.message;
+      } finally {
+        if (generation === styleMixGeneration) spinner.hidden = true;
+      }
+    }
+    async function startStyleMix(trackId) {
+      if (!styleMixSelection || styleMixSelection !== styleMixKey()) return;
+      try {
+        const response = await fetch('/api/style-mix/start', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({selection:styleMixSelection, track_id:trackId, added_by:BrowserProfiles.nickname()})
+        });
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || 'Could not play this mix');
+        showToast('Playing Style Mix');
+      } catch (error) { showToast(error.message); }
     }
 
     // Progress bar loop
@@ -1843,6 +2057,10 @@ function showLyricsError(message) {
         const data = await res.json();
         const seekJump=streamStateJump(currentState,data,hostPlaybackPosition());
         currentState = data;
+        const streamButton = document.getElementById('header-stream-btn');
+        streamButton.disabled = data.stream_available === false;
+        streamButton.title = data.stream_available === false ? 'Live listening is unavailable for the selected host provider' : 'Listen live';
+        if (data.stream_available === false && streamWanted) stopLiveAudio();
         if(seekJump)scheduleSeekStreamRecovery();
         updatePlaybackModes(data);
         JamUI.songChanged(data);

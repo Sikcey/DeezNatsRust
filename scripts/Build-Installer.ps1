@@ -6,6 +6,10 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $project = Split-Path $PSScriptRoot -Parent
+$metadata = (& cargo metadata --manifest-path (Join-Path $project 'Cargo.toml') --no-deps --format-version 1 | ConvertFrom-Json)
+if ($LASTEXITCODE -ne 0) { throw 'Could not read the application version.' }
+$appVersion = ($metadata.packages | Where-Object { $_.name -eq 'deeznats-prototype' }).version
+$productVersion = ([version]$appVersion).ToString(3) + '.0'
 if (!$AppDirectory) { $AppDirectory = Join-Path $project 'target/release' }
 if (!$OutputDirectory) { $OutputDirectory = Join-Path $project 'artifacts/installer' }
 if (!$Compiler) { $Compiler = Join-Path $project '.local/installer-tools/nsis-3.11/makensis.exe' }
@@ -43,7 +47,7 @@ try {
         Add-SourceFile (Join-Path $EngineRoot $relative) ('DeezerNative/' + $relative)
     }
 } finally { $archive.Dispose(); $stream.Dispose() }
-& $Compiler /V2 "/DPROJECT=$project" "/DPAYLOAD=$AppDirectory" "/DOUTPUT=$OutputDirectory" (Join-Path $project 'installer/DeezNats.nsi')
+& $Compiler /V2 "/DPROJECT=$project" "/DPAYLOAD=$AppDirectory" "/DOUTPUT=$OutputDirectory" "/DAPPVERSION=$appVersion" "/DPRODUCTVERSION=$productVersion" (Join-Path $project 'installer/DeezNats.nsi')
 if ($LASTEXITCODE -ne 0) { throw 'Installer compilation failed.' }
 @((Join-Path $OutputDirectory 'DeezNats-Setup.exe'), $archivePath, (Join-Path $AppDirectory 'deeznats-prototype.exe'), (Join-Path $AppDirectory 'libdeezercore.dll')) |
     ForEach-Object { Get-FileHash -LiteralPath $_ -Algorithm SHA256 } | ForEach-Object { $_.Hash + '  ' + [IO.Path]::GetFileName($_.Path) } |

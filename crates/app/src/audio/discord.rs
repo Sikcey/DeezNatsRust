@@ -14,6 +14,7 @@ struct Config {
     enabled: bool,
     show_paused: bool,
     badge: bool,
+    status_name: u8,
     hide_details: bool,
     service_button: bool,
     app_button: bool,
@@ -25,6 +26,7 @@ impl Default for Config {
             enabled: true,
             show_paused: false,
             badge: true,
+            status_name: 0,
             hide_details: false,
             service_button: true,
             app_button: true,
@@ -33,7 +35,7 @@ impl Default for Config {
 }
 impl Config {
     fn value(&self) -> Value {
-        json!({"application_id":self.application_id,"enabled":self.enabled,"show_paused":self.show_paused,"badge":self.badge,"hide_details":self.hide_details,"service_button":self.service_button,"app_button":self.app_button})
+        json!({"application_id":self.application_id,"enabled":self.enabled,"show_paused":self.show_paused,"badge":self.badge,"status_name":self.status_name,"hide_details":self.hide_details,"service_button":self.service_button,"app_button":self.app_button})
     }
     fn update(&self, value: &Value) -> Result<Self, String> {
         let object = value
@@ -53,6 +55,13 @@ impl Config {
                     return Err("Enter a numeric Discord application ID, not a token".into());
                 }
                 next.application_id = id.into();
+                continue;
+            }
+            if key == "status_name" {
+                next.status_name = value
+                    .as_u64()
+                    .filter(|v| *v <= 3)
+                    .ok_or("Invalid status name")? as u8;
                 continue;
             }
             let flag = value.as_bool().ok_or("Discord options must be booleans")?;
@@ -84,6 +93,8 @@ impl Config {
                 config = value;
             }
         }
+        config.badge = false;
+        config.status_name = 1;
         config
     }
     fn save(&self) -> Result<(), String> {
@@ -100,14 +111,13 @@ impl Config {
     }
 }
 fn config_path() -> Option<std::path::PathBuf> {
-    Some(
-        crate::storage::data_dir().ok()?.join("discord-rpc.json"),
-    )
+    Some(crate::storage::data_dir().ok()?.join("discord-rpc.json"))
 }
 
 #[derive(Clone, Default)]
 struct Playback {
     state: String,
+    provider: String,
     title: String,
     artist: String,
     album: String,
@@ -121,6 +131,7 @@ impl Playback {
     fn from_snapshot(snapshot: &Snapshot) -> Self {
         Self {
             state: snapshot.state.clone(),
+            provider: snapshot.provider.label().to_string(),
             title: { snapshot.now.title.clone() },
             artist: { snapshot.now.subtitle.clone() },
             album: { snapshot.now.album.clone() },
@@ -144,13 +155,21 @@ fn clipped(text: &str) -> String {
 }
 fn activity(config: &Config, playback: &Playback, now: u64) -> Value {
     let playing = playback.state == "Playing";
-    if !config.enabled
-        || playback.title.is_empty()
-        || (!playing && !(config.show_paused && playback.state == "Paused"))
-    {
+    if !config.enabled || playback.title.is_empty() || !playing {
         return Value::Null;
     }
     let mut result = json!({"type":2,"details":clipped(if config.hide_details {"Listening to music"}else{&playback.title}),"state":clipped(if !playing {"Paused"}else if config.hide_details {"DeezNats"}else{&playback.artist})});
+    result["name"] = json!(clipped(match config.status_name {
+        0 => &playback.provider,
+        2 => &playback.title,
+        3 => &playback.artist,
+        _ => "DeezNats",
+    }));
+    result["status_display_type"] = json!(match config.status_name {
+        2 => 2,
+        3 => 1,
+        _ => 0,
+    });
     if playing && playback.duration > 0 {
         let start = now.saturating_sub(playback.position.min(playback.duration) / 1000);
         result["timestamps"] =
@@ -161,8 +180,8 @@ fn activity(config: &Config, playback: &Playback, now: u64) -> Value {
             json!({"large_image":playback.artwork,"large_text":clipped(&playback.album)});
     }
     if config.badge {
-        result["assets"]["small_image"] = json!("deeznats");
-        result["assets"]["small_text"] = json!("DeezNats");
+        result["assets"]["small_image"] = json!(playback.provider.to_ascii_lowercase());
+        result["assets"]["small_text"] = json!(&playback.provider);
     }
     let mut buttons = Vec::new();
     if config.service_button
@@ -597,6 +616,7 @@ mod tests {
     fn playing() -> Playback {
         Playback {
             state: "Playing".into(),
+            provider: "Deezer".into(),
             title: "Song".into(),
             artist: "Artist".into(),
             album: "Album".into(),
@@ -622,9 +642,8 @@ mod tests {
         assert!(activity(&config, &playback, 1000).is_null());
         let mut config = config;
         config.show_paused = true;
-        let value = activity(&config, &playback, 1000);
-        assert_eq!(value["state"], "Paused");
-        assert!(value.get("timestamps").is_none());
+        assert!(activity(&config, &playback, 1000).is_null());
+        playback.state = "Playing".into();
         config.hide_details = true;
         let value = activity(&config, &playback, 1000);
         assert_ne!(value["details"], "Song");

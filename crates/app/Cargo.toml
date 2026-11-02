@@ -4,20 +4,32 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+memory-profile = []
+diagnostics = ["memory-profile"]
+
 [dependencies]
 deeznats-core = { path = "../core" }
+deeznats-updater = { path = "../updater" }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 libloading = "0.8"
+windows-core = "0.62"
+windows-numerics = "0.3"
 webview2-com = "0.39.1"
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_Media_Audio"] }
+windows = { version = "0.62", features = ["Foundation", "Media", "Storage_Streams", "Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_System_Threading", "Win32_Security", "Win32_System_WinRT", "Win32_Media_Audio", "Win32_Graphics_Direct2D", "Win32_Graphics_Direct2D_Common", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Dxgi", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_DirectComposition", "Foundation_Numerics"] }
 serde_json = "1"
+sha2 = "0.10"
+sha1 = "0.10"
+hmac = "0.12"
+url = "2"
 serde = { version = "1", features = ["derive"] }
 base64 = "0.22"
 flate2 = "1"
+zip = { version = "9.1.2", default-features = false, features = ["deflate-flate2"] }
 roxmltree = "0.21"
 serde_yaml_ng = "0.10"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
@@ -27,11 +39,15 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Cryptography",
     "Win32_System_Memory",
     "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
     "Win32_Media_Audio",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_GdiPlus",
     "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_System_Registry",
     "Win32_UI_Controls",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",

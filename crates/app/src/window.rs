@@ -11,8 +11,8 @@ use std::{
     sync::Arc,
 };
 use windows_sys::Win32::UI::Shell::{
-    DefSubclassProc, SetWindowSubclass, ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD,
-    NIM_DELETE, NOTIFYICONDATAW,
+    DefSubclassProc, SetWindowSubclass, ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE,
+    NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows_sys::Win32::{
     Foundation::*,
@@ -22,13 +22,16 @@ use windows_sys::Win32::{
         Controls::{Dialogs::*, *},
         HiDpi::*,
         Input::KeyboardAndMouse::{
-            EnableWindow, GetCapture, IsWindowEnabled, ReleaseCapture, SetCapture, SetFocus,
-            TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_DOWN, VK_END, VK_HOME, VK_LEFT,
-            VK_RIGHT, VK_UP,
+            EnableWindow, GetCapture, GetFocus, IsWindowEnabled, ReleaseCapture, SetCapture,
+            SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_DOWN, VK_END, VK_HOME,
+            VK_LEFT, VK_RIGHT, VK_UP,
         },
         WindowsAndMessaging::*,
     },
 };
+use crate::drawing::gpu;
+mod compositor_clock;
+mod artwork_damage;
 const SEARCH: i32 = 501;
 const SESSION: i32 = 502;
 const TRACK: i32 = 503;
@@ -46,6 +49,55 @@ const ART_FADE_MS: u128 = 560;
 const BACKGROUND_FADE_OUT_MS: u64 = 440;
 const BACKGROUND_FADE_IN_MS: u64 = 560;
 const PALETTE_FADE_MS: u128 = 500;
+
+mod frame_pacing;
+
+// Window timers are generated only when the queue is otherwise idle, including
+// inside Windows' native menu and move/resize loops. Posted animation messages
+// can continuously outrank mouse and keyboard input in those nested loops.
+thread_local! {
+    static ANIMATION_TIMERS: std::cell::RefCell<std::collections::HashSet<usize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+static BACKGROUND_FRAME_INTERVAL_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+unsafe fn start_animation_timer(hwnd: HWND, id: usize) {
+    ANIMATION_TIMERS.with(|timers| {
+        if timers.borrow_mut().insert(id) {
+            let interval = BACKGROUND_FRAME_INTERVAL_NS.load(std::sync::atomic::Ordering::Relaxed);
+            // Marquees move slowly; repainting them at 100 Hz needlessly
+            // competes with the rest of the UI for render time.
+            let minimum_ms = if id == 4 { 33 } else { 10 };
+            let millis = ((interval + 999_999) / 1_000_000).max(minimum_ms) as u32;
+            if unsafe { SetTimer(hwnd, id, millis, None) } == 0 {
+                timers.borrow_mut().remove(&id);
+            } else {
+                frame_pacing::start(hwnd, id);
+            }
+        }
+    });
+}
+
+unsafe fn stop_animation_timer(hwnd: HWND, id: usize) {
+    frame_pacing::stop(hwnd, id);
+    ANIMATION_TIMERS.with(|timers| {
+        timers.borrow_mut().remove(&id);
+    });
+    unsafe {
+        KillTimer(hwnd, id);
+    }
+}
+
+unsafe fn refresh_animation_timers(hwnd: HWND) {
+    let ids = ANIMATION_TIMERS.with(|timers| timers.borrow().iter().copied().collect::<Vec<_>>());
+    for id in ids {
+        unsafe {
+            stop_animation_timer(hwnd, id);
+            start_animation_timer(hwnd, id);
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 enum BackgroundTransition {
@@ -267,24 +319,98 @@ fn marquee_offset(elapsed: f64, overflow: f64, speed: f64) -> f64 {
     ((phase - 0.7).max(0.0) * speed).min(overflow)
 }
 unsafe fn draw_hover_text(
-    hwnd: HWND, dc: HDC, font: HFONT, text: &str, rect: RECT,
-    color: u32, flags: u32, scale: f64,
+    hwnd: HWND,
+    dc: HDC,
+    font: HFONT,
+    text: &str,
+    rect: RECT,
+    color: u32,
+    flags: u32,
+    scale: f64,
 ) {
     draw_automatic_text(hwnd, dc, font, text, rect, color, flags, scale);
 }
+thread_local! {static CREDIT_WIDTHS: std::cell::RefCell<HashMap<usize,HashMap<String,i32>>> = std::cell::RefCell::new(HashMap::new());}
 thread_local! {static AUTO_MARQUEES:std::cell::RefCell<HashMap<String,(RECT,std::time::Instant,std::time::Instant)>>=std::cell::RefCell::new(HashMap::new());}
-unsafe fn draw_automatic_text(hwnd:HWND,dc:HDC,font:HFONT,text:&str,rect:RECT,color:u32,flags:u32,scale:f64){
-    let previous=SelectObject(dc,font);let value=wide(text);let mut extent:SIZE=zeroed();
-    GetTextExtentPoint32W(dc,value.as_ptr(),(value.len()-1)as i32,&mut extent);SelectObject(dc,previous);
-    extent.cx=extent.cx.max(crate::drawing::lyric_text_width(dc,font,text)+4);
-    let overflow=extent.cx-(rect.right-rect.left);
-    if overflow<=0{draw_text(dc,font,text,rect,color,flags|DT_SINGLELINE|crate::drawing::LYRICS_UNTRIMMED);return;}
-    let now=std::time::Instant::now();let key=format!("{}:{}:{}:{}:{}",rect.left,rect.top,rect.right,rect.bottom,text);
-    let elapsed=AUTO_MARQUEES.with(|states|{let mut states=states.borrow_mut();states.retain(|_,(_,_,painted)|painted.elapsed().as_secs()<2);let state=states.entry(key).or_insert((rect,now,now));state.2=now;state.1.elapsed().as_secs_f64()});
-    if GetForegroundWindow()==hwnd{SetTimer(hwnd,4,16,None);}
-    let saved=SaveDC(dc);IntersectClipRect(dc,rect.left,rect.top,rect.right,rect.bottom);
-    let mut scrolling=rect;scrolling.left-=marquee_offset(elapsed,overflow as f64,36.*scale)as i32;scrolling.right=scrolling.left+extent.cx+2;
-    draw_text(dc,font,text,scrolling,color,DT_LEFT|DT_VCENTER|DT_SINGLELINE|crate::drawing::LYRICS_UNTRIMMED);RestoreDC(dc,saved);
+// Cleared before DPI-dependent fonts are replaced.
+unsafe fn automatic_text_width(dc: HDC, font: HFONT, text: &str) -> i32 {
+    CREDIT_WIDTHS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(width) = cache.get(&(font as usize)).and_then(|values|values.get(text)) {
+            return *width;
+        }
+        if cache.values().map(|values|values.len()).sum::<usize>() >= 2048 {
+            cache.clear();
+        }
+        let previous = SelectObject(dc, font);
+        let value = wide(text);
+        let mut extent: SIZE = zeroed();
+        GetTextExtentPoint32W(dc, value.as_ptr(), (value.len() - 1) as i32, &mut extent);
+        SelectObject(dc, previous);
+        let width = extent
+            .cx
+            .max(crate::drawing::lyric_text_width(dc, font, text) + 4);
+        cache.entry(font as usize).or_default().insert(text.to_owned(), width);
+        width
+    })
+}
+
+fn reset_marquees() {
+    AUTO_MARQUEES.with(|states| states.borrow_mut().clear());
+    MARQUEE.with(|state| *state.borrow_mut() = None);
+}
+
+unsafe fn draw_automatic_text(
+    hwnd: HWND,
+    dc: HDC,
+    font: HFONT,
+    text: &str,
+    rect: RECT,
+    color: u32,
+    flags: u32,
+    scale: f64,
+) {
+    if RectVisible(dc,&rect)==0 {return;}
+    let width = automatic_text_width(dc, font, text);
+    let overflow = width - (rect.right - rect.left);
+    if overflow <= 0 {
+        draw_text(
+            dc,
+            font,
+            text,
+            rect,
+            color,
+            flags | DT_SINGLELINE | crate::drawing::LYRICS_UNTRIMMED,
+        );
+        return;
+    }
+    let now = std::time::Instant::now();
+    let key = format!(
+        "{}:{}:{}:{}:{}",
+        rect.left, rect.top, rect.right, rect.bottom, text
+    );
+    let elapsed = AUTO_MARQUEES.with(|states| {
+        let mut states = states.borrow_mut();
+        let state = states.entry(key).or_insert((rect, now, now));
+        state.0 = rect;
+        state.2 = now;
+        state.1.elapsed().as_secs_f64()
+    });
+    start_animation_timer(hwnd, 4);
+    let saved = SaveDC(dc);
+    IntersectClipRect(dc, rect.left, rect.top, rect.right, rect.bottom);
+    let mut scrolling = rect;
+    scrolling.left -= marquee_offset(elapsed, overflow as f64, 36. * scale) as i32;
+    scrolling.right = scrolling.left + width + 2;
+    draw_text(
+        dc,
+        font,
+        text,
+        scrolling,
+        color,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | crate::drawing::LYRICS_UNTRIMMED,
+    );
+    RestoreDC(dc, saved);
 }
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
@@ -302,21 +428,32 @@ struct EditBackdrop {
 struct App {
     queue_drag: Option<(usize, i32, bool, usize, Vec<String>)>,
     queue_scroll_drag: bool,
+    queue_wheel_remainder: f64,
+    queue_glide: Option<(f64, f64, f64, std::time::Instant)>,
+    middle_scroll: Option<(bool, i32, bool, std::time::Instant)>,
     caption_buttons: [HWND; 3],
     collapse_button: HWND,
     tray_added: bool,
     search_backdrop: std::cell::RefCell<Option<EditBackdrop>>,
     worker: Worker,
+    updater: crate::updater::Worker,
+    media_controls: Option<crate::media_controls::Controls>,
+    shortcuts: Option<crate::shortcuts::Shortcuts>,
     snapshot: Snapshot,
-    playback_tick: std::time::Instant,
+    playback_clock: PlaybackClock,
     karaoke_preview_started: std::time::Instant,
     lyric_motion: Option<(std::time::Instant, i32)>,
-    lyrics_mode_motion:Option<(std::time::Instant,f32,f32)>,
+    lyrics_mode_motion: Option<(std::time::Instant, f32, f32)>,
     lyric_motion_offset: i32,
     lyric_motion_track: String,
     ui: Ui,
     scene: Scene,
     buttons: Vec<HWND>,
+    button_text: Vec<String>,
+    canvas_pressed: Option<(usize, String)>,
+    canvas_hover: Option<usize>,
+    canvas_focus: Option<usize>,
+    canvas_keyboard: HWND,
     edits: HashMap<i32, HWND>,
     fonts: [HFONT; 12],
     lyrics_fonts: Option<(u32, i32, HFONT, HFONT, HFONT)>,
@@ -332,6 +469,18 @@ struct App {
     scroll_grab_offset: i32,
     catalog: crate::catalog::Worker,
 
+    spotify_service: Option<crate::spotify::service::Service>,
+    spotify_opened: bool,
+    spotify_setup: Option<(
+        Arc<std::sync::atomic::AtomicBool>,
+        std::sync::mpsc::Receiver<Result<(), String>>,
+    )>,
+    spotify_auth: Option<(
+        Arc<std::sync::atomic::AtomicBool>,
+        std::sync::mpsc::Receiver<Result<(), String>>,
+    )>,
+    spotify_device_request: Option<u64>,
+    spotify_jam_request: Option<(u64, Option<String>, bool, crate::spotify::jam::Request)>,
     deezer_auth: Option<(
         Arc<std::sync::atomic::AtomicBool>,
         std::sync::mpsc::Receiver<Result<String, String>>,
@@ -341,7 +490,7 @@ struct App {
     images: HashMap<String, Arc<crate::catalog::Bitmap>>,
     image_order: VecDeque<String>,
     image_pending: HashSet<String>,
-    image_retry_at: HashMap<String,std::time::Instant>,
+    image_retry_at: HashMap<String, std::time::Instant>,
     generation: u64,
     entity: Option<crate::catalog::Entry>,
     query: String,
@@ -365,6 +514,8 @@ struct App {
     scroll_tick: std::time::Instant,
     wheel_remainder: f64,
     layout_scroll: i32,
+    artwork_prefetch_scroll: i32,
+    artwork_prefetch_upward: bool,
     scroll_started: std::time::Instant,
     backdrop_cache: std::cell::RefCell<(Option<BackdropKey>, Vec<u32>)>,
     palette_state: std::cell::RefCell<PaletteState>,
@@ -379,7 +530,8 @@ struct App {
     eq_drag: Option<(u8, usize)>,
     visualizer: crate::visualizer::Visualizer,
     podcast_ids: HashSet<String>,
-    library_pending: Option<(crate::catalog::Entry, bool)>,
+    library_pending: Option<(u64, crate::catalog::Entry, bool)>,
+    playlist_generation: Option<u64>,
     discord_seen: serde_json::Value,
     library_loaded: bool,
     lyrics_hover_start: std::time::Instant,
@@ -387,7 +539,85 @@ struct App {
     lyrics_hover_to: f32,
     connect: Option<crate::connect::ConnectHub>,
 }
+struct PlaybackClock {
+    position: u64,
+    sampled_at: std::time::Instant,
+    correction: i64,
+}
+
+impl Default for PlaybackClock {
+    fn default() -> Self {
+        Self {
+            position: 0,
+            sampled_at: std::time::Instant::now(),
+            correction: 0,
+        }
+    }
+}
+
+impl PlaybackClock {
+    fn position(&self, now: std::time::Instant, playing: bool) -> u64 {
+        if !playing {
+            return self.position;
+        }
+        let elapsed = now
+            .saturating_duration_since(self.sampled_at)
+            .as_millis()
+            .min(1500) as u64;
+        let correction = self.correction * elapsed.min(500) as i64 / 500;
+        self.position
+            .saturating_add(elapsed)
+            .saturating_add_signed(correction)
+    }
+
+    fn sample(&mut self, position: u64, now: std::time::Instant, smooth: bool) {
+        let predicted = self.position(now, true);
+        let error = position as i128 - predicted as i128;
+        if smooth && error.abs() < 500 {
+            // Preserve this frame's position and absorb small engine corrections
+            // over half a second. The clock always moves forward while playing.
+            self.position = predicted;
+            self.correction = error.clamp(-250, 250) as i64;
+        } else {
+            // Seeks, track changes and playback-state changes land immediately.
+            self.position = position;
+            self.correction = 0;
+        }
+        self.sampled_at = now;
+    }
+}
+
 impl App {
+    fn playback_position(&self) -> u64 {
+        let position = self
+            .playback_clock
+            .position(std::time::Instant::now(), self.playing());
+        if self.snapshot.duration > 0 {
+            position.min(self.snapshot.duration)
+        } else {
+            position
+        }
+    }
+
+    fn lyric_layout_changed(&self, position: u64) -> bool {
+        if self.ui.view != View::Lyrics {
+            return false;
+        }
+        if self.ui.rich_lyrics.is_empty() {
+            return self.ui.lyrics.iter().rposition(|l| l.0 <= position)
+                != self.ui.lyrics.iter().rposition(|l| l.0 <= self.ui.position);
+        }
+        let lines = &self.ui.rich_lyrics;
+        lines.iter().rposition(|l| l.start_ms <= position)
+            != lines.iter().rposition(|l| l.start_ms <= self.ui.position)
+            || crate::lyrics::instrumental_gaps(lines, self.ui.duration)
+                .iter()
+                .any(|&(start, end)| {
+                    (start <= position && position < end)
+                        != (start <= self.ui.position && self.ui.position < end)
+                })
+    }
+
     fn lyrics_hover_progress(&self) -> f32 {
         let elapsed = self.lyrics_hover_start.elapsed().as_secs_f32();
         let dur = 0.18;
@@ -571,7 +801,9 @@ impl App {
     }
 
     fn interpolated_palette_and_accent(&self) -> [u32; 9] {
-        if let Some(palette)=PAINT_PALETTE.with(|value|value.get()){return palette;}
+        if let Some(palette) = PAINT_PALETTE.with(|value| value.get()) {
+            return palette;
+        }
         let target = self.raw_target_palette();
         let mut state = self.palette_state.borrow_mut();
         if state.target == [0; 9] {
@@ -738,10 +970,9 @@ unsafe fn draw_karaoke_row(
     let Some(words) = crate::lyrics::word_ranges(line) else {
         return false;
     };
-    let previous = SelectObject(dc, font);
     let measure = |text: &str| crate::drawing::lyric_text_width(dc, font, text);
     let active_color = if is_light { palette[4] } else { 0x00ffffff };
-    let inactive_color = if is_light { palette[5] } else { 0x00a0a0a0 };
+    let inactive_color = if is_light { palette[5] } else { 0x00808080 };
     let shimmer_color = if is_light { accent } else { 0x00ffffff };
     let mut cursor = range.start;
     for (span, word) in words {
@@ -798,7 +1029,6 @@ unsafe fn draw_karaoke_row(
             DT_LEFT | crate::drawing::LYRICS_UNTRIMMED,
         );
     }
-    SelectObject(dc, previous);
     true
 }
 unsafe fn make_control(hwnd: HWND, class: &str, id: i32, style: u32, app: &App) -> HWND {
@@ -884,14 +1114,23 @@ unsafe extern "system" fn canvas_control(
             return 0;
         }
     }
-    if id==VOLUME && msg==WM_MOUSEWHEEL{
-        thread_local!{static WHEEL:std::cell::Cell<i32>=const{std::cell::Cell::new(0)};}
-        let delta=((wp>>16)as u16 as i16)as i32;
-        let steps=WHEEL.with(|value|{let total=value.get()+delta;value.set(total%120);total/120});
-        let old=SendMessageW(hwnd,WM_USER,0,0)as i32;
-        let value=(old+steps*2).clamp(0,100);
-        SendMessageW(hwnd,TBM_SETPOS,1,value as isize);
-        SendMessageW(GetParent(hwnd),WM_HSCROLL,TB_ENDTRACK as usize,hwnd as isize);
+    if id == VOLUME && msg == WM_MOUSEWHEEL {
+        thread_local! {static WHEEL:std::cell::Cell<i32>=const{std::cell::Cell::new(0)};}
+        let delta = ((wp >> 16) as u16 as i16) as i32;
+        let steps = WHEEL.with(|value| {
+            let total = value.get() + delta;
+            value.set(total % 120);
+            total / 120
+        });
+        let old = SendMessageW(hwnd, WM_USER, 0, 0) as i32;
+        let value = (old + steps * 2).clamp(0, 100);
+        SendMessageW(hwnd, TBM_SETPOS, 1, value as isize);
+        SendMessageW(
+            GetParent(hwnd),
+            WM_HSCROLL,
+            TB_ENDTRACK as usize,
+            hwnd as isize,
+        );
         return 0;
     }
     if id == VOLUME && msg == WM_KEYDOWN {
@@ -906,8 +1145,16 @@ unsafe extern "system" fn canvas_control(
                     SendMessageW(parent, WM_KEYDOWN, 27, 0);
                     return 0;
                 }
-                VK_HOME => Some(if (*pointer).scene.volume_vertical{100}else{0}),
-                VK_END => Some(if (*pointer).scene.volume_vertical{0}else{100}),
+                VK_HOME => Some(if (*pointer).scene.volume_vertical {
+                    100
+                } else {
+                    0
+                }),
+                VK_END => Some(if (*pointer).scene.volume_vertical {
+                    0
+                } else {
+                    100
+                }),
                 _ => None,
             };
             if let Some(value) = value {
@@ -935,10 +1182,11 @@ unsafe extern "system" fn canvas_control(
             ClientToScreen(hwnd, &mut pt);
             let parent = GetParent(hwnd);
             if !parent.is_null() {
-                screen_to_content(parent, &mut pt);
+                // WM_CONTEXTMENU takes screen coordinates. Let the parent convert
+                // once, just as it does for a right-click on the window itself.
                 let parent_lp =
                     ((pt.x as u16 as usize) | (((pt.y as u16) as usize) << 16)) as isize;
-                SendMessageW(parent, WM_RBUTTONUP, wp, parent_lp);
+                SendMessageW(parent, WM_CONTEXTMENU, hwnd as usize, parent_lp);
             }
             return 0;
         }
@@ -1012,7 +1260,7 @@ unsafe extern "system" fn canvas_control(
                     };
                     if app.ui.lyrics_cover_hovered != hovered {
                         app.set_lyrics_cover_hover(hovered);
-                        SetTimer(parent, 2, 16, None);
+                        start_animation_timer(parent, 2);
                         rebuild(parent, app);
                     }
                 }
@@ -1083,16 +1331,19 @@ unsafe fn toggle_library(app: &mut App, item: crate::catalog::Entry) {
             return;
         }
     };
-    let Some(engine) = app.snapshot.engine.clone() else {
-        app.notice = "Connect to Deezer first".into();
+    if !app.snapshot.connected {
+        app.notice = format!("Connect to {} first", app.ui.provider.label());
         return;
-    };
+    }
     if app
         .catalog
         .requests
         .send(crate::catalog::Request {
+            #[cfg(feature = "diagnostics")]
+            view_tag: app.ui.view as usize + 1,
             generation: app.generation,
-            engine,
+            provider: app.ui.provider,
+            engine: app.snapshot.engine.clone(),
             job,
         })
         .is_err()
@@ -1100,7 +1351,7 @@ unsafe fn toggle_library(app: &mut App, item: crate::catalog::Entry) {
         app.notice = "Catalog worker is unavailable.".into();
         return;
     }
-    app.library_pending = Some((item, add));
+    app.library_pending = Some((app.generation, item, add));
     app.notice = "Updating library...".into();
 }
 fn adopt_podcasts(app: &mut App, value: &serde_json::Value) {
@@ -1117,6 +1368,18 @@ fn adopt_podcasts(app: &mut App, value: &serde_json::Value) {
 }
 
 fn share_link(item: &crate::catalog::Entry) -> Option<String> {
+    if let Some(rest) = item.id.strip_prefix("spotify:") {
+        let (kind, id) = rest.split_once(':')?;
+        if matches!(
+            kind,
+            "track" | "episode" | "album" | "artist" | "playlist" | "show"
+        ) && id.len() == 22
+            && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        {
+            return Some(format!("https://open.spotify.com/{kind}/{id}"));
+        }
+        return None;
+    }
     if item.id.is_empty() || !item.id.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
@@ -1184,7 +1447,35 @@ unsafe fn paint_search_edit(
     let previous = SEARCH_TEXT_MASK.replace(true);
     SetTextColor(memory, rgb(255, 255, 255));
     SetBkColor(memory, 0);
-    SendMessageW(hwnd, WM_PRINTCLIENT, memory as usize, PRF_CLIENT as isize);
+    if GetWindowTextLengthW(hwnd) == 0 {
+        // The themed native cue banner paints its own opaque background.
+        // Render it into the same text mask as entered text instead.
+        let mut cue = [0u16; 512];
+        if SendMessageW(
+            hwnd,
+            EM_GETCUEBANNER,
+            cue.as_mut_ptr() as usize,
+            cue.len() as isize,
+        ) != 0
+        {
+            let mut rect = zeroed();
+            SendMessageW(hwnd, EM_GETRECT, 0, &mut rect as *mut RECT as isize);
+            let font = SendMessageW(hwnd, WM_GETFONT, 0, 0) as HGDIOBJ;
+            let previous_font = SelectObject(memory, font);
+            SetTextColor(memory, rgb(160, 160, 160));
+            SetBkMode(memory, TRANSPARENT as i32);
+            DrawTextW(
+                memory,
+                cue.as_ptr(),
+                -1,
+                &mut rect,
+                DT_LEFT | DT_SINGLELINE | DT_NOPREFIX,
+            );
+            SelectObject(memory, previous_font);
+        }
+    } else {
+        SendMessageW(hwnd, WM_PRINTCLIENT, memory as usize, PRF_CLIENT as isize);
+    }
     SEARCH_TEXT_MASK.set(previous);
     GdiFlush();
     let foreground = dib(foreground);
@@ -1371,7 +1662,7 @@ fn caption_button_rects(width: i32, height: i32, right: bool, traffic: bool) -> 
         4
     };
     std::array::from_fn(|i| {
-        let slot = if !right {
+        let slot = if !right || traffic {
             match i {
                 2 => 0,
                 0 => 1,
@@ -1469,11 +1760,11 @@ unsafe fn sync_caption_buttons(hwnd: HWND, app: &App) {
         ShowWindow(app.collapse_button, SW_SHOW);
         SetWindowTextW(
             app.collapse_button,
-            wide(if app.ui.sidebar_collapsed {
+            wide(app.ui.t(if app.ui.sidebar_collapsed {
                 "Expand sidebar"
             } else {
                 "Collapse sidebar"
-            })
+            }))
             .as_ptr(),
         );
     }
@@ -1674,6 +1965,83 @@ unsafe fn caption_message(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> Option<
     }
     None
 }
+unsafe fn set_control_visible(hwnd: HWND, visible: bool) {
+    let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+    if (style & WS_VISIBLE != 0) != visible {
+        ShowWindow(hwnd, if visible { SW_SHOW } else { SW_HIDE });
+    }
+}
+
+unsafe fn set_control_enabled(hwnd: HWND, enabled: bool) {
+    let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+    if (style & WS_DISABLED == 0) != enabled {
+        EnableWindow(hwnd, enabled as i32);
+    }
+}
+
+unsafe fn set_cached_control_text(hwnd: HWND, cached: &mut String, text: &str) -> bool {
+    if cached == text || SetWindowTextW(hwnd, wide(text).as_ptr()) == 0 {
+        return false;
+    }
+    cached.clear();
+    cached.push_str(text);
+    true
+}
+
+unsafe extern "system" fn canvas_keyboard_control(
+    hwnd: HWND,
+    msg: u32,
+    wp: usize,
+    lp: isize,
+    _: usize,
+    _: usize,
+) -> isize {
+    let parent = GetParent(hwnd);
+    if msg == WM_GETDLGCODE {
+        let mut flags = DLGC_WANTARROWS;
+        if lp != 0 {
+            let message = &*(lp as *const MSG);
+            if message.message == WM_KEYDOWN
+                && (matches!(message.wParam, 13 | 32)
+                    || [VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT].contains(&(message.wParam as u16)))
+            {
+                flags |= DLGC_WANTMESSAGE;
+            }
+        }
+        return flags as isize;
+    }
+    if msg == WM_SETFOCUS && !parent.is_null() {
+        let pointer = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut App;
+        if let Some(app) = pointer.as_mut() {
+            if app.canvas_focus.is_none() {
+                let (w, h) = size(parent, app);
+                app.canvas_focus = (0..app.scene.buttons.len()).find(|&index| {
+                    let node = &app.scene.buttons[index];
+                    let viewport = button_viewport(app, node, w, h);
+                    canvas_track_button(app, index)
+                        && scene_button_enabled(app, index)
+                        && (matches!(node.action, Action::QueueJump(_))
+                            || (node.rect.y + node.rect.h > viewport.y
+                                && node.rect.y < viewport.y + viewport.h))
+                });
+            }
+            InvalidateRect(parent, null(), 0);
+        }
+    }
+    if matches!(msg, WM_KEYDOWN | WM_KEYUP)
+        && (matches!(wp, 13 | 32) || [VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT].contains(&(wp as u16)))
+    {
+        if msg == WM_KEYDOWN && !parent.is_null() {
+            SendMessageW(parent, msg, wp, lp);
+        }
+        return 0;
+    }
+    if msg == WM_CHAR && matches!(wp, 13 | 32) {
+        return 0;
+    }
+    DefSubclassProc(hwnd, msg, wp, lp)
+}
+
 unsafe fn put(app: &App, hwnd: HWND, r: Rect, show: bool) {
     if show {
         let mut previous: RECT = zeroed();
@@ -1703,14 +2071,19 @@ unsafe fn put(app: &App, hwnd: HWND, r: Rect, show: bool) {
                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW,
             );
         }
-        ShowWindow(hwnd, SW_SHOW);
+        set_control_visible(hwnd, true);
         if moved {
             InvalidateRect(hwnd, null(), 0);
         }
     } else {
-        ShowWindow(hwnd, SW_HIDE);
+        set_control_visible(hwnd, false);
     }
 }
+fn native_ui_scale(dpi: u32) -> f64 {
+    // Window size controls layout breakpoints, never text or control density.
+    dpi.max(96) as f64 / 96.0
+}
+
 unsafe fn size(hwnd: HWND, app: &App) -> (i32, i32) {
     let mut r = zeroed();
     GetClientRect(hwnd, &mut r);
@@ -1984,6 +2357,7 @@ fn text_link_rect(slot: Rect, width: i32, height: i32, centered: bool) -> Rect {
 }
 fn is_track_row(node: &ui::Button) -> bool {
     !node.text_link
+        && node.glyph.is_empty()
         && node.artwork.is_empty()
         && node.rect.h <= 50
         && matches!(&node.action,Action::OpenItem(item) if item.playable())
@@ -1991,10 +2365,16 @@ fn is_track_row(node: &ui::Button) -> bool {
 fn available_text_rect(scene: &Scene, slot: Rect, limit: i32) -> Rect {
     let mut right = limit.max(slot.x + slot.w);
     let overlaps = |r: Rect| r.y < slot.y + slot.h && r.y + r.h > slot.y;
-    for r in scene.buttons.iter().map(|b| b.rect)
+    for r in scene
+        .buttons
+        .iter()
+        .map(|b| b.rect)
         .chain(scene.labels.iter().map(|l| l.rect))
         .chain(scene.pictures.iter().map(|(r, _)| *r))
-        .chain(scene.seek).chain(scene.volume).chain(scene.elapsed).chain(scene.remaining)
+        .chain(scene.seek)
+        .chain(scene.volume)
+        .chain(scene.elapsed)
+        .chain(scene.remaining)
     {
         // Containers and the text's own slot do not obstruct it.
         if overlaps(r) && r.x >= slot.x + slot.w && r.w > 0 {
@@ -2004,22 +2384,45 @@ fn available_text_rect(scene: &Scene, slot: Rect, limit: i32) -> Rect {
     Rect::new(slot.x, slot.y, (right - slot.x).max(slot.w), slot.h)
 }
 unsafe fn expand_media_text(scene: &mut Scene, limit: i32) {
-    let labels: Vec<_> = scene.labels.iter().map(|l| {
-        if matches!(l.kind, 8) { available_text_rect(scene, l.rect, limit) } else { l.rect }
-    }).collect();
-    let groups: HashMap<_, _> = scene.buttons.iter().filter_map(|b| b.artist_credit_group)
-        .map(|r| ((r.x, r.y, r.w, r.h), available_text_rect(scene, r, limit))).collect();
-    let links: Vec<_> = scene.buttons.iter().map(|b| {
-        if b.text_link && !b.text_centered && b.artist_credit_group.is_none() {
-            available_text_rect(scene, b.rect, limit)
-        } else { b.rect }
-    }).collect();
-    for (label, rect) in scene.labels.iter_mut().zip(labels) { label.rect = rect; }
+    let labels: Vec<_> = scene
+        .labels
+        .iter()
+        .enumerate()
+        .map(|(i,l)| {
+            if !scene.catalog_preserved_labels.contains(&i)&&matches!(l.kind, 8) {
+                available_text_rect(scene, l.rect, limit)
+            } else {
+                l.rect
+            }
+        })
+        .collect();
+    let groups: HashMap<_, _> = scene
+        .buttons
+        .iter()
+        .enumerate().filter(|(i,_)|!scene.catalog_preserved_buttons.contains(i)).map(|(_,b)|b)
+        .filter_map(|b| b.artist_credit_group)
+        .map(|r| ((r.x, r.y, r.w, r.h), available_text_rect(scene, r, limit)))
+        .collect();
+    let links: Vec<_> = scene
+        .buttons
+        .iter()
+        .enumerate()
+        .map(|(i,b)| {
+            if !scene.catalog_preserved_buttons.contains(&i)&&b.text_link && !b.text_centered && b.artist_credit_group.is_none() {
+                available_text_rect(scene, b.rect, limit)
+            } else {
+                b.rect
+            }
+        })
+        .collect();
+    for (label, rect) in scene.labels.iter_mut().zip(labels) {
+        label.rect = rect;
+    }
     for (button, rect) in scene.buttons.iter_mut().zip(links) {
         button.rect = rect;
         if !button.text_centered {
             if let Some(r) = button.artist_credit_group {
-                button.artist_credit_group = groups.get(&(r.x, r.y, r.w, r.h)).copied();
+                if let Some(group)=groups.get(&(r.x,r.y,r.w,r.h)){button.artist_credit_group=Some(*group);}
             }
         }
     }
@@ -2035,15 +2438,23 @@ unsafe fn fit_text_links(hwnd: HWND, scene: &mut Scene, fonts: &[HFONT; 12], sca
         SelectObject(dc, fonts[10]);
         let value = wide(&label.text);
         let mut extent: SIZE = zeroed();
-        GetTextExtentPoint32W(dc, value.as_ptr(), (value.len()-1) as i32, &mut extent);
-        let natural = ((extent.cx.max(crate::drawing::lyric_text_width(dc, fonts[10], &label.text)) + 4) as f64 / scale).ceil() as i32;
-        let (rect, badge, favorite) = ui::player_title_rects(title.region, natural, title.badge.is_some(), title.centered);
+        GetTextExtentPoint32W(dc, value.as_ptr(), (value.len() - 1) as i32, &mut extent);
+        let natural = ((extent
+            .cx
+            .max(crate::drawing::lyric_text_width(dc, fonts[10], &label.text))
+            + 4) as f64
+            / scale)
+            .ceil() as i32;
+        let (rect, badge) =
+            ui::player_title_rects(title.region, natural, title.badge.is_some(), title.centered);
         scene.labels[title.label].rect = rect;
-        if let (Some(index), Some(rect)) = (title.badge, badge) { scene.labels[index].rect = rect; }
-        scene.buttons[title.favorite].rect = favorite;
+        if let (Some(index), Some(rect)) = (title.badge, badge) {
+            scene.labels[index].rect = rect;
+        }
     }
     let mut index = 0;
     while index < scene.buttons.len() {
+        if scene.catalog_preserved_buttons.contains(&index){index+=1;continue;}
         let node = &scene.buttons[index];
         if let Some(group) = node.artist_credit_group {
             let centered = node.text_centered;
@@ -2052,7 +2463,14 @@ unsafe fn fit_text_links(hwnd: HWND, scene: &mut Scene, fonts: &[HFONT; 12], sca
                     .iter()
                     .take_while(|b| b.artist_credit_group == Some(group))
                     .count();
-            let font = if scene.player_title.as_ref().is_some_and(|title| group.x == title.region.x && group.y == title.region.y+25) {fonts[11]} else {fonts[0]};
+            let font =
+                if scene.player_title.as_ref().is_some_and(|title| {
+                    group.x == title.region.x && group.y == title.region.y + 25
+                }) {
+                    fonts[11]
+                } else {
+                    fonts[0]
+                };
             SelectObject(dc, font);
             let widths: Vec<_> = scene.buttons[index..end]
                 .iter()
@@ -2060,7 +2478,12 @@ unsafe fn fit_text_links(hwnd: HWND, scene: &mut Scene, fonts: &[HFONT; 12], sca
                     let text: Vec<u16> = button.text.encode_utf16().collect();
                     let mut extent: SIZE = zeroed();
                     GetTextExtentPoint32W(dc, text.as_ptr(), text.len() as i32, &mut extent);
-                    ((extent.cx.max(crate::drawing::lyric_text_width(dc, font, &button.text)) + 4) as f64 / scale).ceil() as i32
+                    ((extent
+                        .cx
+                        .max(crate::drawing::lyric_text_width(dc, font, &button.text))
+                        + 4) as f64
+                        / scale)
+                        .ceil() as i32
                 })
                 .collect();
             for (button, rect) in scene.buttons[index..end]
@@ -2084,7 +2507,12 @@ unsafe fn fit_text_links(hwnd: HWND, scene: &mut Scene, fonts: &[HFONT; 12], sca
         if GetTextExtentPoint32W(dc, text.as_ptr(), text.len() as i32, &mut extent) != 0 {
             node.rect = text_link_rect(
                 node.rect,
-                ((extent.cx.max(crate::drawing::lyric_text_width(dc, font, &node.text)) + 10) as f64 / scale).ceil() as i32,
+                ((extent
+                    .cx
+                    .max(crate::drawing::lyric_text_width(dc, font, &node.text))
+                    + 10) as f64
+                    / scale)
+                    .ceil() as i32,
                 (extent.cy as f64 / scale).ceil() as i32,
                 node.text_centered,
             );
@@ -2120,13 +2548,25 @@ fn wheel_pixels(delta: i32, lines: u32, viewport: i32, remainder: &mut f64) -> i
     *remainder = amount - pixels as f64;
     pixels
 }
+fn retarget_queue_glide(state:Option<(f64,f64,f64,std::time::Instant)>,current:f64,pixels:i32,maximum:f64,now:std::time::Instant)
+    ->(f64,f64,f64,std::time::Instant) {
+    let (position,mut velocity,mut target,tick)=state.unwrap_or((current,0.,current,now));
+    if (target-position).signum()==(pixels as f64).signum() {target=position;}
+    target=(target-pixels as f64).clamp(0.,maximum);
+    if (target-position)*velocity<0. {velocity=0.;}
+    (position,velocity,target,tick)
+}
 fn shift_scroll_content(scene: &mut Scene, delta: i32) {
+    for row in &mut scene.catalog_rows {row.y+=delta;}
     for (y, _) in &mut scene.artwork_ahead {
         *y += delta;
     }
 
     for button in &mut scene.buttons[scene.content_buttons.clone()] {
         button.rect.y += delta;
+        if let Some(group) = &mut button.artist_credit_group {
+            group.y += delta;
+        }
     }
     for label in &mut scene.labels[scene.content_labels.clone()] {
         label.rect.y += delta;
@@ -2140,35 +2580,111 @@ fn shift_scroll_content(scene: &mut Scene, delta: i32) {
     for (rect, _, _) in &mut scene.sliders {
         rect.y += delta;
     }
-    for rect in [
-        &mut scene.eq_graph,
-        &mut scene.eq_sliders,
-    ]
-    .into_iter()
-    .flatten()
+    for rect in [&mut scene.eq_graph, &mut scene.eq_sliders]
+        .into_iter()
+        .flatten()
     {
         rect.y += delta;
     }
 }
+#[cfg(test)]
+#[test]
+fn scrolling_moves_artist_credit_bounds_with_content() {
+    let group = ui::Rect::new(10, 100, 200, 20);
+    let mut scene = Scene::default();
+    scene.buttons = vec![
+        ui::Button {
+            rect: group,
+            artist_credit_group: Some(group),
+            ..Default::default()
+        },
+        ui::Button {
+            rect: group,
+            artist_credit_group: Some(group),
+            ..Default::default()
+        },
+    ];
+    scene.content_buttons = 0..1;
+    shift_scroll_content(&mut scene, -35);
+    assert_eq!(scene.buttons[0].rect.y, 65);
+    assert_eq!(scene.buttons[0].artist_credit_group.unwrap().y, 65);
+    assert_eq!(scene.buttons[1].artist_credit_group, Some(group));
+    shift_scroll_content(&mut scene, 35);
+    assert_eq!(scene.buttons[0].artist_credit_group, Some(group));
+}
 unsafe fn position_content_buttons(app: &App, w: i32, h: i32) {
+    let mut positions = Vec::new();
     for index in app.scene.content_buttons.clone() {
+        if canvas_track_button(app, index) {
+            continue;
+        }
         let node = &app.scene.buttons[index];
         let viewport = button_viewport(app, node, w, h);
         let left = node.rect.x.max(viewport.x);
         let top = node.rect.y.max(viewport.y);
         let right = (node.rect.x + node.rect.w).min(viewport.x + viewport.w);
         let bottom = (node.rect.y + node.rect.h).min(viewport.y + viewport.h);
-        if let Some(control) = app.buttons.get(index) {
-            put(
-                app,
+        if let Some(control) = app.buttons.get(index).filter(|control| !control.is_null()) {
+            positions.push((
                 *control,
                 Rect::new(left, top, (right - left).max(0), (bottom - top).max(0)),
                 right > left && bottom > top,
-            );
+            ));
         }
+    }
+    // Move the native hit targets together. Their pixels are drawn by the
+    // parent's single buffered paint, so per-control repaints are redundant.
+    if positions.is_empty() {
+        return;
+    }
+    let caption = positions
+        .first()
+        .map_or(0, |(control, _, _)| caption_height(GetParent(*control)));
+    let mut batch = BeginDeferWindowPos(positions.len() as i32);
+    for (control, rect, visible) in &positions {
+        if batch.is_null() {
+            break;
+        }
+        if !visible && IsWindowVisible(*control) == 0 {
+            continue;
+        }
+        let mut client: RECT = zeroed();
+        GetClientRect(*control, &mut client);
+        let unchanged_size = client.right == app.px(rect.w) && client.bottom == app.px(rect.h);
+        // Moving a hit target needs neither a resize notification nor a copy
+        // of its old pixels: the parent renders the new frame in one buffer.
+        batch = DeferWindowPos(
+            batch,
+            *control,
+            null_mut(),
+            app.px(rect.x),
+            app.px(rect.y) + caption,
+            app.px(rect.w),
+            app.px(rect.h),
+            SWP_NOZORDER
+                | SWP_NOACTIVATE
+                | SWP_NOREDRAW
+                | SWP_NOCOPYBITS
+                | SWP_NOSENDCHANGING
+                | if unchanged_size { SWP_NOSIZE } else { 0 }
+                | if *visible {
+                    SWP_SHOWWINDOW
+                } else {
+                    SWP_HIDEWINDOW
+                },
+        );
+    }
+    if !batch.is_null() && EndDeferWindowPos(batch) != 0 {
+        return;
+    }
+    for (control, rect, visible) in positions {
+        put(app, control, rect, visible);
     }
 }
 fn settle_scroll(app: &mut App, position: i32) {
+    if position != app.ui.scroll {
+        app.artwork_prefetch_upward = position < app.ui.scroll;
+    }
     app.ui.scroll = position;
     app.scroll_target = position;
     app.scroll_position = position as f64;
@@ -2177,23 +2693,70 @@ fn settle_scroll(app: &mut App, position: i32) {
     app.scroll_tick = std::time::Instant::now();
     app.scroll_started = app.scroll_tick;
 }
-fn scrollbar_position(scene:&Scene,y:i32,grab:i32,bottom:i32)->i32{
-    let Some(track)=scene.panels.iter().find(|p|p.kind==5)else{return 0};
-    let Some(thumb)=scene.panels.iter().find(|p|p.kind==6)else{return 0};
-    let maximum=(scene.content_height-bottom).max(0);
-    let span=(track.rect.h-thumb.rect.h).max(1);
-    (((y-track.rect.y-grab).clamp(0,span)as i64*maximum as i64)/span as i64)as i32
+fn main_scroll_animating(app:&App)->bool {
+    app.ui.smooth_scrolling&&(app.scroll_target!=app.ui.scroll||(app.scroll_position-app.scroll_target as f64).abs()>=0.05||app.scroll_velocity.abs()>=5.)
+}
+unsafe fn scroll_to_scrollbar_position(hwnd: HWND, app: &mut App, position: i32) {
+    if app.ui.smooth_scrolling {
+        if !main_scroll_animating(app) {
+            app.scroll_position = app.ui.scroll as f64;
+            app.scroll_velocity = 0.0;
+            app.scroll_tick = std::time::Instant::now();
+        }
+        app.scroll_target = position;
+        if (position as f64 - app.scroll_position) * app.scroll_velocity < 0.0 {
+            app.scroll_velocity = 0.0;
+        }
+        start_animation_timer(hwnd, 2);
+    } else {
+        settle_scroll(app, position);
+        rebuild(hwnd, app);
+    }
+}
+fn scrollbar_thumb_y(top:f64, height:f64, thumb:f64, offset:f64, maximum:f64)->f64 {
+    top + offset.clamp(0., maximum.max(0.)) * (height-thumb).max(0.) / maximum.max(1.)
+}
+fn shown_scrollbar_y(app:&App, panel:&ui::Panel, h:i32)->Option<f64> {
+    if panel.kind==6 {
+        let track=app.scene.panels.iter().find(|p|p.kind==5&&p.rect.x==panel.rect.x)?;
+        let offset=if main_scroll_animating(app){app.scroll_position}else{app.ui.scroll as f64};
+        let bottom=if app.ui.view==View::Lyrics{h-64}else{content_bottom(app,h)};
+        Some(scrollbar_thumb_y(track.rect.y as f64,track.rect.h as f64,panel.rect.h as f64,offset,(app.scene.content_height-bottom).max(0) as f64))
+    }else if panel.kind==17&&app.scene.device_sidebar.is_none(){
+        let track=app.scene.queue_scrollbar?;
+        let offset=app.queue_glide.map_or((app.ui.queue_scroll*24+app.ui.queue_scroll_offset) as f64,|s|s.0);
+        Some(scrollbar_thumb_y(track.y as f64,track.h as f64,panel.rect.h as f64,offset,(app.scene.queue_scroll_max*24) as f64))
+    }else{None}
+}
+fn scrollbar_position(scene: &Scene, y: i32, grab: i32, bottom: i32) -> i32 {
+    let Some(track) = scene.panels.iter().find(|p| p.kind == 5) else {
+        return 0;
+    };
+    let Some(thumb) = scene.panels.iter().find(|p| p.kind == 6) else {
+        return 0;
+    };
+    let maximum = (scene.content_height - bottom).max(0);
+    let span = (track.rect.h - thumb.rect.h).max(1);
+    (((y - track.rect.y - grab).clamp(0, span) as i64 * maximum as i64) / span as i64) as i32
 }
 unsafe fn scroll_to(hwnd: HWND, app: &mut App, position: i32) {
+    #[cfg(feature = "diagnostics")]
+    let _timing = crate::diagnostics::span("scroll.update", app.ui.view.title());
+    #[cfg(feature = "diagnostics")]
+    let _page_allocations = crate::memory_profile::page_scope(app.ui.view as usize + 1);
     let previous = app.ui.scroll;
     if previous == position {
         return;
     }
+    // Retire rectangles from the previous screen position.
+    reset_marquees();
+    app.artwork_prefetch_upward = position < previous;
     app.ui.scroll = position;
     let settings = app.ui.view == View::Settings;
-    let manual_lyrics=app.ui.view==View::Lyrics && app.scene.lyrics_anchor.is_none();
-    let reuse = settings || manual_lyrics
-        || (app.ui.page.as_ref().is_some_and(|page| !page.loading)
+    let manual_lyrics = app.ui.view == View::Lyrics && app.scene.lyrics_anchor.is_none();
+    let reuse = settings
+        || (manual_lyrics && (position - app.layout_scroll).abs() < ui::SCROLL_OVERSCAN - 32)
+        || (app.ui.page.is_some()
             && !matches!(
                 app.ui.view,
                 View::FlowTune
@@ -2203,23 +2766,51 @@ unsafe fn scroll_to(hwnd: HWND, app: &mut App, position: i32) {
                     | View::PlaylistEdit
                     | View::TrackInfo
             )
-            && (position - app.layout_scroll).abs() < 128);
+            && (position - app.layout_scroll).abs() < ui::SCROLL_OVERSCAN - 32);
     if !reuse {
-        rebuild(hwnd, app);
-        return;
+        #[cfg(feature = "diagnostics")]
+        let _timing = crate::diagnostics::span("scroll.rebuild", app.ui.view.title());
+        let (w,h)=size(hwnd,app);
+        let focus=app.canvas_focus.and_then(|i|app.scene.buttons.get(i)).map(|b|canvas_action_key(&b.action));
+        shift_scroll_content(&mut app.scene,previous-position);
+        if let Some(mut patch)=ui::prepare_catalog_scroll(&mut app.scene,&app.ui,h) {
+            expand_media_text(&mut patch.scene,w-16);
+            fit_text_links(hwnd,&mut patch.scene,&app.fonts,app.scale);
+            ui::finish_catalog_scroll(&mut app.scene,patch);
+            gpu::invalidate_main_layer();
+            app.layout_scroll=position;app.artwork_prefetch_scroll=position;
+            app.canvas_focus=focus.and_then(|key|app.scene.buttons.iter().position(|b|canvas_action_matches(&key,&b.action)));
+            app.canvas_hover=None;app.canvas_pressed=None;
+            app.buttons.resize(app.scene.buttons.len(),null_mut());
+            app.button_text.resize(app.scene.buttons.len(),String::new());
+            request_art(app,h);trim_artwork(app,h);
+        }else{
+            rebuild(hwnd, app);return;
+        }
+    }else{
+        shift_scroll_content(&mut app.scene, previous - position);
     }
-    shift_scroll_content(&mut app.scene, previous - position);
     if settings && app.ui.tab == 1 {
         if let Some(rect) = &mut app.scene.session {
             rect.y += previous - position;
         }
     }
     let (w, h) = size(hwnd, app);
+    if manual_lyrics && !app.ui.timed_lyrics() {
+        let focused = app
+            .scene
+            .lyric_rows
+            .iter()
+            .filter(|row| row.range.start == 0)
+            .min_by_key(|row| (app.scene.labels[row.label].rect.y - (h / 2 - 20)).abs())
+            .map(|row| row.line);
+        for row in &app.scene.lyric_rows {
+            app.scene.labels[row.label].kind = if Some(row.line) == focused { 13 } else { 12 };
+        }
+    }
     position_content_buttons(app, w, h);
     if settings {
-        for (id, rect) in [
-            (SESSION, app.scene.session),
-        ] {
+        for (id, rect) in [(SESSION, app.scene.session)] {
             if id == SESSION && app.ui.tab != 1 {
                 continue;
             }
@@ -2245,21 +2836,77 @@ unsafe fn scroll_to(hwnd: HWND, app: &mut App, position: i32) {
         if (position - app.layout_scroll).abs() >= 96 {
             app.layout_scroll = position;
             request_art(app, h);
+            trim_artwork(app, h);
         }
     }
-    let bottom=if app.ui.view==View::Lyrics{h-64}else{content_bottom(app,h)};
+    if crate::drawing::progressive_artwork_enabled()
+        && !settings
+        && matches!(app.ui.view, View::Home | View::Explore)
+        && (position - app.artwork_prefetch_scroll).abs() >= 96
+    {
+        app.artwork_prefetch_scroll = position;
+        request_art(app, h);
+        trim_artwork(app, h);
+    }
+    let bottom = if app.ui.view == View::Lyrics {
+        h - 64
+    } else {
+        content_bottom(app, h)
+    };
     let available = bottom - app.scene.content_top;
     let maximum = (app.scene.content_height - bottom).max(1);
     for panel in &mut app.scene.panels {
         if panel.kind == 6 {
-            panel.rect.y = app.scene.content_top + ((position as i64 * (available - panel.rect.h) as i64) / maximum as i64) as i32;
+            panel.rect.y = app.scene.content_top
+                + ((position as i64 * (available - panel.rect.h) as i64) / maximum as i64) as i32;
         }
     }
-    InvalidateRect(hwnd, null(), 0);
+    if !settings && !manual_lyrics && scroll_repaint_enabled() {
+        let mut client: RECT = zeroed();
+        GetClientRect(hwnd, &mut client);
+        let rect = scroll_repaint_rect(app, client.right, h, caption_height(hwnd));
+        if rect.top >= 0
+            && rect.bottom <= client.bottom
+            && rect.top < rect.bottom
+            && rect.right > 0
+            && scroll_repaint_avoids_search(app, &rect, caption_height(hwnd))
+        {
+            InvalidateRect(hwnd, &rect, 0);
+        } else {
+            InvalidateRect(hwnd, null(), 0);
+        }
+    } else {
+        InvalidateRect(hwnd, null(), 0);
+    }
 }
 unsafe fn rebuild(hwnd: HWND, app: &mut App) {
-    if app.render_suspended {app.layout_dirty=true;return;}
-    app.layout_dirty=false;
+    gpu::invalidate_layers();
+    #[cfg(feature = "diagnostics")]
+    let _timing = crate::diagnostics::span("ui.rebuild", app.ui.view.title());
+    #[cfg(feature = "diagnostics")]
+    let _page_allocations = crate::memory_profile::page_scope(app.ui.view as usize + 1);
+    crate::drawing::set_lyric_cache_scope(
+        (app.ui.view == View::Lyrics)
+            .then_some((app.ui.provider.label(), app.snapshot.now.id.as_str())),
+    );
+    if app.render_suspended {
+        app.layout_dirty = true;
+        return;
+    }
+    app.layout_dirty = false;
+    let scale = native_ui_scale(GetDpiForWindow(hwnd));
+    if (app.scale - scale).abs() > 0.0001 {
+        app.scale = scale;
+        let old_fonts = app.fonts;
+        CREDIT_WIDTHS.with(|cache| cache.borrow_mut().clear());
+        app.fonts = make_fonts(scale);
+        for control in app.edits.values() {
+            SendMessageW(*control, WM_SETFONT, app.fonts[0] as usize, 1);
+        }
+        for font in old_fonts {
+            DeleteObject(font);
+        }
+    }
     let (w, h) = size(hwnd, app);
     app.ui.dpi_scale = app.scale;
     app.ensure_lyrics_fonts(w);
@@ -2279,10 +2926,31 @@ unsafe fn rebuild(hwnd: HWND, app: &mut App) {
             app.search_hint = hint;
         }
     }
+    for (id, hint) in [
+        (SESSION, "Paste ARL, or leave empty to use saved session"),
+        (TRACK, "Deezer track ID"),
+        (NAME, "Playlist name"),
+    ] {
+        if let Some(control) = app.edits.get(&id) {
+            SendMessageW(
+                *control,
+                EM_SETCUEBANNER,
+                1,
+                wide(app.ui.t(hint)).as_ptr() as isize,
+            );
+        }
+    }
     let previous_anchor = app.scene.lyrics_anchor;
     let previous_scroll = app.layout_scroll;
     app.layout_scroll = app.ui.scroll;
+    app.artwork_prefetch_scroll = app.ui.scroll;
     let had_karaoke_preview = app.scene.karaoke_preview.is_some();
+    #[cfg(feature = "diagnostics")]
+    let build_started = std::time::Instant::now();
+    let previous_canvas_focus = app
+        .canvas_focus
+        .and_then(|index| app.scene.buttons.get(index))
+        .map(|node| canvas_action_key(&node.action));
     app.scene = ui::build(
         &app.ui,
         (w, h),
@@ -2291,6 +2959,18 @@ unsafe fn rebuild(hwnd: HWND, app: &mut App) {
         &app.ui.now.title,
         app.playing(),
         app.volume,
+    );
+    app.canvas_focus = previous_canvas_focus.and_then(|key| {
+        (0..app.scene.buttons.len()).find(|&index| {
+            canvas_track_button(app, index)
+                && canvas_action_matches(&key, &app.scene.buttons[index].action)
+        })
+    });
+    #[cfg(feature = "diagnostics")]
+    crate::diagnostics::record(
+        "rebuild.scene",
+        app.ui.view.title(),
+        build_started.elapsed(),
     );
     if let (Some(before), Some(after)) = (previous_anchor, app.scene.lyrics_anchor) {
         if app.lyric_motion_track == app.ui.now.id
@@ -2308,7 +2988,7 @@ unsafe fn rebuild(hwnd: HWND, app: &mut App) {
             }
             if app.lyric_motion.is_some() {
                 shift_scroll_content(&mut app.scene, app.lyric_motion_offset);
-                SetTimer(hwnd, 2, 16, None);
+                start_animation_timer(hwnd, 2);
             }
         } else {
             app.lyric_motion = None;
@@ -2323,94 +3003,51 @@ unsafe fn rebuild(hwnd: HWND, app: &mut App) {
     } else {
         String::new()
     };
-    if app.scene.lyrics_gap.is_some() && app.playing() {
-        SetTimer(hwnd, 2, 16, None);
+    if app.ui.view == View::Lyrics && app.ui.timed_lyrics() && app.playing() {
+        start_animation_timer(hwnd, 2);
     }
+    #[cfg(feature = "diagnostics")]
+    let text_started = std::time::Instant::now();
     expand_media_text(&mut app.scene, w - 16);
     fit_text_links(hwnd, &mut app.scene, &app.fonts, app.scale);
+    #[cfg(feature = "diagnostics")]
+    crate::diagnostics::record("rebuild.text", app.ui.view.title(), text_started.elapsed());
     if app.scene.karaoke_preview.is_some() {
         if !had_karaoke_preview {
             app.karaoke_preview_started = std::time::Instant::now();
         }
         if app.ui.karaoke_lyrics {
-            SetTimer(hwnd, 2, 16, None);
+            start_animation_timer(hwnd, 2);
         }
     }
-    for (index, node) in app.scene.buttons.iter().enumerate() {
-        if index >= app.buttons.len() {
-            app.buttons.push(make_control(
-                hwnd,
-                "BUTTON",
-                1000 + index as i32,
-                BS_OWNERDRAW as u32,
-                app,
-            ));
+    #[cfg(feature = "diagnostics")]
+    let controls_started = std::time::Instant::now();
+    let canvas_available =
+        (0..app.scene.buttons.len()).any(|index| canvas_track_button(app, index));
+    if canvas_available && app.canvas_keyboard.is_null() {
+        app.canvas_keyboard = make_control(hwnd, "BUTTON", 998, BS_PUSHBUTTON as u32, app);
+        if !app.canvas_keyboard.is_null() {
+            SetWindowSubclass(app.canvas_keyboard, Some(canvas_keyboard_control), 2, 0);
+            SetWindowTextW(app.canvas_keyboard, wide(app.ui.t("Track list")).as_ptr());
+            SetWindowPos(
+                app.canvas_keyboard,
+                null_mut(),
+                -10,
+                -10,
+                1,
+                1,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW,
+            );
         }
-        let button = app.buttons[index];
-        let text = if !node.accessible.is_empty() {
-            &node.accessible
-        } else if node.text.is_empty() {
-            match node.action {
-                Action::Back => "Back",
-                Action::Toggle => {
-                    if app.playing() {
-                        "Pause"
-                    } else {
-                        "Play"
-                    }
-                }
-                Action::Shuffle => "Shuffle",
-                Action::Repeat => "Repeat",
-                Action::Previous => "Previous",
-                Action::Next => "Next",
-                Action::Go(View::Account) => "Account",
-                Action::Go(View::Lyrics) => "Lyrics",
-                Action::Go(View::Queue) => "Queue",
-                Action::Go(View::Add) => "Add to library",
-                Action::Search => "Search",
-                Action::ToggleCheck(_) => "Select track",
-                _ => "Button",
-            }
-        } else {
-            &node.text
-        };
-        if read(button) != text {
-            SetWindowTextW(button, wide(text).as_ptr());
-        }
-        let content = app.scene.content_buttons.contains(&index);
-        let viewport = button_viewport(app, node, w, h);
-        let mut bounds = node.rect;
-        let mut visible = !content
-            || (node.rect.y + node.rect.h > viewport.y
-                && node.rect.y < viewport.y + viewport.h
-                && node.rect.x + node.rect.w > viewport.x
-                && node.rect.x < viewport.x + viewport.w);
-        if content && visible {
-            bounds.x = node.rect.x.max(viewport.x);
-            bounds.y = node.rect.y.max(viewport.y);
-            let right = (node.rect.x + node.rect.w).min(viewport.x + viewport.w);
-            let bottom = (node.rect.y + node.rect.h).min(viewport.y + viewport.h);
-            bounds.w = (right - bounds.x).max(0);
-            bounds.h = (bottom - bounds.y).max(0);
-            if bounds.w <= 0 || bounds.h <= 0 {
-                visible = false;
-            }
-        }
-        put(app, button, bounds, visible);
-        EnableWindow(
-            button,
-            (node.enabled
-                && app
-                    .scene
-                    .auth_modal
-                    .is_none_or(|(_, _, first)| index >= first)
-                && !(matches!(node.action, Action::Connect | Action::ConnectSaved)
-                    && app.pending.is_some())) as i32,
-        );
     }
-    for button in app.buttons.iter().skip(app.scene.buttons.len()) {
-        ShowWindow(*button, SW_HIDE);
+    if !app.canvas_keyboard.is_null() {
+        set_control_visible(app.canvas_keyboard, canvas_available);
     }
+    // Scene buttons are painted and hit-tested by the canvas. Keep the
+    // index-aligned slots for drawing, without creating native child windows.
+    app.buttons.resize(app.scene.buttons.len(), null_mut());
+    app.button_text
+        .resize(app.scene.buttons.len(), String::new());
     sync_caption_buttons(hwnd, app);
     for (id, r) in [
         (SEARCH, app.scene.search),
@@ -2435,7 +3072,10 @@ unsafe fn rebuild(hwnd: HWND, app: &mut App) {
     }
     for id in [NAME, DESCRIPTION] {
         if let Some(&control) = app.edits.get(&id) {
-            EnableWindow(control, (!(app.ui.view == View::PlaylistEdit && app.ui.playlist_busy)) as i32);
+            set_control_enabled(
+                control,
+                !(app.ui.view == View::PlaylistEdit && app.ui.playlist_busy),
+            );
         }
     }
     let Some(&volume_control) = app.edits.get(&VOLUME) else {
@@ -2483,20 +3123,168 @@ unsafe fn rebuild(hwnd: HWND, app: &mut App) {
                 rect.y >= app.scene.content_top && rect.y + rect.h <= content_bottom(app, h),
             );
         } else if let Some(control) = app.edits.get(&id) {
-            ShowWindow(*control, SW_HIDE);
+            set_control_visible(*control, false);
         }
     }
     put(app, status, Rect::new(0, 0, 0, 0), false);
+    #[cfg(feature = "diagnostics")]
+    crate::diagnostics::record(
+        "rebuild.controls",
+        app.ui.view.title(),
+        controls_started.elapsed(),
+    );
     status_text(app);
+    #[cfg(feature = "diagnostics")]
+    let artwork_started = std::time::Instant::now();
     request_art(app, h);
+    trim_artwork(app, h);
+    #[cfg(feature = "diagnostics")]
+    crate::diagnostics::record(
+        "rebuild.artwork",
+        app.ui.view.title(),
+        artwork_started.elapsed(),
+    );
     update_background(hwnd, app);
     InvalidateRect(hwnd, null(), 0);
 }
 fn content_bottom(app: &App, height: i32) -> i32 {
-    app.scene.panels.iter().rev().find(|panel| panel.kind == 21)
-        .map(|panel| panel.rect.y-16).unwrap_or(height-124)
+    app.scene
+        .panels
+        .iter()
+        .rev()
+        .find(|panel| panel.kind == 21)
+        .map(|panel| panel.rect.y - 16)
+        .unwrap_or(height - 124)
 }
+// Set DEEZNATS_FULL_SCROLL_REPAINT=1 to restore the original full-window path.
+fn scroll_repaint_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("DEEZNATS_FULL_SCROLL_REPAINT").is_none())
+}
+fn scroll_repaint_rect(app: &App, width: i32, height: i32, caption: i32) -> RECT {
+    RECT {
+        left: app
+            .px(if app.ui.sidebar_collapsed { 70 } else { 246 })
+            .min(width),
+        top: caption + app.px(app.scene.content_top),
+        right: width,
+        bottom: caption + app.px(content_bottom(app, height)),
+    }
+}
+fn scroll_repaint_avoids_search(app: &App, region: &RECT, caption: i32) -> bool {
+    app.scene.search.is_none_or(|search| {
+        let search = app.rect(search);
+        search.bottom + caption <= region.top
+            || search.top + caption >= region.bottom
+            || search.right <= region.left
+            || search.left >= region.right
+    })
+}
+fn canvas_track_button(app: &App, index: usize) -> bool {
+    index < app.scene.buttons.len()
+}
+
+fn scene_button_enabled(app: &App, index: usize) -> bool {
+    app.scene.buttons.get(index).is_some_and(|node| {
+        node.enabled
+            && app
+                .scene
+                .auth_modal
+                .is_none_or(|(_, _, first)| index >= first)
+            && !(matches!(node.action, Action::Connect | Action::ConnectSaved)
+                && app.pending.is_some())
+    })
+}
+
+fn canvas_action_key(action: &Action) -> String {
+    match action {
+        Action::OpenItem(item) => format!("open:{}:{}", item.kind, item.id),
+        Action::ToggleCheck(id) => format!("check:{id}"),
+        Action::Sort(column) => format!("sort:{column}"),
+        _ => format!("other:{action:?}"),
+    }
+}
+
+fn canvas_action_matches(key: &str, action: &Action) -> bool {
+    match action {
+        Action::OpenItem(item) => key
+            .strip_prefix("open:")
+            .and_then(|value| value.split_once(':'))
+            .is_some_and(|(kind, id)| kind == item.kind && id == item.id),
+        Action::ToggleCheck(id) => key.strip_prefix("check:") == Some(id.as_str()),
+        Action::Sort(column) => {
+            key.strip_prefix("sort:")
+                .and_then(|value| value.parse::<usize>().ok())
+                == Some(*column)
+        }
+        _ => canvas_action_key(action) == key,
+    }
+}
+
+fn rect_contains(rect: Rect, x: i32, y: i32) -> bool {
+    x >= rect.x && y >= rect.y && x < rect.x + rect.w && y < rect.y + rect.h
+}
+
+fn track_row_rect(node: &ui::Button, w: i32, queue_w: i32, collapsed: bool, lyrics: bool) -> Rect {
+    let base_x = (node.rect.x - 48).max(if collapsed { 74 } else { 260 });
+    let cw = w - base_x - queue_w - if lyrics { 32 } else { 40 };
+    Rect::new(base_x + 2, node.rect.y - 2, (cw - 4).max(100), 52)
+}
+
+#[cfg(test)]
+#[test]
+fn track_row_hit_area_includes_columns_beyond_title() {
+    let node = ui::Button {
+        rect: Rect::new(320, 104, 200, 48),
+        ..Default::default()
+    };
+    let row = track_row_rect(&node, 1200, 280, false, false);
+    assert!(rect_contains(row, 750, 120));
+    assert!(!rect_contains(node.rect, 750, 120));
+    assert!(!rect_contains(row, 950, 120));
+    assert!(!rect_contains(row, 750, 160));
+}
+
+fn canvas_track_hit(app: &App, x: i32, y: i32, w: i32, h: i32) -> Option<usize> {
+    let hit = |&index: &usize| {
+        let node = &app.scene.buttons[index];
+        let hit_rect = if is_track_row(node) {
+            let queue_w = if app.ui.right_sidebar_open() {
+                280.min(w / 3)
+            } else {
+                0
+            };
+            track_row_rect(
+                node,
+                w,
+                queue_w,
+                app.ui.sidebar_collapsed,
+                app.ui.view == View::Lyrics,
+            )
+        } else {
+            node.rect
+        };
+        canvas_track_button(app, index)
+            && scene_button_enabled(app, index)
+            && rect_contains(hit_rect, x, y)
+            && (!(app.scene.content_buttons.contains(&index)||matches!(node.action,Action::QueueJump(_)))
+                || rect_contains(button_viewport(app, node, w, h), x, y))
+    };
+    // Seek regions are invisible and laid out after the floating lyrics controls.
+    // Their insertion order must never put them above an actual control.
+    if app.ui.view==View::Lyrics {
+        if let Some(index)=(0..app.scene.buttons.len()).rev()
+            .filter(|&i|!matches!(app.scene.buttons[i].action,Action::SeekMs(_)))
+            .find(hit) {return Some(index);}
+    }
+    (0..app.scene.buttons.len()).rev().find(hit)
+}
+
 fn button_viewport(app: &App, node: &ui::Button, w: i32, h: i32) -> Rect {
+    if matches!(node.action,Action::QueueJump(_)) {if let Some(mut viewport)=app.scene.queue_viewport{if gpu::is_recording(gpu::Layer::Queue){viewport.y-=144;viewport.h+=288;}return viewport;}}
+    if app.ui.view==View::Lyrics&&matches!(node.action,Action::SeekMs(_)) {
+        return app.scene.lyrics_area.unwrap_or(Rect::new(20,0,(w-40).max(1),(h-64).max(0)));
+    }
     let left = if app.ui.view == View::Lyrics {
         20
     } else if app.ui.sidebar_collapsed {
@@ -2514,7 +3302,7 @@ fn button_viewport(app: &App, node: &ui::Button, w: i32, h: i32) -> Rect {
     } else {
         content_bottom(app, h) - app.scene.content_top
     };
-    let queue_w = if app.ui.queue_sidebar_open {
+    let queue_w = if app.ui.right_sidebar_open() {
         280.min(w / 3)
     } else {
         0
@@ -2524,8 +3312,12 @@ fn button_viewport(app: &App, node: &ui::Button, w: i32, h: i32) -> Rect {
     } else {
         w - 20
     };
-    let default = Rect::new(left, top, (right - left).max(100), height);
-    if matches!(node.action, Action::Genre(_)) {
+    let margin=if gpu::is_recording(gpu::Layer::Main){ui::SCROLL_OVERSCAN}else{0};
+    let default = Rect::new(left, top-margin, (right - left).max(100), height+2*margin);
+    if matches!(
+        node.action,
+        Action::Genre(_) | Action::FlowMoreGenres | Action::FlowAddGenre
+    ) {
         app.scene.genre_viewport.unwrap_or(default)
     } else {
         default
@@ -2537,7 +3329,8 @@ unsafe fn status_text(app: &App) {
     } else {
         &app.notice
     };
-    if read(app.edits[&STATUS]) != *message {
+    let message = app.ui.t(message);
+    if read(app.edits[&STATUS]) != message {
         SetWindowTextW(app.edits[&STATUS], wide(message).as_ptr());
     }
 }
@@ -2548,6 +3341,149 @@ unsafe fn command(app: &mut App, command: Command) -> bool {
         false
     } else {
         true
+    }
+}
+
+unsafe fn request_update(app: &mut App, request: crate::updater::Request) {
+    if app.ui.update.busy() {
+        return;
+    }
+    let phase = match request {
+        crate::updater::Request::Check => crate::updater::Phase::Checking,
+        crate::updater::Request::Download => crate::updater::Phase::Downloading,
+        crate::updater::Request::Apply => crate::updater::Phase::Applying,
+    };
+    let checking = matches!(request, crate::updater::Request::Check);
+    if app.updater.commands.try_send(request).is_ok() {
+        app.ui.update.phase = phase;
+        app.ui.update.error.clear();
+        if checking {
+            app.ui.last_update_check = crate::updater::now();
+            app.ui.save_preferences();
+        }
+    }
+}
+
+unsafe fn process_updates(hwnd: HWND, app: &mut App) -> bool {
+    let mut changed = false;
+    while let Ok(event) = app.updater.events.try_recv() {
+        match event {
+            crate::updater::Event::State(state) => {
+                app.ui.update = state;
+                changed = true;
+            }
+            crate::updater::Event::Exit => {
+                // This explicit restart bypasses keep-playing-on-close/tray behavior.
+                DestroyWindow(hwnd);
+                return true;
+            }
+        }
+    }
+    if changed && app.ui.view == View::Settings && app.ui.tab == 0 {
+        rebuild(hwnd, app);
+    }
+    #[cfg(not(test))]
+    if app.ui.auto_updates
+        && crate::updater::now().saturating_sub(app.ui.last_update_check) >= 86400
+        && matches!(
+            app.ui.update.phase,
+            crate::updater::Phase::Idle
+                | crate::updater::Phase::Current
+                | crate::updater::Phase::Failed
+        )
+    {
+        request_update(app, crate::updater::Request::Check);
+    }
+    false
+}
+
+unsafe fn restore_shortcuts(app: &mut App) {
+    if let Some(shortcuts) = &mut app.shortcuts {
+        for (index, binding) in app.ui.shortcuts.iter().enumerate() {
+            app.ui.shortcut_errors[index] =
+                shortcuts.set(index, *binding).err().unwrap_or_default();
+        }
+    }
+}
+
+unsafe fn capture_shortcut(hwnd: HWND, app: &mut App, key: u32) {
+    let Some(index) = app.ui.shortcut_capture else {
+        return;
+    };
+    if key == 27 {
+        app.ui.shortcut_capture = None;
+        restore_shortcuts(app);
+    } else if !matches!(key, 0x10..=0x12 | 0x5b | 0x5c | 0xa0..=0xa5) {
+        let binding = if key == 8 {
+            None
+        } else {
+            Some(crate::shortcuts::current_binding(key))
+        };
+        let duplicate = binding.is_some()
+            && app
+                .ui
+                .shortcuts
+                .iter()
+                .enumerate()
+                .any(|(other, value)| other != index && *value == binding);
+        let result = if duplicate {
+            Err("That shortcut is already assigned to another action.".into())
+        } else if let Some(shortcuts) = &mut app.shortcuts {
+            shortcuts.set(index, binding)
+        } else {
+            Err("Keyboard shortcuts are unavailable.".into())
+        };
+        match result {
+            Ok(()) => {
+                app.ui.shortcuts[index] = binding;
+                app.ui.shortcut_capture = None;
+                restore_shortcuts(app);
+                app.ui.save_preferences();
+            }
+            Err(error) => app.ui.shortcut_errors[index] = error,
+        }
+    }
+    rebuild(hwnd, app);
+}
+
+unsafe fn shortcut_action(hwnd: HWND, app: &mut App, action: usize) {
+    match action {
+        0 => {
+            command(app, Command::Toggle);
+        }
+        1 => {
+            command(app, Command::Previous);
+        }
+        2 => {
+            command(app, Command::Next);
+        }
+        3 => {
+            command(app, Command::Stop);
+        }
+        4..=6 => {
+            let volume = match action {
+                4 => (app.volume + 5).min(100),
+                5 => app.volume.saturating_sub(5),
+                _ => {
+                    if app.volume == 0 {
+                        app.ui.unmuted_volume.clamp(1, 100)
+                    } else {
+                        0
+                    }
+                }
+            };
+            if command(app, Command::Volume(volume)) {
+                if volume == 0 && app.volume > 0 {
+                    app.ui.unmuted_volume = app.volume;
+                }
+                app.volume = volume;
+                app.ui.initial_volume = volume;
+                SendMessageW(app.edits[&VOLUME], TBM_SETPOS, 1, volume as isize);
+                SetTimer(hwnd, 3, 300, None);
+                rebuild(hwnd, app);
+            }
+        }
+        _ => {}
     }
 }
 unsafe fn read(hwnd: HWND) -> String {
@@ -2590,28 +3526,62 @@ unsafe fn capture_playlist_fields(app: &mut App) {
     app.ui.playlist_draft.description = description;
 }
 unsafe fn set_playlist_fields(app: &App) {
-    SetWindowTextW(app.edits[&NAME], wide(&app.ui.playlist_draft.title).as_ptr());
-    SetWindowTextW(app.edits[&DESCRIPTION], wide(&app.ui.playlist_draft.description).as_ptr());
+    SetWindowTextW(
+        app.edits[&NAME],
+        wide(&app.ui.playlist_draft.title).as_ptr(),
+    );
+    SetWindowTextW(
+        app.edits[&DESCRIPTION],
+        wide(&app.ui.playlist_draft.description).as_ptr(),
+    );
 }
 unsafe fn submit_playlist(app: &mut App, mutation: crate::playlist::Mutation) {
-    if app.ui.playlist_busy { app.notice = "A playlist update is still in progress".into(); return; }
-    let Some(engine) = app.snapshot.engine.clone().filter(|_| app.snapshot.connected) else {
-        app.notice = "Connect Deezer first".into(); return;
-    };
-    if let crate::playlist::Mutation::Save { title, .. } = &mutation {
-        if title.trim().is_empty() { app.notice = "Enter a playlist name".into(); return; }
+    if app.ui.playlist_busy {
+        app.notice = "A playlist update is still in progress".into();
+        return;
     }
-    let request = crate::catalog::Request { generation: app.generation, engine, job: crate::catalog::Job::Playlist(mutation) };
+    if !app.snapshot.connected {
+        app.notice = format!("Connect to {} first", app.ui.provider.label());
+        return;
+    }
+    if let crate::playlist::Mutation::Save { title, .. } = &mutation {
+        if title.trim().is_empty() {
+            app.notice = "Enter a playlist name".into();
+            return;
+        }
+    }
+    let request = crate::catalog::Request {
+        #[cfg(feature = "diagnostics")]
+        view_tag: app.ui.view as usize + 1,
+        generation: app.generation,
+        provider: app.ui.provider,
+        engine: app.snapshot.engine.clone(),
+        job: crate::catalog::Job::Playlist(mutation),
+    };
     if app.catalog.requests.send(request).is_ok() {
-        app.ui.playlist_busy = true; app.notice = "Updating playlist...".into();
-    } else { app.notice = "Catalog worker is unavailable".into(); }
+        app.playlist_generation = Some(app.generation);
+        app.ui.playlist_busy = true;
+        app.notice = "Updating playlist...".into();
+    } else {
+        app.notice = "Catalog worker is unavailable".into();
+    }
 }
 fn update_playlist_preview(app: &mut App) {
-    match app.ui.playlist_draft.jpeg().and_then(|bytes| crate::catalog::decode(&bytes, 500)) {
+    match app
+        .ui
+        .playlist_draft
+        .jpeg()
+        .and_then(|bytes| crate::catalog::decode(&bytes, 500))
+    {
         Ok(bitmap) => {
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let key = format!("playlist-cover:{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-            if app.ui.playlist_draft.preview.starts_with("playlist-cover:") { app.images.remove(&app.ui.playlist_draft.preview); }
+            let key = format!(
+                "playlist-cover:{}",
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            );
+            if app.ui.playlist_draft.preview.starts_with("playlist-cover:") {
+                app.images.remove(&app.ui.playlist_draft.preview);
+            }
             app.images.insert(key.clone(), Arc::new(bitmap));
             app.ui.playlist_draft.preview = key;
             app.notice = "Cover ready. Save the playlist to upload it.".into();
@@ -2621,26 +3591,38 @@ fn update_playlist_preview(app: &mut App) {
 }
 unsafe fn playlist_export_path(hwnd: HWND) -> Option<PathBuf> {
     let mut path = vec![0u16; 32768];
-    let name = wide("playlist-cover.jpg"); path[..name.len()].copy_from_slice(&name);
-    let filter = wide("JPEG image\0*.jpg\0"); let extension = wide("jpg");
+    let name = wide("playlist-cover.jpg");
+    path[..name.len()].copy_from_slice(&name);
+    let filter = wide("JPEG image\0*.jpg\0");
+    let extension = wide("jpg");
     let mut dialog: OPENFILENAMEW = zeroed();
-    dialog.lStructSize = size_of::<OPENFILENAMEW>() as u32; dialog.hwndOwner = hwnd;
-    dialog.lpstrFilter = filter.as_ptr(); dialog.lpstrDefExt = extension.as_ptr();
-    dialog.lpstrFile = path.as_mut_ptr(); dialog.nMaxFile = path.len() as u32;
+    dialog.lStructSize = size_of::<OPENFILENAMEW>() as u32;
+    dialog.hwndOwner = hwnd;
+    dialog.lpstrFilter = filter.as_ptr();
+    dialog.lpstrDefExt = extension.as_ptr();
+    dialog.lpstrFile = path.as_mut_ptr();
+    dialog.nMaxFile = path.len() as u32;
     dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-    if GetSaveFileNameW(&mut dialog) == 0 { return None; }
-    Some(PathBuf::from(String::from_utf16_lossy(&path[..path.iter().position(|v| *v == 0).unwrap_or(0)])))
+    if GetSaveFileNameW(&mut dialog) == 0 {
+        return None;
+    }
+    Some(PathBuf::from(String::from_utf16_lossy(
+        &path[..path.iter().position(|v| *v == 0).unwrap_or(0)],
+    )))
 }
 
 unsafe fn data_request(app: &mut App, job: crate::catalog::Job) {
-    if let Some(engine) = app.snapshot.engine.clone() {
+    if app.ui.provider == crate::catalog::Provider::Spotify || app.snapshot.engine.is_some() {
         let lyrics = matches!(
             job,
             crate::catalog::Job::Lyrics(..) | crate::catalog::Job::LyricsWindow(..)
         );
         let request = crate::catalog::Request {
+            #[cfg(feature = "diagnostics")]
+            view_tag: app.ui.view as usize + 1,
             generation: app.generation,
-            engine,
+            provider: app.ui.provider,
+            engine: app.snapshot.engine.clone(),
             job,
         };
         let failed = if lyrics {
@@ -2657,7 +3639,10 @@ unsafe fn data_request(app: &mut App, job: crate::catalog::Job) {
             }
         }
     } else {
-        app.notice = "Connect your Deezer account to load this page.".into();
+        app.notice = format!(
+            "Connect your {} account to load this page.",
+            app.ui.provider.label()
+        );
     }
 }
 fn adjacent_lyric_tracks(
@@ -2673,17 +3658,144 @@ fn adjacent_lyric_tracks(
         .cloned()
         .collect()
 }
+fn invalidate_flow(app: &mut App) {
+    let key = serde_json::json!([
+        provider_account_key(app),
+        "Flow",
+        "",
+        "",
+        "",
+        app.ui.flow_id
+    ])
+    .to_string();
+    app.catalog.session.refresh_flow(&key);
+    app.page_cache.retain(|(k, _)| *k != key);
+}
+unsafe fn switch_provider(app: &mut App, provider: crate::catalog::Provider) {
+    if provider != app.ui.provider {
+        if let Some((cancel, _)) = app.spotify_auth.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        app.ui.spotify_catalog_busy = false;
+    }
+    if let Some((cancel, _)) = app.deezer_auth.take() {
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    app.ui.deezer_login_open = false;
+    app.ui.deezer_login_busy = false;
+    app.pending = None;
+    app.ui.switch_flow_provider(provider);
+    app.ui.provider = provider;
+    app.ui.device_menu_open = false;
+    app.ui.spotify_devices.clear();
+    app.ui.spotify_devices_busy = false;
+    app.ui.spotify_devices_status.clear();
+    app.spotify_device_request = None;
+    provider.set_active();
+    app.spotify_jam_request = None;
+    app.ui.spotify_jam = None;
+    app.ui.spotify_jam_busy = false;
+    app.ui.spotify_jam_status.clear();
+    app.generation = app.generation.wrapping_add(1);
+    app.catalog.set_generation(app.generation);
+    app.catalog.session.invalidate();
+    app.page_cache.clear();
+    app.navigation.clear();
+    app.ui.history.clear();
+    app.entity = None;
+    app.query.clear();
+    app.ui.page = None;
+    app.ui.track_info = None;
+    app.ui.liked_ids.clear();
+    app.podcast_ids.clear();
+    app.library_loaded = false;
+    app.library_pending = None;
+    app.ui.playlist_busy = false;
+    app.playlist_generation = None;
+    app.ui.playlist_track = None;
+    app.ui.playlist_draft = Default::default();
+    app.flow_save_expected = None;
+    app.ui.flow_loaded = false;
+    app.ui.genres.clear();
+    app.ui.flow_options.clear();
+    app.ui.mix_genres = None;
+    app.ui.queue.clear();
+    app.ui.queue_index = 0;
+    app.ui.now = Default::default();
+    app.ui.account = serde_json::Value::Null;
+    app.ui.lyrics.clear();
+    app.ui.rich_lyrics.clear();
+    app.ui.lyrics_provider.clear();
+    app.lyrics_id.clear();
+    app.ui.view = View::Home;
+    app.ui.scroll = 0;
+    app.snapshot.connected = false;
+    app.snapshot.account = serde_json::Value::Null;
+    app.snapshot.now = Default::default();
+    app.snapshot.queue = Arc::new(Vec::new());
+    app.snapshot.position = 0;
+    app.playback_clock = PlaybackClock::default();
+    app.snapshot.duration = 0;
+    SetWindowTextW(app.edits[&SESSION], wide("").as_ptr());
+    SendMessageW(
+        app.edits[&SESSION],
+        EM_SETPASSWORDCHAR,
+        if provider == crate::catalog::Provider::Spotify {
+            0
+        } else {
+            0x25cf
+        },
+        0,
+    );
+    SendMessageW(
+        app.edits[&SESSION],
+        EM_SETCUEBANNER,
+        1,
+        wide(if provider == crate::catalog::Provider::Spotify {
+            "Public Spotify application Client ID"
+        } else {
+            "Paste ARL, or leave empty to use saved session"
+        })
+        .as_ptr() as isize,
+    );
+    command(app, Command::SwitchProvider(provider));
+    if provider == crate::catalog::Provider::Spotify && app.ui.spotify_configured {
+        start_spotify(app);
+    }
+    load_page(app);
+}
+fn provider_account_key(app: &App) -> String {
+    format!(
+        "{}:{}",
+        app.ui.provider.label(),
+        crate::catalog::string(&app.snapshot.account, &["userId", "id"])
+    )
+}
 fn page_key(app: &App) -> String {
     serde_json::json!([
-        app.snapshot.account.get("userId").cloned().unwrap_or_default(),
-        format!("{:?}",app.ui.view),
-        app.entity.as_ref().map(|entry|entry.kind.as_str()).unwrap_or(""),
-        app.entity.as_ref().map(|entry|entry.id.as_str()).unwrap_or(""),
+        provider_account_key(app),
+        format!("{:?}", app.ui.view),
+        app.entity
+            .as_ref()
+            .map(|entry| entry.kind.as_str())
+            .unwrap_or(""),
+        app.entity
+            .as_ref()
+            .map(|entry| entry.id.as_str())
+            .unwrap_or(""),
         app.query,
-        if app.ui.view==View::Flow {app.ui.flow_id.as_str()} else {""}
-    ]).to_string()
+        if app.ui.view == View::Flow {
+            app.ui.flow_id.as_str()
+        } else {
+            ""
+        }
+    ])
+    .to_string()
 }
 unsafe fn load_page(app: &mut App) {
+    if !app.ui.provider.supports_downloads() && matches!(app.ui.view, View::Offline) {
+        app.ui.view = View::Home;
+    }
     if app.ui.view == View::Podcasts && !app.snapshot.connected {
         app.generation += 1;
         app.catalog.set_generation(app.generation);
@@ -2700,11 +3812,10 @@ unsafe fn load_page(app: &mut App) {
         app.generation += 1;
         app.catalog.set_generation(app.generation);
 
-        app.ui.page = Some(Arc::new(crate::catalog::Page {
-            title: "Offline".into(),
-            rows: app.ui.offline.clone(),
-            ..Default::default()
-        }));
+        app.ui.page = Some(Arc::new(crate::downloads::library_page(
+            &app.ui.offline,
+            app.entity.as_ref(),
+        )));
         return;
     }
     if !matches!(
@@ -2712,6 +3823,7 @@ unsafe fn load_page(app: &mut App) {
         View::Home
             | View::Explore
             | View::Flow
+            | View::StyleMix
             | View::Podcasts
             | View::Favorites
             | View::Albums
@@ -2729,20 +3841,34 @@ unsafe fn load_page(app: &mut App) {
     app.catalog.set_generation(app.generation);
 
     let key = page_key(app);
-    let cached = app.page_cache.iter().find(|(k,_)|*k==key).map(|(_,page)|page.clone());
-    app.catalog.session.begin(app.generation,key,cached.clone());
+    let cached = app
+        .page_cache
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, page)| page.clone());
+    app.catalog
+        .session
+        .begin(app.generation, key, cached.clone());
     if let Some(page) = cached {
-        let mut page=(*page).clone();
-        page.loading=app.snapshot.connected;
+        let mut page = (*page).clone();
+        page.loading = app.snapshot.connected;
         page.error.clear();
-        app.ui.page=Some(Arc::new(page));
+        app.ui.page = Some(Arc::new(page));
         app.notice.clear();
     } else {
         app.ui.page = Some(Arc::new(crate::catalog::Page {
-            title: app.entity.as_ref().map(|e|e.title.clone()).unwrap_or_else(||app.ui.view.title().into()),
-            entity:app.entity.clone(),
-            loading:app.snapshot.connected,
-            error:if app.snapshot.connected {String::new()} else {"Sign in to load your Deezer library.".into()},
+            title: app
+                .entity
+                .as_ref()
+                .map(|e| e.title.clone())
+                .unwrap_or_else(|| app.ui.view.title().into()),
+            entity: app.entity.clone(),
+            loading: app.snapshot.connected,
+            error: if app.snapshot.connected {
+                String::new()
+            } else {
+                format!("Sign in to load your {} library.", app.ui.provider.label())
+            },
             ..Default::default()
         }));
     }
@@ -2758,8 +3884,25 @@ unsafe fn load_page(app: &mut App) {
             },
         ),
     );
+    if app.ui.view == View::StyleMix
+        && app.ui.mix_region != usize::MAX
+        && app.ui.mix_genres.is_none()
+        && app.query.is_empty()
+        && app.snapshot.connected
+    {
+        let name = if app.ui.provider == crate::catalog::Provider::Spotify {
+            "SpotifyStyleMixGenres"
+        } else {
+            "DeezerStyleMixGenres"
+        };
+        data_request(
+            app,
+            crate::catalog::Job::Api(name.into(), vec![serde_json::json!(app.ui.mix_region)]),
+        );
+    }
 }
 unsafe fn queue_scroll_pointer(hwnd: HWND, app: &mut App, y: i32) {
+    app.queue_glide = None;
     if let Some(track) = app.scene.queue_scrollbar {
         let thumb = app
             .scene
@@ -2769,15 +3912,408 @@ unsafe fn queue_scroll_pointer(hwnd: HWND, app: &mut App, y: i32) {
             .map(|p| p.rect.h)
             .unwrap_or(24);
         let span = (track.h - thumb).max(1);
-        app.ui.queue_scroll = ((y - track.y - thumb / 2).clamp(0, span) as usize
+        let offset = ((y - track.y - thumb / 2).clamp(0, span) as usize
             * app.scene.queue_scroll_max
             / span as usize)
             .min(app.scene.queue_scroll_max);
+        if app.scene.device_sidebar.is_some() {
+            app.ui.device_sidebar_scroll = offset as i32;
+        } else {
+            set_queue_scroll(hwnd,app,(offset*24).min(i32::MAX as usize) as i32);
+            return;
+        }
         rebuild(hwnd, app);
     }
 }
+
+unsafe fn set_queue_scroll(hwnd: HWND, app: &mut App, pixels: i32) {
+    let offset = pixels.clamp(
+        0,
+        app.scene
+            .queue_scroll_max
+            .saturating_mul(24)
+            .min(i32::MAX as usize) as i32,
+    ) as usize;
+    if app.ui.queue_scroll * 24 + app.ui.queue_scroll_offset != offset {
+        let previous=app.ui.queue_scroll*24+app.ui.queue_scroll_offset;
+        reset_marquees();
+        app.ui.queue_scroll = offset / 24;
+        app.ui.queue_scroll_offset = offset % 24;
+        let focus=app.canvas_focus.and_then(|i|app.scene.buttons.get(i)).map(|b|canvas_action_key(&b.action));
+        let (_,h)=size(hwnd,app);
+        let queue_origin=app.scene.queue_layout_scroll;
+        if ui::refresh_queue_sidebar(&mut app.scene,&app.ui,h) {
+            if app.scene.queue_layout_scroll!=queue_origin {gpu::invalidate_queue_layer();}
+            app.canvas_focus=focus.and_then(|key|app.scene.buttons.iter().position(|b|canvas_action_matches(&key,&b.action)));
+            app.canvas_hover=None;app.canvas_pressed=None;
+            app.buttons.resize(app.scene.buttons.len(),null_mut());
+            app.button_text.resize(app.scene.buttons.len(),String::new());
+            if previous/72!=offset/72 {request_art(app,h);}
+            if let Some(frame)=app.scene.queue_frame {
+                let mut rect=app.rect(frame);let caption=caption_height(hwnd);rect.top+=caption;rect.bottom+=caption;
+                InvalidateRect(hwnd,&rect,0);
+            }
+        } else {rebuild(hwnd,app);}
+    }
+}
+const OFFSCREEN_ARTWORK_BYTES: usize = 16 * 1024 * 1024;
+const OFFSCREEN_ARTWORK_HIGH_WATER:usize=24*1024*1024;
+const RESIDENT_ARTWORK_BYTES: usize = 64 * 1024 * 1024;
+const MINIMIZED_CACHE_DELAY_MS: u32 = 60_000;
+
+fn trim_inactive_pages(pages: &mut VecDeque<(String, Arc<crate::catalog::Page>)>, current: &str) {
+    let mut recent = pages.iter().filter(|(key, _)| key != current).count();
+    while recent > 2 {
+        if let Some(index) = pages.iter().position(|(key, _)| key != current) {
+            pages.remove(index);
+            recent -= 1;
+        } else {
+            break;
+        }
+    }
+}
+
+fn trim_artwork_entries(
+    images: &mut HashMap<String, Arc<crate::catalog::Bitmap>>,
+    order: &mut VecDeque<String>,
+    protected: &HashSet<String>,
+) -> Vec<(String, u64)> {
+    trim_artwork_recent(images,order,protected,&HashSet::new(),false)
+}
+
+fn trim_artwork_recent(images:&mut HashMap<String,Arc<crate::catalog::Bitmap>>,order:&mut VecDeque<String>,protected:&HashSet<String>,recent:&HashSet<u64>,scrolling:bool)->Vec<(String,u64)> {
+    let mut total=images.values().map(|i|i.pixels.len()*4).sum::<usize>();
+    let mut offscreen=images.iter().filter(|(key,_)|!protected.contains(*key)).map(|(_,i)|i.pixels.len()*4).sum::<usize>();
+    let soft=!scrolling&&offscreen>OFFSCREEN_ARTWORK_HIGH_WATER;
+    let mut removed=Vec::new();
+    while total>RESIDENT_ARTWORK_BYTES||(soft&&offscreen>OFFSCREEN_ARTWORK_BYTES){
+        let hard=total>RESIDENT_ARTWORK_BYTES;
+        let Some(index)=order.iter().position(|key|!protected.contains(key)&&images.get(key).is_some_and(|i|hard||!recent.contains(&i.id)))else{break;};
+        let key=order.remove(index).unwrap();
+        if let Some(image)=images.remove(&key){let bytes=image.pixels.len()*4;total=total.saturating_sub(bytes);offscreen=offscreen.saturating_sub(bytes);removed.push((key,image.id));}
+    }
+    removed
+}
+
+fn trim_artwork_entries_to(
+    images: &mut HashMap<String, Arc<crate::catalog::Bitmap>>,
+    order: &mut VecDeque<String>,
+    protected: &HashSet<String>,
+    offscreen_limit: usize,
+) -> Vec<(String, u64)> {
+    let mut total = 0usize;
+    let mut offscreen = 0usize;
+    for (key, image) in images.iter() {
+        let bytes = image.pixels.len().saturating_mul(4);
+        total = total.saturating_add(bytes);
+        if !protected.contains(key) {
+            offscreen = offscreen.saturating_add(bytes);
+        }
+    }
+    let mut removed = Vec::new();
+    while total > RESIDENT_ARTWORK_BYTES || offscreen > offscreen_limit {
+        let Some(index) = order.iter().position(|key| !protected.contains(key)) else {
+            break;
+        };
+        let key = order.remove(index).unwrap();
+        if let Some(image) = images.remove(&key) {
+            let bytes = image.pixels.len().saturating_mul(4);
+            total = total.saturating_sub(bytes);
+            offscreen = offscreen.saturating_sub(bytes);
+            removed.push((key, image.id));
+        }
+    }
+    removed
+}
+
+fn trim_minimized_artwork(app: &mut App) {
+    let mut protected = HashSet::new();
+    for entry in app
+        .ui
+        .queue
+        .iter()
+        .skip(app.ui.queue_index.saturating_sub(2))
+        .take(8)
+        .chain(std::iter::once(&app.ui.now))
+    {
+        protected.insert(entry.artwork.clone());
+    }
+    protected.insert(format!("background:{}", app.ui.now.artwork));
+    protected.insert(crate::catalog::cover_artwork_key(&app.ui.now.artwork));
+    protected.insert(format!(
+        "blur:cover:{}",
+        crate::catalog::cover_artwork_key(&app.ui.now.artwork)
+    ));
+    protected.insert(app.custom_background.clone());
+    protected.insert(app.ui.playlist_draft.preview.clone());
+    protected.extend(
+        app.scene
+            .buttons
+            .iter()
+            .map(|button| button.artwork.clone()),
+    );
+    protected.extend(app.scene.pictures.iter().map(|(_, url)| url.clone()));
+    protected.extend(app.scene.artwork_ahead.iter().map(|(_, url)| url.clone()));
+    let removed = trim_artwork_entries_to(
+        &mut app.images,
+        &mut app.image_order,
+        &protected,
+        2 * 1024 * 1024,
+    );
+    let mut retired: HashSet<u64> = removed.iter().map(|(_, id)| *id).collect();
+    for image in app
+        .images
+        .values()
+        .chain(app.previous_cover.iter())
+        .chain(app.background.iter())
+        .chain(app.previous_background.iter())
+    {
+        retired.remove(&image.id);
+    }
+    crate::drawing::evict_resized_artwork(&retired);
+    for (key, _) in removed {
+        app.image_pending.remove(&key);
+        app.image_times.remove(&key);
+    }
+    app.artwork.shrink(app.images.values().map(|i|i.id).collect());
+}
+
+fn trim_artwork(app: &mut App, height: i32) {
+    let top = app.scene.content_top;
+    let bottom = content_bottom(app, height);
+    let ahead = (bottom - top).max(240);
+    let mut protected = HashSet::new();
+    let mut keep = |url: &str| {
+        if !url.is_empty() {
+            protected.insert(url.to_owned());
+        }
+    };
+    for entry in app
+        .ui
+        .queue
+        .iter()
+        .skip(app.ui.queue_index.saturating_sub(2))
+        .take(8)
+        .chain(std::iter::once(&app.ui.now))
+    {
+        keep(&entry.artwork);
+    }
+    keep(&format!("background:{}", app.ui.now.artwork));
+    keep(&crate::catalog::cover_artwork_key(&app.ui.now.artwork));
+    keep(&format!(
+        "blur:cover:{}",
+        crate::catalog::cover_artwork_key(&app.ui.now.artwork)
+    ));
+    keep(&app.custom_background);
+    keep(&app.ui.playlist_draft.preview);
+    for button in &app.scene.buttons {
+        if button.rect.y + button.rect.h > top - ahead && button.rect.y < bottom + ahead {
+            keep(&button.artwork);
+        }
+    }
+    for (rect, url) in &app.scene.pictures {
+        if rect.y + rect.h > top - ahead && rect.y < bottom + ahead {
+            keep(url);
+        }
+    }
+    for (y, url) in &app.scene.artwork_ahead {
+        if *y >= top - ahead && *y < bottom + ahead {
+            keep(url);
+        }
+    }
+    let before = artwork_metrics_path().map(|_| {
+        let total = app
+            .images
+            .values()
+            .map(|image| image.pixels.len().saturating_mul(4))
+            .sum();
+        let offscreen = app
+            .images
+            .iter()
+            .filter(|(key, _)| !protected.contains(*key))
+            .map(|(_, image)| image.pixels.len().saturating_mul(4))
+            .sum();
+        (total, offscreen, crate::drawing::resized_artwork_stats())
+    });
+    let recent=app.artwork.recent_ids();
+    let scrolling=main_scroll_animating(app)||app.queue_glide.is_some()||app.scrolling||app.queue_scroll_drag;
+    if scrolling {unsafe{let parent=GetParent(app.canvas_keyboard);if !parent.is_null(){SetTimer(parent,10,5100,None);}}}
+    let removed = trim_artwork_recent(&mut app.images, &mut app.image_order, &protected,&recent,scrolling);
+    if !removed.is_empty() {
+        let mut retired: HashSet<u64> = removed.iter().map(|(_, id)| *id).collect();
+        for image in app
+            .images
+            .values()
+            .chain(app.previous_cover.iter())
+            .chain(app.background.iter())
+            .chain(app.previous_background.iter())
+        {
+            retired.remove(&image.id);
+        }
+        crate::drawing::evict_resized_artwork(&retired);
+        for (key, _) in &removed {
+            app.image_pending.remove(key);
+            app.image_times.remove(key);
+        }
+    }
+    if let Some(before) = before {
+        artwork_metrics(app, &protected, before, removed.len());
+    }
+    let used=protected.iter().filter_map(|url|app.images.get(url).map(|i|i.id)).collect();
+    app.artwork.residency(app.images.values().map(|i|i.id).collect(),&used);
+}
+
+fn artwork_metrics_path() -> Option<&'static std::ffi::OsStr> {
+    static PATH: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| std::env::var_os("DEEZNATS_ARTWORK_METRICS"))
+        .as_deref()
+}
+
+fn render_memory_metrics(app: &App) {
+    let Some(path) = artwork_metrics_path() else {
+        return;
+    };
+    thread_local! { static LAST: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) }; }
+    let now = std::time::Instant::now();
+    if LAST.with(|last| {
+        if last
+            .get()
+            .is_some_and(|previous| now.duration_since(previous).as_secs_f32() < 1.0)
+        {
+            true
+        } else {
+            last.set(Some(now));
+            false
+        }
+    }) {
+        return;
+    }
+    let (shadows, lyrics, blurred) = crate::drawing::lyric_raster_bytes();
+    struct CountWriter(usize);
+    impl std::io::Write for CountWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut page_bytes = CountWriter(0);
+    for (_, page) in &app.page_cache {
+        let _ = serde_json::to_writer(&mut page_bytes, page.as_ref());
+    }
+    if let Some(page) = app.ui.page.as_ref() {
+        if !app
+            .page_cache
+            .iter()
+            .any(|(_, cached)| Arc::ptr_eq(page, cached))
+        {
+            let _ = serde_json::to_writer(&mut page_bytes, page.as_ref());
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    let page_scoped_rust_live = Some(crate::memory_profile::page_live(app.ui.view as usize + 1));
+    #[cfg(feature = "diagnostics")]
+    let page_scoped_all: Option<Vec<usize>> =
+        Some((0..256).map(crate::memory_profile::page_live).collect());
+    #[cfg(feature = "diagnostics")]
+    let measured_rust_live = Some(crate::memory_profile::current_live());
+    #[cfg(not(feature = "diagnostics"))]
+    let page_scoped_rust_live: Option<usize> = None;
+    #[cfg(not(feature = "diagnostics"))]
+    let page_scoped_all: Option<Vec<usize>> = None;
+    #[cfg(not(feature = "diagnostics"))]
+    let measured_rust_live: Option<usize> = None;
+    let record = serde_json::json!({
+        "kind": "render_memory", "view": format!("{:?}", app.ui.view),
+        "page_scoped_rust_live_bytes": page_scoped_rust_live,
+        "page_tag": app.ui.view as usize + 1, "page_scoped_all_live_bytes": page_scoped_all,
+        "measured_rust_live_bytes": measured_rust_live,
+        "time_unix_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis(),
+        "lyric_shadow_bytes": shadows, "lyric_raster_bytes": lyrics,
+        "lyric_blurred_bytes": blurred, "backdrop_bytes": app.backdrop_cache.borrow().1.capacity() * 4,
+        "pages": app.page_cache.len(), "page_json_bytes": page_bytes.0,
+        "resized_bytes": crate::drawing::resized_artwork_stats().1,
+        "artwork_bytes": app.images.values().map(|image| image.pixels.len() * 4).sum::<usize>()
+    });
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write as _;
+        let _ = writeln!(file, "{record}");
+    }
+}
+
+fn artwork_metrics(
+    app: &App,
+    protected: &HashSet<String>,
+    before: (usize, usize, (usize, usize)),
+    evicted: usize,
+) {
+    thread_local! { static LAST: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) }; }
+    let Some(path) = artwork_metrics_path() else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    if LAST.with(|last| {
+        if evicted == 0
+            && last
+                .get()
+                .is_some_and(|previous| now.duration_since(previous).as_secs_f32() < 1.0)
+        {
+            true
+        } else {
+            last.set(Some(now));
+            false
+        }
+    }) {
+        return;
+    }
+    let mut unique = HashSet::new();
+    let unique_bytes: usize = app
+        .images
+        .values()
+        .filter(|image| unique.insert(image.id))
+        .map(|image| image.pixels.len().saturating_mul(4))
+        .sum();
+    let total_bytes: usize = app
+        .images
+        .values()
+        .map(|image| image.pixels.len().saturating_mul(4))
+        .sum();
+    let offscreen_bytes: usize = app
+        .images
+        .iter()
+        .filter(|(key, _)| !protected.contains(*key))
+        .map(|(_, image)| image.pixels.len().saturating_mul(4))
+        .sum();
+    let resized = crate::drawing::resized_artwork_stats();
+    let record = serde_json::json!({
+        "time_unix_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis(),
+        "view": format!("{:?}", app.ui.view), "entries": app.images.len(),
+        "unique_images": unique.len(), "unique_bytes": unique_bytes, "accounted_bytes": total_bytes,
+        "offscreen_bytes": offscreen_bytes, "before_bytes": before.0,
+        "before_offscreen_bytes": before.1, "evicted_entries": evicted,
+        "resized_entries": resized.0, "resized_bytes": resized.1,
+        "before_resized_bytes": before.2.1
+    });
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write as _;
+        let _ = writeln!(file, "{record}");
+    }
+}
+
 unsafe fn request_art(app: &mut App, h: i32) {
-    if app.render_suspended{return;}
+    if app.render_suspended {
+        return;
+    }
     let engine = app.snapshot.engine.clone();
     let mut urls = Vec::new();
     for node in &app.scene.buttons {
@@ -2797,10 +4333,11 @@ unsafe fn request_art(app: &mut App, h: i32) {
     if !app.ui.now.artwork.is_empty() {
         urls.push(app.ui.now.artwork.clone());
     }
+    let visible: HashSet<String> = urls.iter().cloned().collect();
     // Visible artwork is submitted first; speculative requests never create
     // extra native controls or alter the virtualized page layout.
     let mut ahead: Vec<_> = app.scene.artwork_ahead.iter().collect();
-    let upward = app.scroll_target < app.ui.scroll;
+    let upward = app.artwork_prefetch_upward;
     ahead.sort_by_key(|(y, _)| {
         let preferred = if upward {
             *y < app.scene.content_top
@@ -2820,42 +4357,246 @@ unsafe fn request_art(app: &mut App, h: i32) {
     urls.extend(ahead.into_iter().map(|(_, url)| url.clone()));
     let mut seen = HashSet::new();
     urls.retain(|url| seen.insert(url.clone()));
-    app.image_retry_at.retain(|url,_|seen.contains(url));
+    app.artwork.set_wanted(seen.clone(),visible.clone());
+    app.image_retry_at.retain(|url, _| seen.contains(url));
+    {
+        let touched:HashSet<&str>=urls.iter().filter(|url|app.images.contains_key(*url)).map(String::as_str).collect();
+        app.image_order.retain(|key|!touched.contains(key.as_str()));
+    }
     for url in urls {
         if app.images.contains_key(&url) {
             // Actual use refreshes recency; insertion order alone evicts covers
             // that are still on screen during long browsing sessions.
-            app.image_order.retain(|key| key != &url);
             app.image_order.push_back(url.clone());
         }
         if !url.is_empty()
             && !app.images.contains_key(&url)
             && !app.image_pending.contains(&url)
-            && app.image_retry_at.get(&url).is_none_or(|at|std::time::Instant::now()>=*at)
+            && (visible.contains(&url)
+                || !crate::drawing::progressive_artwork_enabled()
+                || !matches!(app.ui.view, View::Home | View::Explore)
+                || app.image_pending.len() < 12)
+            && app
+                .image_retry_at
+                .get(&url)
+                .is_none_or(|at| std::time::Instant::now() >= *at)
             && app
                 .artwork
-                .requests
-                .try_send(crate::catalog::ArtRequest {
+                .request(crate::catalog::ArtRequest {
+                    #[cfg(feature = "diagnostics")]
+                    view_tag: app.ui.view as usize + 1,
                     engine: engine.clone(),
-                    url: url.clone(),
+                    url: url.strip_prefix("cover:").unwrap_or(&url).to_owned(),
                     key: url.clone(),
                     background: false,
-                    max_edge: if url
-                        == crate::catalog::display_artwork_url(&app.ui.now.artwork, 1024, true)
+                    max_edge: if url == crate::catalog::cover_artwork_key(&app.ui.now.artwork)
                         && app.ui.view == View::Lyrics
                     {
                         1024
                     } else {
                         crate::catalog::CARD_ART_EDGE
                     },
-                })
+                },visible.contains(&url))
                 .is_ok()
         {
             app.image_pending.insert(url);
         }
     }
+    let used=visible.iter().filter_map(|url|app.images.get(url).map(|i|i.id)).collect();
+    app.artwork.residency(app.images.values().map(|i|i.id).collect(),&used);
+}
+unsafe fn start_spotify(app: &mut App) {
+    app.spotify_service.take();
+    app.spotify_opened = false;
+    match crate::spotify::service::Service::start() {
+        Ok(service) => {
+            app.spotify_service = Some(service);
+            app.ui.spotify_phase = Some(crate::spotify::service::Phase::Starting);
+            app.ui.spotify_setup_status = "Starting Soloist...".into();
+        }
+        Err(error) => {
+            app.ui.spotify_phase = Some(crate::spotify::service::Phase::Failed);
+            app.ui.spotify_setup_status = error;
+        }
+    }
+}
+unsafe fn begin_spotify_auth(app: &mut App, action: crate::spotify::AuthAction) {
+    if app.spotify_auth.is_some() {
+        return;
+    }
+    app.spotify_jam_request = None;
+    app.ui.spotify_jam = None;
+    app.ui.spotify_jam_busy = false;
+    app.ui.spotify_jam_status.clear();
+    app.ui.spotify_reset_pending = matches!(action, crate::spotify::AuthAction::Refresh);
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = cancel.clone();
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    match std::thread::Builder::new()
+        .name("spotify-catalog-auth".into())
+        .spawn(move || {
+            let result = match action {
+                crate::spotify::AuthAction::Login => crate::spotify::login_web(&flag),
+                crate::spotify::AuthAction::Logout => crate::spotify::logout(),
+                crate::spotify::AuthAction::Refresh => crate::spotify::refresh()
+                    .and_then(|_| crate::spotify::catalog_account().map(|_| ())),
+            };
+            let _ = send.send(result);
+        }) {
+        Ok(_) => {
+            app.spotify_auth = Some((cancel, receive));
+            app.ui.spotify_catalog_busy = true;
+            app.ui.spotify_catalog_status = "Updating Spotify sign-in...".into();
+        }
+        Err(_) => app.ui.spotify_catalog_status = "Could not start Spotify sign-in.".into(),
+    }
+}
+unsafe fn request_spotify_jam(app: &mut App, operation: crate::spotify::jam::Operation) {
+    if app.ui.provider != crate::catalog::Provider::Spotify || app.ui.spotify_jam_busy {
+        return;
+    }
+    let identity = crate::spotify::jam::account_key();
+    let copy_invite = matches!(operation, crate::spotify::jam::Operation::Invite(_));
+    app.ui.spotify_jam_busy = true;
+    app.ui.spotify_jam_status = "Loading Spotify Jam...".into();
+    match crate::spotify::jam::spawn(operation, identity.clone()) {
+        Ok(request) => {
+            app.spotify_jam_request = Some((app.generation, identity, copy_invite, request))
+        }
+        Err(_) => {
+            app.ui.spotify_jam_busy = false;
+            app.ui.spotify_jam_status = "Could not start Spotify Jam worker.".into();
+        }
+    }
+}
+
+unsafe fn refresh_spotify_devices(app: &mut App) {
+    if app.ui.provider != crate::catalog::Provider::Spotify || app.ui.spotify_devices_busy {
+        return;
+    }
+    app.ui.spotify_devices_busy = true;
+    app.ui.spotify_devices_status = "Loading Spotify devices...".into();
+    request_spotify_device_action(app, "SPDevicesJSON", vec![]);
+}
+unsafe fn request_spotify_device_action(app: &mut App, name: &str, args: Vec<serde_json::Value>) {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let token = (1u64 << 63) | NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    app.spotify_device_request = Some(token);
+    let request = crate::catalog::Request {
+        #[cfg(feature = "diagnostics")]
+        view_tag: app.ui.view as usize + 1,
+        generation: token,
+        provider: crate::catalog::Provider::Spotify,
+        engine: None,
+        job: crate::catalog::Job::Api(name.into(), args),
+    };
+    if app.catalog.requests.send(request).is_err() {
+        app.spotify_device_request = None;
+        app.ui.spotify_devices_busy = false;
+        app.ui.spotify_devices_status = "Spotify device worker is unavailable.".into();
+    }
+}
+unsafe fn open_spotify(hwnd: HWND, app: &mut App) {
+    if ShellExecuteW(
+        hwnd,
+        wide("open").as_ptr(),
+        wide("spotify:").as_ptr(),
+        null(),
+        null(),
+        SW_SHOWNORMAL,
+    ) as isize
+        <= 32
+    {
+        app.notice="Open Spotify on this computer or another device on the same network, then select DeezNats in its device picker.".into();
+    }
 }
 unsafe fn process_data(hwnd: HWND, app: &mut App) {
+    let auth_result =
+        app.spotify_auth
+            .as_ref()
+            .and_then(|(_, receiver)| match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("Spotify sign-in worker closed.".into()))
+                }
+                Err(_) => None,
+            });
+    if let Some(result) = auth_result {
+        app.spotify_auth = None;
+        app.ui.spotify_catalog_busy = false;
+        let reset_pending = std::mem::take(&mut app.ui.spotify_reset_pending);
+        match result {
+            Ok(()) => {
+                app.ui.spotify_reset_failed = false;
+                app.ui.spotify_catalog_status = if crate::spotify::api_configured() {
+                    "Spotify sign-in updated."
+                } else {
+                    "Signed out of Spotify."
+                }
+                .into();
+                if app.ui.provider == crate::catalog::Provider::Spotify {
+                    switch_provider(app, crate::catalog::Provider::Spotify);
+                }
+            }
+            Err(error) => {
+                if reset_pending {
+                    app.ui.spotify_reset_failed = true;
+                }
+                app.ui.spotify_catalog_status = error;
+            }
+        }
+        app.notice = app.ui.spotify_catalog_status.clone();
+        rebuild(hwnd, app);
+    }
+    let setup_result =
+        app.spotify_setup
+            .as_ref()
+            .and_then(|(_, receive)| match receive.try_recv() {
+                Ok(value) => Some(value),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("Spotify setup window closed.".into()))
+                }
+                Err(_) => None,
+            });
+    if let Some(result) = setup_result {
+        app.spotify_setup = None;
+        app.ui.spotify_setup_busy = false;
+        match result {
+            Ok(()) => {
+                app.ui.spotify_configured = true;
+                start_spotify(app);
+            }
+            Err(error) => app.ui.spotify_setup_status = error,
+        }
+        app.notice = app.ui.spotify_setup_status.clone();
+        rebuild(hwnd, app);
+    }
+
+    if !app.ui.spotify_setup_busy {
+        if let Some(service) = &app.spotify_service {
+            let status = service.status();
+            if app.ui.spotify_phase != Some(status.phase)
+                || app.ui.spotify_setup_status != status.message
+            {
+                if app.notice == app.ui.spotify_setup_status {
+                    app.notice = status.message.clone();
+                }
+                app.ui.spotify_phase = Some(status.phase);
+                app.ui.spotify_setup_status = status.message;
+                if status.phase == crate::spotify::service::Phase::Pairing && !app.spotify_opened {
+                    app.spotify_opened = true;
+                    MessageBoxW(
+                        hwnd,
+                        wide(&app.ui.t("Open Spotify on your phone or computer and select DeezNats in Spotify Connect to finish pairing.")).as_ptr(),
+                        wide(&app.ui.t("Pair Spotify")).as_ptr(),
+                        MB_OK | MB_ICONINFORMATION,
+                    );
+                    open_spotify(hwnd, app);
+                }
+                rebuild(hwnd, app);
+            }
+        }
+    }
     let auth_result = app
         .deezer_auth
         .as_ref()
@@ -2887,6 +4628,49 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
     }
 
     let mut dirty = false;
+    let jam_result = app
+        .spotify_jam_request
+        .as_ref()
+        .and_then(|(_, _, _, request)| match request.receiver.try_recv() {
+            Ok(result) => Some(result),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(
+                "Spotify Jam worker closed. Refresh Jam to check its state.".into(),
+            )),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+        });
+    if let Some(result) = jam_result {
+        if let Some((_generation, identity, copy_invite, _)) = app.spotify_jam_request.take() {
+            app.ui.spotify_jam_busy = false;
+            if app.ui.provider == crate::catalog::Provider::Spotify
+                && identity == crate::spotify::jam::account_key()
+            {
+                match result {
+                    Ok(session) => {
+                        if copy_invite {
+                            if let Some(invite) = session.as_ref().and_then(|s| s.invite.as_ref()) {
+                                app.notice = match copy_text(hwnd, invite) {
+                                    Ok(()) => "Spotify Jam invite copied.".into(),
+                                    Err(error) => error,
+                                };
+                            }
+                        }
+                        app.ui.spotify_jam_status = if session.as_ref().is_some_and(|s| s.active) {
+                            "Jam is active."
+                        } else {
+                            "No active Spotify Jam."
+                        }
+                        .into();
+                        app.ui.spotify_jam = session;
+                    }
+                    Err(error) => app.ui.spotify_jam_status = error,
+                }
+            } else {
+                app.ui.spotify_jam = None;
+                app.ui.spotify_jam_status = "Spotify session changed. Refresh Jam.".into();
+            }
+            dirty = true;
+        }
+    }
 
     let mut repaint = false;
     // Resolve the current target before accepting worker replies: a reply for a
@@ -2897,12 +4681,55 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
             app.background = Some(texture);
             app.background_transition
                 .texture_ready(std::time::Instant::now());
-            SetTimer(hwnd, 2, 16, None);
+            start_animation_timer(hwnd, 2);
             repaint = true;
         }
     }
     while let Ok(event) = app.downloads.updates.try_recv() {
         match event {
+            crate::downloads::Event::Maintenance(result) => {
+                app.ui.library_storage = match result {
+                    Ok(summary) => summary,
+                    Err(error) => error,
+                };
+                app.notice = app.ui.library_storage.clone();
+                dirty = true;
+            }
+            crate::downloads::Event::RemovedSelection(result) => {
+                app.downloads.finish_removal();
+                app.ui.offline = crate::downloads::load_offline();
+                app.page_cache.clear();
+                app.notice = match result {
+                    Ok(()) => "Download removed".into(),
+                    Err(error) => format!("Could not remove download: {error}"),
+                };
+                if matches!(app.ui.view, View::Offline | View::Podcasts) {
+                    load_page(app);
+                }
+                dirty = true;
+            }
+            crate::downloads::Event::Removed(result) => {
+                app.downloads.finish_removal();
+                app.ui.downloads.clear();
+                app.download_cancels.clear();
+                app.ui.offline = crate::downloads::load_offline();
+                app.page_cache.clear();
+                app.catalog.session.invalidate();
+                app.notice = match result {
+                    Ok(()) => "Downloaded files removed".into(),
+                    Err(error) => format!("Some downloads could not be removed: {error}"),
+                };
+                if matches!(app.ui.view, View::Offline | View::Podcasts) {
+                    load_page(app);
+                }
+                dirty = true;
+            }
+            crate::downloads::Event::Started(id, title) => {
+                if let Some(job) = app.ui.downloads.iter_mut().find(|job| job.id == id) {
+                    job.message = format!("Downloading {title}");
+                }
+                dirty = true;
+            }
             crate::downloads::Event::Track(id, index, total, item, result) => {
                 if let Some(job) = app.ui.downloads.iter_mut().find(|j| j.id == id) {
                     job.done = index;
@@ -2910,15 +4737,10 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
                     match result {
                         Ok(_) => {
                             job.message = format!("Saved {}", item.title);
-                            if !app
-                                .ui
+                            app.ui
                                 .offline
-                                .iter()
-                                .any(|e| e.id == item.id && e.kind == item.kind)
-                            {
-                                app.ui.offline.push(*item);
-                                crate::downloads::save_offline(&app.ui.offline);
-                            }
+                                .retain(|e| e.id != item.id || e.kind != item.kind);
+                            app.ui.offline.push(*item);
                         }
                         Err(error) => {
                             job.failed += 1;
@@ -2926,24 +4748,16 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
                         }
                     }
                 }
+                if matches!(app.ui.view, View::Offline | View::Podcasts) {
+                    load_page(app);
+                }
                 dirty = true;
             }
-            crate::downloads::Event::Finished(id, cancelled) => {
-                if let Some(job) = app.ui.downloads.iter_mut().find(|j| j.id == id) {
-                    job.finished = true;
-                    job.message = if cancelled {
-                        "Cancelled".into()
-                    } else {
-                        format!(
-                            "Completed: {} saved / {} failed",
-                            job.done - job.failed,
-                            job.failed
-                        )
-                    };
-                }
+            crate::downloads::Event::Finished(id, _cancelled) => {
+                app.ui.downloads.retain(|job| job.id != id);
                 app.download_cancels.remove(&id);
                 app.page_cache.clear();
-                if app.ui.view == View::Podcasts {
+                if matches!(app.ui.view, View::Podcasts | View::Offline) {
                     load_page(app);
                 }
                 dirty = true;
@@ -2952,36 +4766,74 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
     }
     while let Ok(event) = app.catalog.updates.try_recv() {
         match event {
-            crate::catalog::Event::Playlist(mutation, result) => {
+            crate::catalog::Event::Playlist(generation, provider, mutation, result)
+                if provider == app.ui.provider && app.playlist_generation == Some(generation) =>
+            {
+                app.playlist_generation = None;
                 app.ui.playlist_busy = false;
                 if let crate::playlist::Mutation::Save { id, seed, .. } = &mutation {
                     app.ui.playlist_draft.id = id.clone();
-                    if seed.is_none() { app.ui.playlist_draft.seed = None; }
+                    if seed.is_none() {
+                        app.ui.playlist_draft.seed = None;
+                    }
                 }
                 app.page_cache.clear();
                 app.catalog.session.invalidate();
                 app.library_loaded = false;
                 match result {
                     Ok(outcome) => {
-                        if matches!(mutation, crate::playlist::Mutation::Save { .. }) { app.ui.playlist_draft.image = None; }
-                        if matches!(mutation, crate::playlist::Mutation::Save { .. }) && matches!(app.ui.view, View::PlaylistEdit | View::CoverEdit) {
+                        if matches!(mutation, crate::playlist::Mutation::Save { .. }) {
+                            app.ui.playlist_draft.image = None;
+                        }
+                        if matches!(mutation, crate::playlist::Mutation::Save { .. })
+                            && matches!(app.ui.view, View::PlaylistEdit | View::CoverEdit)
+                        {
                             let entry = crate::catalog::Entry {
-                                id: outcome.id, kind: "playlist".into(), title: app.ui.playlist_draft.title.clone(),
-                                artwork: app.ui.playlist_draft.preview.clone(), raw: serde_json::json!({"description":app.ui.playlist_draft.description}), ..Default::default()
+                                id: outcome.id,
+                                kind: "playlist".into(),
+                                title: app.ui.playlist_draft.title.clone(),
+                                artwork: app.ui.playlist_draft.preview.clone(),
+                                raw: serde_json::json!({"description":app.ui.playlist_draft.description}),
+                                ..Default::default()
                             };
                             navigate(app, View::Album, Some(entry), String::new());
                             load_page(app);
-                        } else if matches!(mutation, crate::playlist::Mutation::Add(..)) && app.ui.view == View::PlaylistPicker {
-                            let entry = app.ui.page.as_ref().and_then(|p| p.rows.iter().find(|e| e.id == outcome.id)).cloned()
-                                .unwrap_or(crate::catalog::Entry { id: outcome.id.clone(), kind: "playlist".into(), title: "Playlist".into(), ..Default::default() });
+                        } else if matches!(mutation, crate::playlist::Mutation::Add(..))
+                            && app.ui.view == View::PlaylistPicker
+                        {
+                            let entry = app
+                                .ui
+                                .page
+                                .as_ref()
+                                .and_then(|p| p.rows.iter().find(|e| e.id == outcome.id))
+                                .cloned()
+                                .unwrap_or(crate::catalog::Entry {
+                                    id: outcome.id.clone(),
+                                    kind: "playlist".into(),
+                                    title: "Playlist".into(),
+                                    ..Default::default()
+                                });
                             app.ui.playlist_track = None;
-                            navigate(app, View::Album, Some(entry), String::new()); load_page(app);
-                        } else if outcome.deleted && (app.entity.as_ref().is_some_and(|e| e.id == outcome.id) || matches!(app.ui.view, View::PlaylistEdit | View::CoverEdit)) {
-                            navigate(app, View::Playlists, None, String::new()); load_page(app);
-                        } else if matches!(app.ui.view, View::Album | View::Playlists | View::PlaylistPicker) {
+                            navigate(app, View::Album, Some(entry), String::new());
+                            load_page(app);
+                        } else if outcome.deleted
+                            && (app.entity.as_ref().is_some_and(|e| e.id == outcome.id)
+                                || matches!(app.ui.view, View::PlaylistEdit | View::CoverEdit))
+                        {
+                            navigate(app, View::Playlists, None, String::new());
+                            load_page(app);
+                        } else if matches!(
+                            app.ui.view,
+                            View::Album | View::Playlists | View::PlaylistPicker
+                        ) {
                             load_page(app);
                         }
-                        app.notice = if outcome.deleted { "Playlist deleted" } else { "Playlist updated" }.into();
+                        app.notice = if outcome.deleted {
+                            "Playlist deleted"
+                        } else {
+                            "Playlist updated"
+                        }
+                        .into();
                     }
                     Err(error) => app.notice = error,
                 }
@@ -2994,36 +4846,95 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
                     if app.page_cache.len() >= 12 {
                         app.page_cache.pop_front();
                     }
-                    app.page_cache
-                        .push_back((key, page.clone()));
+                    app.page_cache.push_back((key, page.clone()));
                 }
                 app.notice = if !page.error.is_empty() {
                     page.error.clone()
                 } else if page.loading {
-                    "Loading personalized Deezer content...".into()
+                    format!(
+                        "Loading personalized {} content...",
+                        app.ui.provider.label()
+                    )
                 } else {
                     String::new()
                 };
-                let changed = app.ui.page.as_ref().is_none_or(|old| !crate::catalog::session::same_render(old,&page));
+                let changed = app
+                    .ui
+                    .page
+                    .as_ref()
+                    .is_none_or(|old| !crate::catalog::session::same_render(old, &page));
                 app.ui.page = Some(page);
                 dirty |= changed;
             }
-            crate::catalog::Event::Api(generation, name, result)
-                if generation == app.generation || library_operation(&name) =>
+            crate::catalog::Event::Api(generation, provider, name, result)
+                if provider == app.ui.provider
+                    && (if matches!(name.as_str(), "SPDevicesJSON" | "SPTransferPlaybackJSON") {
+                        app.spotify_device_request == Some(generation)
+                    } else {
+                        generation == app.generation || library_operation(&name)
+                    }) =>
             {
+                if name == "SPDevicesJSON" {
+                    app.spotify_device_request = None;
+                    app.ui.spotify_devices_busy = false;
+                    match &result {
+                        Ok(value) => {
+                            app.ui.spotify_devices = value
+                                .as_array()
+                                .or_else(|| value["devices"].as_array())
+                                .cloned()
+                                .unwrap_or_default();
+                            app.ui.spotify_devices_status = if app.ui.spotify_devices.is_empty() {
+                                "No Spotify devices found. Open Spotify on a device.".into()
+                            } else {
+                                String::new()
+                            };
+                        }
+                        Err(error) => app.ui.spotify_devices_status = error.clone(),
+                    }
+                    dirty = true;
+                    continue;
+                }
+                if name == "SPTransferPlaybackJSON" {
+                    app.spotify_device_request = None;
+                    app.ui.spotify_devices_busy = false;
+                    match result {
+                        Ok(_) => refresh_spotify_devices(app),
+                        Err(error) => app.ui.spotify_devices_status = error,
+                    }
+                    dirty = true;
+                    continue;
+                }
                 match result {
                     Ok(value) => {
+                        if matches!(
+                            name.as_str(),
+                            "DeezerStyleMixGenres" | "SpotifyStyleMixGenres"
+                        ) {
+                            if value["region"].as_u64() == Some(app.ui.mix_region as u64) {
+                                app.ui.mix_genres = Some(value);
+                                app.notice.clear();
+                            }
+                            dirty = true;
+                            continue;
+                        }
                         if library_operation(&name) {
-                            if name == "RustPodcastLibraryJSON" {
+                            if name == "RustPodcastLibraryJSON"
+                                && (provider == crate::catalog::Provider::Deezer
+                                    || value.get("podcasts").is_some())
+                            {
                                 adopt_podcasts(app, &value);
                             }
-                            if let Some((item, add)) =
-                                if name != "RustPodcastLibraryJSON" || value["changed"] == true {
-                                    app.library_pending.take()
-                                } else {
-                                    None
-                                }
-                            {
+                            if let Some((_, item, add)) = if (name != "RustPodcastLibraryJSON"
+                                || provider == crate::catalog::Provider::Spotify
+                                || value["changed"] == true)
+                                && app.library_pending.as_ref().is_some_and(
+                                    |(pending_generation, _, _)| *pending_generation == generation,
+                                ) {
+                                app.library_pending.take()
+                            } else {
+                                None
+                            } {
                                 if value.as_i64() == Some(0) || value.as_bool() == Some(false) {
                                     app.notice = "The service rejected the library update".into();
                                 } else {
@@ -3033,7 +4944,9 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
                                         app.ui.liked_ids.remove(&item.library_key());
                                     }
                                     app.page_cache.clear();
-                                    app.notice = if item.kind == "podcast" {
+                                    app.notice = if item.kind == "podcast"
+                                        && provider == crate::catalog::Provider::Deezer
+                                    {
                                         if add {
                                             "Podcast saved to this app's library"
                                         } else {
@@ -3054,17 +4967,21 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
                             let devices = value.as_array().or_else(|| {
                                 value.get("devices").and_then(serde_json::Value::as_array)
                             });
-                            app.ui.devices = std::iter::once((String::new(), "Default Windows output".into())).chain(devices
-                                .into_iter()
-                                .flatten()
-                                .map(|v| {
-                                    (
-                                        crate::catalog::string(v, &["id"]),
-                                        crate::catalog::string(v, &["name"]),
+                            app.ui.devices =
+                                std::iter::once((String::new(), "Default Windows output".into()))
+                                    .chain(
+                                        devices
+                                            .into_iter()
+                                            .flatten()
+                                            .map(|v| {
+                                                (
+                                                    crate::catalog::string(v, &["id"]),
+                                                    crate::catalog::string(v, &["name"]),
+                                                )
+                                            })
+                                            .filter(|(id, _)| !id.is_empty()),
                                     )
-                                })
-                                .filter(|(id, _)| !id.is_empty()))
-                                .collect();
+                                    .collect();
                             app.notice =
                                 format!("{} audio outputs available", app.ui.devices.len());
                         } else if name == "DZEQJSON" {
@@ -3112,11 +5029,13 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
                                     )
                                 })
                                 .collect();
-                            if !app
-                                .ui
-                                .flow_options
-                                .iter()
-                                .any(|(id, _)| *id == app.ui.flow_id)
+                            if !(app.ui.provider == crate::catalog::Provider::Spotify
+                                && crate::spotify::flow::Selection::parse(&app.ui.flow_id).is_ok())
+                                && !app
+                                    .ui
+                                    .flow_options
+                                    .iter()
+                                    .any(|(id, _)| *id == app.ui.flow_id)
                             {
                                 app.ui.flow_id = app
                                     .ui
@@ -3154,13 +5073,15 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
                                     )
                                 })
                                 .collect();
-                            app.notice = "Flow genres loaded from Deezer".into();
+                            app.notice =
+                                format!("Flow genres loaded from {}", app.ui.provider.label());
                             if let Some(expected) = app.flow_save_expected.clone() {
                                 if expected.iter().all(|(id, enabled)| {
                                     app.ui.genres.iter().any(|g| g.0 == *id && g.2 == *enabled)
                                 }) {
                                     app.flow_save_expected = None;
                                     app.ui.save_preferences();
+                                    invalidate_flow(app);
                                     navigate(app, View::Flow, None, String::new());
                                     load_page(app);
                                     app.notice = "Flow configuration saved and verified".into();
@@ -3199,7 +5120,17 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
                         }
                     }
                     Err(error) => {
-                        if library_operation(&name) {
+                        if matches!(
+                            name.as_str(),
+                            "DeezerStyleMixGenres" | "SpotifyStyleMixGenres"
+                        ) {
+                            app.ui.mix_genres = Some(serde_json::json!({"error":error}));
+                        }
+                        if library_operation(&name)
+                            && app.library_pending.as_ref().is_some_and(
+                                |(pending_generation, _, _)| *pending_generation == generation,
+                            )
+                        {
                             app.library_pending = None;
                         }
                         app.notice = error;
@@ -3207,18 +5138,26 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
                 }
                 dirty = true;
             }
-            crate::catalog::Event::Lyrics(id, sources, result)
-                if id == app.snapshot.now.id
+            crate::catalog::Event::Lyrics(provider, id, sources, result)
+                if provider == app.ui.provider
+                    && id == app.snapshot.now.id
                     && sources == app.ui.lyrics_sources & crate::lyrics::SUPPORTED_SOURCES =>
             {
                 match result {
                     Ok((provider, lines)) => {
-                        let changed=app.ui.lyrics_provider!=provider || app.ui.rich_lyrics.len()!=lines.len() || app.ui.rich_lyrics.iter().zip(&lines).any(|(a,b)|a.text!=b.text||a.start_ms!=b.start_ms);
-                        if changed && app.ui.view==View::Lyrics {
-                            settle_scroll(app,0);
-                            app.ui.lyrics_manual_scroll=false;
-                            app.lyric_motion=None;
-                            app.lyric_motion_offset=0;
+                        let changed = app.ui.lyrics_provider != provider
+                            || app.ui.rich_lyrics.len() != lines.len()
+                            || app
+                                .ui
+                                .rich_lyrics
+                                .iter()
+                                .zip(&lines)
+                                .any(|(a, b)| a.text != b.text || a.start_ms != b.start_ms);
+                        if changed && app.ui.view == View::Lyrics {
+                            settle_scroll(app, 0);
+                            app.ui.lyrics_manual_scroll = false;
+                            app.lyric_motion = None;
+                            app.lyric_motion_offset = 0;
                         }
                         app.ui.lyrics_provider = provider;
                         app.ui.rich_lyrics = lines.clone();
@@ -3252,9 +5191,26 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
             _ => {}
         }
     }
-    while let Ok((url, result)) = app.artwork.updates.try_recv() {
+    let mut artwork_cancelled=false;
+    while let Ok(key)=app.artwork.cancelled.try_recv(){app.image_pending.remove(&key);artwork_cancelled=true;}
+    let artwork_batch_started = std::time::Instant::now();
+    let mut artwork_changed = false;
+    let (_,artwork_height)=size(hwnd,app);
+    let mut artwork_rects=Vec::new();
+    for _ in 0..4 {
+        if artwork_batch_started.elapsed() >= std::time::Duration::from_millis(2) {
+            break;
+        }
+        let Ok((url, result)) = app.artwork.updates.try_recv() else {
+            break;
+        };
         app.image_pending.remove(&url);
-        if result.is_err(){app.image_retry_at.insert(url.clone(),std::time::Instant::now()+std::time::Duration::from_secs(3));}
+        if result.is_err() {
+            app.image_retry_at.insert(
+                url.clone(),
+                std::time::Instant::now() + std::time::Duration::from_secs(3),
+            );
+        }
         if let Ok(bitmap) = result {
             app.image_retry_at.remove(&url);
             if url.starts_with("background:") {
@@ -3283,8 +5239,11 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
                 .map(|entry| entry.artwork.as_str())
                 .filter(|url| !url.is_empty())
                 .collect();
-            let background_key=format!("background:{}",app.ui.now.artwork);
-            let lyrics_blur_key=format!("blur:cover:{}",crate::catalog::display_artwork_url(&app.ui.now.artwork,1024,true));
+            let background_key = format!("background:{}", app.ui.now.artwork);
+            let lyrics_blur_key = format!(
+                "blur:cover:{}",
+                crate::catalog::cover_artwork_key(&app.ui.now.artwork)
+            );
             queue_covers.insert(background_key.as_str());
             queue_covers.insert(lyrics_blur_key.as_str());
             queue_covers.extend(
@@ -3322,15 +5281,25 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
                 app.image_times.remove(&old);
             }
             app.images.insert(url.clone(), bitmap);
+            let damage=artwork_damage::arrival(&app.scene,&url,content_bottom(app,artwork_height));
+            if damage.main {gpu::invalidate_main_layer();}
+            if damage.queue {gpu::invalidate_queue_layer();}
+            artwork_rects.extend(damage.rects);
             app.image_times
                 .insert(url.clone(), std::time::Instant::now());
-            SetTimer(hwnd, 2, 16, None);
+            let cover=url==app.ui.now.artwork||url==crate::catalog::cover_artwork_key(&app.ui.now.artwork)||url.starts_with("background:")||url.starts_with("blur:cover:");
+            if cover {start_animation_timer(hwnd, 2);repaint=true;}
             app.image_order.retain(|key| key != &url);
             app.image_order.push_back(url);
-            repaint = true;
+            artwork_changed = true;
             // A newly arrived cover may need its hover-blur variant prepared.
             dirty |= app.ui.view == View::Lyrics && app.ui.lyrics_cover_hovered;
         }
+    }
+    if artwork_changed {
+        let (_, height) = size(hwnd, app);
+        trim_artwork(app, height);
+        request_art(app,height);
     }
     if dirty {
         rebuild(hwnd, app);
@@ -3339,29 +5308,56 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
         request_art(app, height);
         update_background(hwnd, app);
         InvalidateRect(hwnd, null(), 0);
-    } else if app.image_retry_at.values().any(|at|std::time::Instant::now()>=*at) {
-        let (_,height)=size(hwnd,app);
-        request_art(app,height);
+    } else if artwork_changed {
+        let caption=caption_height(hwnd);
+        for rect in artwork_rects {
+            let mut rect=app.rect(rect);rect.top+=caption;rect.bottom+=caption;
+            InvalidateRect(hwnd,&rect,0);
+        }
+    } else if artwork_cancelled {
+        let (_,height)=size(hwnd,app);request_art(app,height);
+    } else if app
+        .image_retry_at
+        .values()
+        .any(|at| std::time::Instant::now() >= *at)
+    {
+        let (_, height) = size(hwnd, app);
+        request_art(app, height);
     }
 }
 
 unsafe fn choose_storage_folder(hwnd: HWND, title: &str) -> Result<Option<PathBuf>, String> {
-    use windows_sys::Win32::UI::Shell::{SHBrowseForFolderW, SHGetPathFromIDListW, BROWSEINFOW, BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS};
-    use windows_sys::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+    use windows_sys::Win32::System::Com::{
+        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED,
+    };
+    use windows_sys::Win32::UI::Shell::{
+        SHBrowseForFolderW, SHGetPathFromIDListW, BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS,
+        BROWSEINFOW,
+    };
     if CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32) < 0 {
         return Err("Could not initialize the folder picker.".into());
     }
     let title = wide(title);
     let mut display = [0u16; 260];
-    let info = BROWSEINFOW { hwndOwner: hwnd, pszDisplayName: display.as_mut_ptr(),
-        lpszTitle: title.as_ptr(), ulFlags: BIF_NEWDIALOGSTYLE | BIF_RETURNONLYFSDIRS, ..zeroed() };
+    let info = BROWSEINFOW {
+        hwndOwner: hwnd,
+        pszDisplayName: display.as_mut_ptr(),
+        lpszTitle: title.as_ptr(),
+        ulFlags: BIF_NEWDIALOGSTYLE | BIF_RETURNONLYFSDIRS,
+        ..zeroed()
+    };
     let item = SHBrowseForFolderW(&info);
-    if item.is_null() { CoUninitialize(); return Ok(None); }
+    if item.is_null() {
+        CoUninitialize();
+        return Ok(None);
+    }
     let mut path = [0u16; 32768];
     let valid = SHGetPathFromIDListW(item, path.as_mut_ptr()) != 0;
     windows_sys::Win32::System::Com::CoTaskMemFree(item.cast());
     CoUninitialize();
-    if !valid { return Err("Could not read the selected folder.".into()); }
+    if !valid {
+        return Err("Could not read the selected folder.".into());
+    }
     let end = path.iter().position(|c| *c == 0).unwrap_or(path.len());
     Ok(Some(PathBuf::from(String::from_utf16_lossy(&path[..end]))))
 }
@@ -3419,7 +5415,10 @@ unsafe fn theme_path(hwnd: HWND, save: bool) -> Option<PathBuf> {
     })
 }
 unsafe fn update_background(hwnd: HWND, app: &mut App) {
-    if app.render_suspended{app.layout_dirty=true;return;}
+    if app.render_suspended {
+        app.layout_dirty = true;
+        return;
+    }
     let now = std::time::Instant::now();
     if app.cover_source != app.ui.now.artwork {
         if let Some(old) = app.images.get(&app.cover_source) {
@@ -3433,30 +5432,15 @@ unsafe fn update_background(hwnd: HWND, app: &mut App) {
     }
     if app.cover_changed.is_none() && app.images.contains_key(&app.cover_source) {
         app.cover_changed = Some(now);
-        SetTimer(hwnd, 2, 16, None);
+        start_animation_timer(hwnd, 2);
     }
     let url = match app.ui.background_mode {
-        1 => {
-            if !app.ui.now.artwork.is_empty() {
-                app.ui.now.artwork.clone()
-            } else {
-                app.ui
-                    .page
-                    .as_ref()
-                    .and_then(|p| {
-                        p.sections
-                            .iter()
-                            .flat_map(|s| s.entries.iter())
-                            .find(|e| !e.artwork.is_empty())
-                    })
-                    .map(|e| e.artwork.clone())
-                    .unwrap_or_default()
-            }
-        }
+        1 if !crate::catalog::is_default_cover(&app.ui.now.artwork) => app.ui.now.artwork.clone(),
         2 => app.custom_background.clone(),
         _ => String::new(),
     };
     if url.is_empty() {
+        *app.backdrop_cache.borrow_mut() = Default::default();
         app.background = None;
         app.previous_background = None;
         app.background_source.clear();
@@ -3501,33 +5485,32 @@ unsafe fn update_background(hwnd: HWND, app: &mut App) {
         app.background_transition = transition;
         app.background_source = key.clone();
         app.background_requested = false;
-        SetTimer(hwnd, 2, 16, None);
+        start_animation_timer(hwnd, 2);
     }
     if app.ui.background_mode == 1 {
         let high_key = source_key.clone();
         if !app.images.contains_key(&high_key) {
             if !app.image_pending.contains(&high_key) {
-                if let Some(engine) = app.snapshot.engine.clone() {
-                    let high_url = if url.starts_with("https://cdn-images.dzcdn.net/images/") {
-                        url.replace("/320x320-", "/768x768-")
-                            .replace("/250x250-", "/768x768-")
-                    } else {
-                        url.clone()
-                    };
-                    if app
-                        .artwork
-                        .requests
-                        .try_send(crate::catalog::ArtRequest {
-                            engine: Some(engine),
-                            url: high_url,
-                            key: high_key.clone(),
-                            background: true,
-                            max_edge: 768,
-                        })
-                        .is_ok()
-                    {
-                        app.image_pending.insert(high_key);
-                    }
+                let high_url = if url.starts_with("https://cdn-images.dzcdn.net/images/") {
+                    url.replace("/320x320-", "/768x768-")
+                        .replace("/250x250-", "/768x768-")
+                } else {
+                    url.clone()
+                };
+                if app
+                    .artwork
+                    .request(crate::catalog::ArtRequest {
+                        #[cfg(feature = "diagnostics")]
+                        view_tag: app.ui.view as usize + 1,
+                        engine: app.snapshot.engine.clone(),
+                        url: high_url,
+                        key: high_key.clone(),
+                        background: true,
+                        max_edge: 768,
+                    },true)
+                    .is_ok()
+                {
+                    app.image_pending.insert(high_key);
                 }
             }
             return;
@@ -3561,12 +5544,17 @@ fn navigate(app: &mut App, view: View, entity: Option<crate::catalog::Entry>, qu
         app.query.clone(),
         app.ui.scroll,
     ));
-    app.ui.go(view);
+    if app.ui.view == view {
+        app.ui.history.push(view);
+    } else {
+        app.ui.go(view);
+    }
     if app.ui.history.len() > 32 {
         app.ui.history.remove(0);
     }
     settle_scroll(app, 0);
     app.ui.shelf_offsets.clear();
+    app.ui.shelf_rows.clear();
     app.entity = entity;
     app.query = query;
 }
@@ -3618,7 +5606,55 @@ unsafe fn update_eq_from_sliders(hwnd: HWND, app: &mut App, band: usize, y: i32,
     rebuild(hwnd, app);
 }
 
+unsafe fn activate_scene_button(hwnd: HWND, app: &mut App, index: usize) {
+    if !scene_button_enabled(app, index) {
+        return;
+    }
+    let node = &app.scene.buttons[index];
+    if node.glyph == "\u{e710}" && matches!(node.action, Action::Go(View::Add)) {
+        let rect = app.rect(node.rect);
+        show_context_menu(
+            hwnd,
+            app,
+            POINT {
+                x: (rect.left + rect.right) / 2,
+                y: rect.top,
+            },
+        );
+    } else {
+        let action = node.action.clone();
+        activate(hwnd, app, action);
+    }
+}
+
 unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
+    if !(app.ui.provider == crate::catalog::Provider::Spotify && app.ui.device_menu_open)
+        && !matches!(
+            action,
+            Action::ToggleDeviceMenu
+                | Action::CloseDeviceMenu
+                | Action::SpotifyDevicesRefresh
+                | Action::SpotifyTransferPlayback(_)
+                | Action::SpotifyJamOpen
+                | Action::SpotifyJamRefresh
+                | Action::SpotifyJamStart
+                | Action::SpotifyJamEnd(_)
+                | Action::SpotifyJamLeave(_)
+                | Action::SpotifyJamRemove(_, _)
+                | Action::SpotifyJamCopyInvite
+                | Action::ToggleBool("jam_enabled")
+                | Action::OpenConnect
+                | Action::CopyConnectLink
+        )
+    {
+        if app.ui.device_menu_open && matches!(action, Action::Go(View::Settings)) {
+            app.ui.tab = 5;
+        }
+        app.ui.device_menu_open = false;
+    }
+    if app.ui.shortcut_capture.take().is_some() {
+        restore_shortcuts(app);
+    }
     if app.ui.deezer_login_open
         && !matches!(
             action,
@@ -3635,10 +5671,105 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
         app.ui.lyrics_volume_open = false;
     }
     match action {
+        Action::ToggleDeviceMenu => {
+            app.ui.toggle_device_sidebar();
+            if app.ui.device_menu_open {
+                refresh_spotify_devices(app);
+                if app.ui.provider == crate::catalog::Provider::Spotify {
+                    request_spotify_jam(app, crate::spotify::jam::Operation::Refresh);
+                }
+            }
+        }
+        Action::CloseDeviceMenu => app.ui.device_menu_open = false,
+        Action::SpotifyDevicesRefresh => {
+            refresh_spotify_devices(app);
+            request_spotify_jam(app, crate::spotify::jam::Operation::Refresh);
+        }
+        Action::SpotifyJamOpen => {
+            app.ui.device_menu_open = true;
+            app.ui.queue_sidebar_open = false;
+            refresh_spotify_devices(app);
+            request_spotify_jam(app, crate::spotify::jam::Operation::Refresh);
+        }
+        Action::SpotifyJamRefresh => {
+            request_spotify_jam(app, crate::spotify::jam::Operation::Refresh)
+        }
+        Action::SpotifyJamStart => request_spotify_jam(app, crate::spotify::jam::Operation::Start),
+        Action::SpotifyJamEnd(id) => {
+            request_spotify_jam(app, crate::spotify::jam::Operation::End(id))
+        }
+        Action::SpotifyJamLeave(id) => {
+            request_spotify_jam(app, crate::spotify::jam::Operation::Leave(id))
+        }
+        Action::SpotifyJamRemove(session, member) => request_spotify_jam(
+            app,
+            crate::spotify::jam::Operation::Remove { session, member },
+        ),
+        Action::SpotifyJamCopyInvite => {
+            if let Some(session) = app.ui.spotify_jam.as_ref() {
+                request_spotify_jam(
+                    app,
+                    crate::spotify::jam::Operation::Invite(session.id.clone()),
+                );
+            }
+        }
+        Action::SpotifyTransferPlayback(id) => {
+            if app.ui.provider == crate::catalog::Provider::Spotify && !app.ui.spotify_devices_busy
+            {
+                app.ui.spotify_devices_busy = true;
+                app.ui.spotify_devices_status = "Connecting to device...".into();
+                let playing = app.snapshot.state == "Playing";
+                request_spotify_device_action(
+                    app,
+                    "SPTransferPlaybackJSON",
+                    vec![serde_json::json!(id), serde_json::json!(playing)],
+                );
+            }
+        }
+        Action::SwitchProvider(provider) => switch_provider(app, provider),
+        Action::OnboardingSelect(provider) => app.ui.onboarding_provider = Some(provider),
+        Action::OnboardingNext => {
+            if let Some(provider) = app.ui.onboarding_provider {
+                app.ui.onboarding_open = false;
+                activate(
+                    hwnd,
+                    app,
+                    match provider {
+                        crate::catalog::Provider::Deezer => Action::DeezerLogin,
+                        crate::catalog::Provider::Spotify => Action::SpotifyLogin,
+                    },
+                );
+            }
+        }
+        Action::DeezerLogin => {
+            switch_provider(app, crate::catalog::Provider::Deezer);
+            app.ui.deezer_login_open = true;
+            app.ui.deezer_login_advanced = false;
+        }
+        Action::SpotifyLogin => {
+            if app.ui.provider != crate::catalog::Provider::Spotify {
+                switch_provider(app, crate::catalog::Provider::Spotify);
+            }
+            begin_spotify_auth(app, crate::spotify::AuthAction::Login);
+        }
+        Action::SpotifyLogout => begin_spotify_auth(app, crate::spotify::AuthAction::Logout),
+        Action::SpotifyRefresh => begin_spotify_auth(app, crate::spotify::AuthAction::Refresh),
+        Action::CheckUpdate => request_update(app, crate::updater::Request::Check),
+        Action::DownloadUpdate => request_update(app, crate::updater::Request::Download),
+        Action::ApplyUpdate => request_update(app, crate::updater::Request::Apply),
         Action::OpenConnect => {
             if let Some(connect) = &app.connect {
                 let url = wide(&format!("http://127.0.0.1:{}/", connect.port()));
-                if ShellExecuteW(hwnd, wide("open").as_ptr(), url.as_ptr(), null(), null(), SW_SHOWNORMAL) as isize <= 32 {
+                if ShellExecuteW(
+                    hwnd,
+                    wide("open").as_ptr(),
+                    url.as_ptr(),
+                    null(),
+                    null(),
+                    SW_SHOWNORMAL,
+                ) as isize
+                    <= 32
+                {
                     app.notice = "Could not open Connect in your browser".into();
                 }
             }
@@ -3651,7 +5782,7 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
                 };
             }
         }
-        Action::DeezerLogo => {}
+        Action::DeezerLogo | Action::SpotifyLogo => {}
 
         Action::ShelfAll(title) => {
             let discover_filter = app
@@ -3685,6 +5816,38 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
                     sections: vec![section],
                     ..Default::default()
                 }));
+            }
+        }
+        Action::ShelfMore(title, cols) => {
+            if let Some(page) = app.ui.page.clone().filter(|page| !page.loading) {
+                if app.ui.view == View::Explore && page.is_discover() {
+                    if let Some(related) = crate::catalog::catalogue_page(&page, &title) {
+                        navigate(app, View::Album, None, String::new());
+                        app.generation += 1;
+                        app.catalog.set_generation(app.generation);
+                        app.ui.page = Some(Arc::new(related));
+                    }
+                } else {
+                    let rows = app.ui.shelf_rows.entry(title.clone()).or_insert(2);
+                    *rows += 2;
+                    let target = *rows * cols;
+                    let loaded = page
+                        .sections
+                        .iter()
+                        .find(|s| s.title == title)
+                        .map_or(0, |s| s.entries.len());
+                    if loaded < target && crate::catalog::shelf_has_more(&page, &title) {
+                        let mut request = (*page).clone();
+                        request.error.clear();
+                        request.loading = true;
+                        request.raw.push((
+                            "spotify:more-shelf".into(),
+                            serde_json::json!({"title":title,"target":target}),
+                        ));
+                        app.ui.page = Some(Arc::new(request.clone()));
+                        data_request(app, crate::catalog::Job::More(request));
+                    }
+                }
             }
         }
         Action::BackgroundMode(mode) => {
@@ -3724,15 +5887,105 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
                 };
             }
         }
+        Action::LibraryMaintenance(clean) => {
+            app.notice = match app.downloads.maintenance(clean) {
+                Ok(()) => "Inspecting library storage...".into(),
+                Err(error) => error,
+            };
+        }
+        Action::RemoveDownloads => {
+            for cancel in app.download_cancels.values() {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            app.notice = match app.downloads.remove_all(app.snapshot.engine.clone()) {
+                Ok(()) => "Removing downloaded files...".into(),
+                Err(error) => error,
+            };
+        }
         Action::CancelDownload(id) => {
             if let Some(cancel) = app.download_cancels.get(&id) {
                 cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                 app.notice = "Download cancellation requested".into();
             }
         }
+        Action::MixMore(languages) => {
+            let rows = if languages {
+                &mut app.ui.mix_language_rows
+            } else {
+                &mut app.ui.mix_genre_rows
+            };
+            *rows = rows.saturating_add(3);
+        }
+        Action::MixLess(languages) => {
+            let rows = if languages {
+                &mut app.ui.mix_language_rows
+            } else {
+                &mut app.ui.mix_genre_rows
+            };
+            *rows = 3;
+            app.ui.scroll = 0;
+        }
+        Action::MixLanguages => {
+            app.ui.mix_language_rows = 3;
+            app.ui.mix_region = usize::MAX;
+            app.ui.mix_genre = usize::MAX;
+            app.ui.mix_genres = None;
+            app.query.clear();
+            app.ui.scroll = 0;
+            load_page(app);
+        }
+        Action::MixRegion(index) => {
+            app.ui.mix_genre_rows = 3;
+            app.ui.mix_region = index.min(crate::style_mix::REGIONS.len() - 1);
+            app.ui.mix_genre = usize::MAX;
+            app.ui.mix_genres = None;
+            app.query.clear();
+            app.ui.scroll = 0;
+            load_page(app);
+            if !app.snapshot.connected {
+                app.ui.mix_genres =
+                    Some(serde_json::json!({"error":"Sign in to check available genres."}));
+            }
+        }
+        Action::MixGenre(index) => {
+            if !app
+                .ui
+                .mix_genres
+                .as_ref()
+                .and_then(|data| data["genres"].as_array())
+                .is_some_and(|genres| {
+                    genres
+                        .iter()
+                        .any(|genre| genre["id"].as_u64() == Some(index as u64))
+                })
+            {
+                return;
+            }
+            app.ui.mix_genre = index.min(crate::style_mix::GENRES.len() - 1);
+            app.query = crate::style_mix::Selection::new(app.ui.mix_region, app.ui.mix_genre)
+                .map(|selection| selection.key())
+                .unwrap_or_default();
+            app.ui.scroll = 0;
+            load_page(app);
+        }
+        Action::BuildStyleMix => {
+            app.query = crate::style_mix::Selection::new(app.ui.mix_region, app.ui.mix_genre)
+                .map(|s| s.key())
+                .unwrap_or_default();
+            app.ui.scroll = 0;
+            load_page(app);
+        }
         Action::FlowChoice(index) => {
             if let Some((id, _)) = app.ui.flow_options.get(index) {
-                app.ui.flow_id = id.clone();
+                if app.ui.provider == crate::catalog::Provider::Spotify {
+                    app.ui.flow_id = crate::spotify::flow::Selection {
+                        mood: id.clone(),
+                        genres: crate::spotify::flow::mood_genres(id),
+                    }
+                    .key();
+                } else {
+                    app.ui.flow_id = id.clone();
+                }
                 app.ui.genres.clear();
                 app.ui.flow_loaded = false;
                 app.notice = "Loading Flow genres...".into();
@@ -3743,6 +5996,31 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
                         vec![serde_json::json!(app.ui.flow_id)],
                     ),
                 );
+            }
+        }
+        Action::FlowMoreGenres => {
+            app.ui.flow_genre_limit = if app.ui.flow_filter.trim().is_empty() {
+                if app.ui.flow_genre_limit > 30 {
+                    30
+                } else {
+                    crate::spotify::flow::BROWSE_GENRES.len()
+                }
+            } else {
+                app.ui.flow_genre_limit.saturating_add(48)
+            };
+        }
+        Action::FlowAddGenre => {
+            let genre = app.ui.flow_filter.trim().to_owned();
+            if app.ui.provider == crate::catalog::Provider::Spotify
+                && app.ui.flow_customizable
+                && crate::spotify::flow::valid_genre(&genre)
+                && !app
+                    .ui
+                    .genres
+                    .iter()
+                    .any(|g| g.1.eq_ignore_ascii_case(&genre))
+            {
+                app.ui.genres.push((genre.clone(), genre, true, false));
             }
         }
         Action::Genre(index) => {
@@ -3758,6 +6036,33 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
         Action::ApplyFlow => {
             if !app.ui.flow_loaded {
                 app.notice = "Wait for Flow genres to load.".into();
+                rebuild(hwnd, app);
+                return;
+            }
+            if app.ui.provider == crate::catalog::Provider::Spotify {
+                match crate::spotify::flow::Selection::parse(&app.ui.flow_id) {
+                    Ok(mut selection) => {
+                        selection.genres = app
+                            .ui
+                            .genres
+                            .iter()
+                            .filter(|g| g.2)
+                            .map(|g| g.0.clone())
+                            .collect();
+                        if let Err(error) = crate::spotify::flow::Selection::parse(&selection.key())
+                        {
+                            app.notice = error;
+                            rebuild(hwnd, app);
+                            return;
+                        }
+                        app.ui.flow_id = selection.key();
+                        app.ui.save_preferences();
+                        invalidate_flow(app);
+                        navigate(app, View::Flow, None, String::new());
+                        load_page(app);
+                    }
+                    Err(error) => app.notice = error,
+                }
                 rebuild(hwnd, app);
                 return;
             }
@@ -3827,28 +6132,42 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
             }
         }
         Action::ResetTheme => {
-            if app.ui.light {
-                app.ui.light_colors.clear();
-                let theme = if app.ui.solid_theme >= 12 {
-                    app.ui.solid_theme
+            if app.ui.solid_theme >= ui::SOLID_THEMES.len() {
+                let light = app.ui.light;
+                app.ui.apply_solid_theme(if light { 12 } else { 1 });
+                app.ui.solid_theme = ui::SOLID_THEMES.len() + usize::from(light);
+                if light {
+                    app.ui.custom_light_colors = app.ui.light_colors.clone();
                 } else {
-                    12
-                };
-                app.ui.apply_solid_theme(theme);
+                    app.ui.custom_dark_colors = app.ui.dark_colors.clone();
+                }
+                material(hwnd, app);
+                app.ui.save_preferences();
+                app.notice = "Default theme colors restored.".into();
             } else {
-                app.ui.dark_colors.clear();
-                if app.ui.background_mode == 3 {
-                    let theme = if app.ui.solid_theme < 12 {
+                if app.ui.light {
+                    app.ui.light_colors.clear();
+                    let theme = if app.ui.solid_theme >= 12 {
                         app.ui.solid_theme
                     } else {
-                        1
+                        12
                     };
                     app.ui.apply_solid_theme(theme);
+                } else {
+                    app.ui.dark_colors.clear();
+                    if app.ui.background_mode == 3 {
+                        let theme = if app.ui.solid_theme < 12 {
+                            app.ui.solid_theme
+                        } else {
+                            1
+                        };
+                        app.ui.apply_solid_theme(theme);
+                    }
                 }
+                material(hwnd, app);
+                app.ui.save_preferences();
+                app.notice = "Default theme colors restored.".into();
             }
-            material(hwnd, app);
-            app.ui.save_preferences();
-            app.notice = "Default theme colors restored.".into();
         }
         Action::Sort(col) => {
             if app.ui.sort_column == col {
@@ -3876,7 +6195,7 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
                     Err(error) => error,
                 };
             } else {
-                app.notice = "This item has no shareable Deezer link".into();
+                app.notice = "This item has no shareable link".into();
             }
         }
         Action::Color(key) => {
@@ -3887,12 +6206,19 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
             choose.rgbResult = match key {
                 "FixedBackgroundColor" => app.ui.solid_color,
                 "LightTint" => app.ui.light_tint,
-                _ => app.ui.color(key, rgb(159, 57, 124)),
+                _ => app
+                    .ui
+                    .custom_theme_draft
+                    .as_ref()
+                    .and_then(|(_, colors)| colors.get(key).copied())
+                    .unwrap_or_else(|| app.ui.color(key, rgb(159, 57, 124))),
             };
             choose.lpCustColors = custom.as_mut_ptr();
             choose.Flags = CC_FULLOPEN | CC_RGBINIT;
             if ChooseColorW(&mut choose) != 0 {
-                if key == "FixedBackgroundColor" {
+                if let Some((_, colors)) = &mut app.ui.custom_theme_draft {
+                    colors.insert(key.into(), choose.rgbResult);
+                } else if key == "FixedBackgroundColor" {
                     app.ui.solid_color = choose.rgbResult;
                     if app.ui.light {
                         app.ui
@@ -3906,8 +6232,10 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
                 } else {
                     app.ui.dark_colors.insert(key.into(), choose.rgbResult);
                 }
-                material(hwnd, app);
-                app.ui.save_preferences();
+                if app.ui.custom_theme_draft.is_none() {
+                    material(hwnd, app);
+                    app.ui.save_preferences();
+                }
             }
         }
         Action::Adjust(key, delta) => {
@@ -3932,10 +6260,11 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
             {
                 *s_val = pos;
             }
-            let prefix = app.ui.t(key);
-            for label in &mut app.scene.labels {
-                if label.text.starts_with(prefix) {
-                    label.text = format!("{}: {}%", prefix, pos);
+            if let Some((rect, _, _)) = app.scene.sliders.iter().find(|(_, k, _)| *k == key) {
+                for label in &mut app.scene.labels {
+                    if label.rect.x == rect.x + rect.w + 8 && label.rect.y == rect.y + 6 {
+                        label.text = format!("{}%", pos);
+                    }
                 }
             }
             if is_blur {
@@ -3950,7 +6279,10 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
         Action::ChooseStorage => {
             match choose_storage_folder(hwnd, app.ui.t("Choose data folder...")) {
                 Ok(Some(folder)) => match crate::storage::choose(&folder) {
-                    Ok(_) => app.notice = app.ui.t("Storage location saved. Close and reopen DeezNats to copy your data.").into(),
+                    Ok(_) => app.notice = app
+                        .ui
+                        .t("Storage location saved. Close and reopen DeezNats to copy your data.")
+                        .into(),
                     Err(error) => app.notice = app.ui.t(&error).into(),
                 },
                 Ok(None) => {}
@@ -4005,7 +6337,7 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
         }
         Action::Api(name, args) => {
             data_request(app, crate::catalog::Job::Api(name.into(), args));
-            app.notice = "Loading from Deezer...".into();
+            app.notice = format!("Loading from {}...", app.ui.provider.label());
         }
         Action::OpenItem(item) if app.ui.view == View::PlaylistPicker => {
             if item.kind == "playlist" {
@@ -4015,11 +6347,18 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
             }
         }
         Action::OpenItem(item) => {
-            if item.playable() {
+            if item.kind == "offline_collection" {
+                navigate(app, View::Offline, Some(item), String::new());
+                load_page(app);
+            } else if item.playable() {
                 let mut items = Vec::new();
                 if let Some(page) = &app.ui.page {
                     if page.rows.iter().any(|e| e.id == item.id) {
-                        items = page.rows.iter().filter(|e| e.playable()).cloned().collect();
+                        items = crate::ui::sorted_page_rows(&app.ui, page)
+                            .into_iter()
+                            .filter(|e| e.playable())
+                            .cloned()
+                            .collect();
                     } else if let Some(section) = page
                         .sections
                         .iter()
@@ -4065,8 +6404,11 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
         }
         Action::PlayAll => {
             if let Some(page) = app.ui.page.clone() {
-                let mut items: Vec<_> =
-                    page.rows.iter().filter(|e| e.playable()).cloned().collect();
+                let mut items: Vec<_> = crate::ui::sorted_page_rows(&app.ui, &page)
+                    .into_iter()
+                    .filter(|e| e.playable())
+                    .cloned()
+                    .collect();
                 if items.is_empty() {
                     items = page
                         .sections
@@ -4087,17 +6429,27 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
                 }
             }
         }
+        Action::RefreshFlow => {
+            if app.ui.view == View::Flow && !app.ui.page.as_ref().is_some_and(|p| p.loading) {
+                let key = page_key(app);
+                app.catalog.session.refresh_flow(&key);
+                app.page_cache.retain(|(k, _)| *k != key);
+                load_page(app);
+            }
+        }
         Action::More => {
-            if let Some(page) = app.ui.page.clone().filter(|page|!page.loading) {
-                let mut loading=(*page).clone();
-                loading.loading=true;
-                app.ui.page=Some(Arc::new(loading));
+            if let Some(page) = app.ui.page.clone().filter(|page| !page.loading) {
+                let mut loading = (*page).clone();
+                loading.loading = true;
+                app.ui.page = Some(Arc::new(loading));
                 data_request(app, crate::catalog::Job::More((*page).clone()));
             }
         }
         Action::FavoriteNow => {
             let item = app.ui.now.clone();
-            if !item.id.is_empty() { toggle_library(app, item); }
+            if !item.id.is_empty() {
+                toggle_library(app, item);
+            }
         }
         Action::MuteVolume => {
             if app.volume > 0 {
@@ -4126,7 +6478,12 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
                 toggle_library(app, item);
             }
         }
-        Action::Download => {
+        Action::Download | Action::RepairDownloads => {
+            let repairing = matches!(action, Action::RepairDownloads);
+            if !app.ui.provider.supports_downloads() {
+                app.notice = "Downloads are unavailable for Spotify Soloist.".into();
+                return;
+            }
             let Some(engine) = app.snapshot.engine.clone() else {
                 app.notice = "Connect to Deezer before downloading.".into();
                 rebuild(hwnd, app);
@@ -4144,13 +6501,27 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            if items.is_empty() && !app.ui.now.id.is_empty() {
+            if repairing {
+                items = match crate::downloads::missing_downloads() {
+                    Ok(items) => items,
+                    Err(error) => {
+                        app.notice = error;
+                        return;
+                    }
+                };
+            }
+            if !repairing && items.is_empty() && !app.ui.now.id.is_empty() {
                 items.push(app.ui.now.clone());
             }
             if items.is_empty() {
-                app.notice = "Open a track collection before downloading.".into();
+                app.notice = if repairing {
+                    "No missing downloads found."
+                } else {
+                    "Open a track collection before downloading."
+                }
+                .into();
             } else {
-                let id = app.ui.downloads.last().map(|j| j.id + 1).unwrap_or(1);
+                let id = app.ui.downloads.iter().map(|j| j.id).max().unwrap_or(0) + 1;
                 let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let title = app
                     .ui
@@ -4158,19 +6529,32 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
                     .as_ref()
                     .map(|p| p.title.clone())
                     .unwrap_or_else(|| app.ui.now.title.clone());
+                let collection = app
+                    .ui
+                    .page
+                    .as_ref()
+                    .and_then(|p| p.entity.as_ref())
+                    .filter(|e| matches!(e.kind.as_str(), "album" | "playlist" | "podcast"));
+                for item in &mut items {
+                    if repairing {
+                        continue;
+                    }
+                    if let Some(collection) = collection {
+                        item.raw["_download_groups"] = serde_json::json!([collection.wire()]);
+                    } else {
+                        item.raw["_download_single"] = true.into();
+                    }
+                }
                 let total = items.len();
-                if app
-                    .downloads
-                    .requests
-                    .try_send(crate::downloads::Request {
-                        id,
-                        engine,
-                        items,
-                        quality: app.ui.value("Download quality"),
-                        cancelled: cancel.clone(),
-                    })
-                    .is_ok()
-                {
+                if let Err(error) = app.downloads.enqueue(crate::downloads::Request {
+                    id,
+                    engine,
+                    items,
+                    quality: app.ui.value("Download quality"),
+                    cancelled: cancel.clone(),
+                }) {
+                    app.notice = error;
+                } else {
                     app.download_cancels.insert(id, cancel);
                     app.ui.downloads.push(crate::downloads::Status {
                         id,
@@ -4180,18 +6564,22 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
                         ..Default::default()
                     });
                     app.notice = "Download queued".into();
-                } else {
-                    app.notice = "Download queue is full".into();
                 }
             }
         }
-        Action::Go(View::Account) if !app.snapshot.connected => {
+        Action::Go(View::Account)
+            if !app.snapshot.connected && app.ui.provider == crate::catalog::Provider::Deezer =>
+        {
             app.ui.deezer_login_open = true;
             app.ui.deezer_login_advanced = false;
         }
         Action::EditPlaylist(item) => {
-            if app.ui.playlist_busy { app.notice = "Wait for the playlist update to finish".into(); }
-            else {
+            if !crate::playlist::can_edit(&item, &app.ui.account) {
+                return;
+            }
+            if app.ui.playlist_busy {
+                app.notice = "Wait for the playlist update to finish".into();
+            } else {
                 app.ui.playlist_draft = crate::playlist::Draft::from_entry(Some(&item));
                 navigate(app, View::PlaylistEdit, None, String::new());
                 set_playlist_fields(app);
@@ -4228,31 +6616,50 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
                 update_playlist_preview(app);
             }
         }
-        Action::ExportPlaylistCover => {
-            match app.ui.playlist_draft.jpeg() {
-                Ok(bytes) => {
-                    if let Some(path) = playlist_export_path(hwnd) {
-                        app.notice = match std::fs::write(path, bytes) {
-                            Ok(()) => "Cover exported".into(), Err(e) => e.to_string(),
-                        };
-                    }
+        Action::ExportPlaylistCover => match app.ui.playlist_draft.jpeg() {
+            Ok(bytes) => {
+                if let Some(path) = playlist_export_path(hwnd) {
+                    app.notice = match std::fs::write(path, bytes) {
+                        Ok(()) => "Cover exported".into(),
+                        Err(e) => e.to_string(),
+                    };
                 }
-                Err(e) => app.notice = e,
             }
-        }
+            Err(e) => app.notice = e,
+        },
         Action::DeletePlaylist => {
             let id = app.ui.playlist_draft.id.clone();
-            if !id.is_empty() && !app.ui.playlist_busy && MessageBoxW(hwnd, wide("Delete this playlist from Deezer? This cannot be undone.").as_ptr(), wide("Delete playlist").as_ptr(), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES {
+            if !id.is_empty()
+                && !app.ui.playlist_busy
+                && MessageBoxW(
+                    hwnd,
+                    wide(
+                        app.ui
+                            .t(if app.ui.provider == crate::catalog::Provider::Spotify {
+                                "Remove this playlist from your Spotify library?"
+                            } else {
+                                "Delete this playlist from Deezer? This cannot be undone."
+                            }),
+                    )
+                    .as_ptr(),
+                    wide(app.ui.t("Delete playlist")).as_ptr(),
+                    MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+                ) == IDYES
+            {
                 submit_playlist(app, crate::playlist::Mutation::Delete(id));
             }
         }
         Action::Go(view) => {
-            if matches!(view, View::PlaylistEdit | View::CoverEdit) && app.ui.playlist_busy { return; }
+            if matches!(view, View::PlaylistEdit | View::CoverEdit) && app.ui.playlist_busy {
+                return;
+            }
             if view == View::PlaylistEdit {
                 app.ui.playlist_draft = crate::playlist::Draft::from_entry(None);
                 set_playlist_fields(app);
             }
-            if view == View::CoverEdit { capture_playlist_fields(app); }
+            if view == View::CoverEdit {
+                capture_playlist_fields(app);
+            }
 
             let view = if view == View::Account {
                 View::Settings
@@ -4267,6 +6674,7 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
                 app.ui.flow_loaded = false;
                 app.ui.genres.clear();
                 app.ui.flow_filter.clear();
+                app.ui.flow_genre_limit = 30;
                 SetWindowTextW(app.edits[&SEARCH], wide("").as_ptr());
                 {
                     data_request(
@@ -4275,10 +6683,10 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
                     );
                 }
             }
-            settle_scroll(app,0);
+            settle_scroll(app, 0);
             app.notice.clear();
             if view == View::Lyrics {
-                SetTimer(hwnd, 2, 16, None);
+                start_animation_timer(hwnd, 2);
                 let id = app.snapshot.now.id.clone();
                 if !id.is_empty() {
                     app.lyrics_id = id.clone();
@@ -4312,21 +6720,26 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
                 app.ui.view = view;
                 app.entity = entity;
                 app.query = query;
-                if view==View::Lyrics {
-                    settle_scroll(app,0);
-                    app.ui.lyrics_manual_scroll=false;
+                if view == View::Lyrics {
+                    settle_scroll(app, 0);
+                    app.ui.lyrics_manual_scroll = false;
                 } else if app.ui.scroll_animation {
                     app.scroll_target = scroll;
                     app.scroll_origin = app.ui.scroll;
                     app.scroll_position = app.ui.scroll as f64;
                     app.scroll_tick = std::time::Instant::now();
                     app.scroll_started = std::time::Instant::now();
-                    SetTimer(hwnd, 2, 16, None);
+                    start_animation_timer(hwnd, 2);
                 } else {
                     app.ui.scroll = scroll;
                     app.scroll_target = scroll;
                 }
                 app.ui.shelf_offsets.clear();
+            } else if app.ui.is_subpage() {
+                app.ui.view = app.ui.fallback_parent_view();
+                app.entity = None;
+                app.query.clear();
+                settle_scroll(app, 0);
             }
             app.notice.clear();
             load_page(app);
@@ -4339,6 +6752,59 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
             SetWindowTextW(app.edits[&SESSION], wide("").as_ptr());
             login(hwnd, app);
             return;
+        }
+        Action::StartSpotify => {
+            if app.spotify_setup.is_none() {
+                crate::spotify::remote::select_device(None);
+                start_spotify(app);
+                command(app, Command::SetPlaying(true));
+            }
+        }
+        Action::OpenSpotify => open_spotify(hwnd, app),
+        Action::ReconnectSpotifyOutput => {
+            app.notice = match crate::spotify::service::reopen_output() {
+                Ok(()) => "Reconnecting Spotify audio output...".into(),
+                Err(error) => error,
+            };
+        }
+        Action::OpenSpotifyOutputSettings => {
+            if ShellExecuteW(
+                hwnd,
+                wide("open").as_ptr(),
+                wide("ms-settings:apps-volume").as_ptr(),
+                null(),
+                null(),
+                SW_SHOWNORMAL,
+            ) as isize
+                <= 32
+            {
+                app.notice = "Could not open Windows Volume mixer. Open Settings > System > Sound > Volume mixer.".into();
+            }
+        }
+        Action::SpotifySetup => {
+            if app.spotify_setup.is_none() {
+                app.spotify_service.take();
+                app.ui.spotify_phase = None;
+                let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let flag = cancel.clone();
+                let translations = app.ui.translations.clone();
+                let palette = app.raw_target_palette();
+                let (send, receive) = std::sync::mpsc::sync_channel(1);
+                match std::thread::Builder::new()
+                    .name("spotify-setup".into())
+                    .spawn(move || {
+                        let _ =
+                            send.send(crate::spotify::wizard::run(&flag, translations, palette));
+                    }) {
+                    Ok(_) => {
+                        app.spotify_setup = Some((cancel, receive));
+                        app.ui.spotify_setup_busy = true;
+                        app.ui.spotify_setup_status =
+                            "Complete setup in the Spotify window.".into();
+                    }
+                    Err(_) => app.notice = "Could not open Spotify setup.".into(),
+                }
+            }
         }
         Action::DeezerLoginOptions => {
             app.ui.deezer_login_open = true;
@@ -4378,6 +6844,26 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
                 }
             }
         }
+        Action::BindShortcut(index) => {
+            if index < app.ui.shortcuts.len() {
+                app.ui.shortcut_capture = Some(index);
+                app.ui.shortcut_errors[index].clear();
+                if let Some(shortcuts) = &mut app.shortcuts {
+                    shortcuts.clear();
+                }
+                SetFocus(hwnd);
+            }
+        }
+        Action::ResetShortcut(index) => {
+            if index < app.ui.shortcuts.len() {
+                if let Some(shortcuts) = &mut app.shortcuts {
+                    let _ = shortcuts.set(index, None);
+                }
+                app.ui.shortcuts[index] = None;
+                app.ui.shortcut_errors[index].clear();
+                app.ui.save_preferences();
+            }
+        }
         Action::Logout => {
             app.page_cache.clear();
             app.catalog.session.invalidate();
@@ -4393,7 +6879,7 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
             command(app, Command::Toggle);
             app.notice.clear();
             if app.ui.view == View::Lyrics {
-                SetTimer(hwnd, 2, 16, None);
+                start_animation_timer(hwnd, 2);
             }
         }
         Action::Stop => {
@@ -4415,13 +6901,13 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
             app.ui.tab = tab;
             app.ui.scroll = 0;
             app.scroll_target = 0;
-            if tab == 3 {
+            if tab == 3 && app.ui.provider == crate::catalog::Provider::Deezer {
                 data_request(
                     app,
                     crate::catalog::Job::Api("DZAudioDevicesJSON".into(), vec![]),
                 );
             }
-            if tab == 4 {
+            if tab == 4 && app.ui.provider == crate::catalog::Provider::Deezer {
                 data_request(app, crate::catalog::Job::Api("DZEQJSON".into(), vec![]));
             }
         }
@@ -4443,7 +6929,15 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
             };
             let menu = CreatePopupMenu();
             for (index, value) in values.iter().enumerate() {
-                AppendMenuW(menu, MF_STRING, index + 1, wide(app.ui.t(value)).as_ptr());
+                let flags = if key == "Show on startup"
+                    && value == "Offline"
+                    && !app.ui.provider.supports_downloads()
+                {
+                    MF_STRING | MF_GRAYED
+                } else {
+                    MF_STRING
+                };
+                AppendMenuW(menu, flags, index + 1, wide(app.ui.t(value)).as_ptr());
             }
             let mut point = zeroed();
             GetCursorPos(&mut point);
@@ -4459,8 +6953,15 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
             DestroyMenu(menu);
             if selected > 0 {
                 app.ui.choices.insert(key, (selected - 1) as usize);
+                if key == "Status name" {
+                    command(
+                        app,
+                        Command::Discord(serde_json::json!({"status_name": selected - 1})),
+                    );
+                }
                 if key == "Language" {
-                    app.ui.set_language(["", "tr", "en", "az"][(selected - 1) as usize]);
+                    app.ui
+                        .set_language(["", "tr", "en", "az"][(selected - 1) as usize]);
                     app.notice.clear();
                 } else if key == "Background" {
                     let value = selected - 1;
@@ -4558,8 +7059,11 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
         Action::Previous | Action::Next => {
             if matches!(action, Action::Previous) && app.snapshot.position > 3000 {
                 app.snapshot.position = 0;
+                app.playback_clock = PlaybackClock::default();
                 app.ui.position = 0;
-            } else if !app.ui.queue.is_empty() && !(matches!(action, Action::Next) && app.snapshot.radio_active) {
+            } else if !app.ui.queue.is_empty()
+                && !(matches!(action, Action::Next) && app.snapshot.radio_active)
+            {
                 if matches!(action, Action::Previous) {
                     app.ui.queue_index = app.ui.queue_index.saturating_sub(1);
                 } else {
@@ -4581,14 +7085,29 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
         }
         Action::Notice(message) => app.notice = message.into(),
         Action::SavePlaylist => {
-            if app.ui.playlist_busy { return; }
+            if app.ui.playlist_busy {
+                return;
+            }
             capture_playlist_fields(app);
             let draft = &app.ui.playlist_draft;
             let cover = if draft.image.is_some() {
-                match draft.jpeg() { Ok(bytes) => Some(bytes), Err(e) => { app.notice = e; rebuild(hwnd, app); return; } }
-            } else { None };
+                match draft.jpeg() {
+                    Ok(bytes) => Some(bytes),
+                    Err(e) => {
+                        app.notice = e;
+                        rebuild(hwnd, app);
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
             let mutation = crate::playlist::Mutation::Save {
-                id: draft.id.clone(), title: draft.title.clone(), description: (draft.id.is_empty() || draft.description_changed).then(|| draft.description.clone()), cover,
+                id: draft.id.clone(),
+                title: draft.title.clone(),
+                description: (draft.id.is_empty() || draft.description_changed)
+                    .then(|| draft.description.clone()),
+                cover,
                 seed: draft.seed.as_ref().map(|e| e.id.clone()),
             };
             submit_playlist(app, mutation);
@@ -4596,7 +7115,7 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
         Action::Search => {
             let query = read(app.edits[&SEARCH]);
             navigate(app, View::Explore, None, query);
-            app.notice = format!("Searching {}...", "Deezer");
+            app.notice = format!("Searching {}...", app.ui.provider.label());
             load_page(app);
         }
         Action::Close => {
@@ -4626,7 +7145,35 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
             }
         }
         Action::ToggleQueueSidebar => {
-            app.ui.queue_sidebar_open = !app.ui.queue_sidebar_open;
+            app.ui.toggle_queue_sidebar();
+            if app.ui.queue_sidebar_open {
+                rebuild(hwnd, app);
+                let anchor = app.scene.queue_anchor;
+                app.ui.queue_scroll = anchor / 24;
+                app.ui.queue_scroll_offset = anchor % 24;
+            }
+        }
+        Action::QueueReturn => {
+            app.queue_glide = None;
+            app.ui.queue_scroll = app.scene.queue_anchor / 24;
+            app.ui.queue_scroll_offset = app.scene.queue_anchor % 24;
+        }
+        Action::LyricsFollow => {
+            app.ui.lyrics_manual_until = None;
+            if app.ui.resume_lyric_follow(std::time::Instant::now()) {
+                let previous_scroll = app.ui.scroll;
+                settle_scroll(app, 0);
+                rebuild(hwnd, app);
+                if let Some(anchor) = app.scene.lyrics_anchor {
+                    let offset = anchor - previous_scroll;
+                    app.lyric_motion = Some((std::time::Instant::now(), offset));
+                    app.lyric_motion_offset = offset;
+                    shift_scroll_content(&mut app.scene, offset);
+                    let (width, height) = size(hwnd, app);
+                    position_content_buttons(app, width, height);
+                    start_animation_timer(hwnd, 2);
+                }
+            }
         }
         Action::QueueJump(idx) => {
             if let Some(entry) = app.ui.queue.get(idx).cloned() {
@@ -4655,18 +7202,25 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
             app.notice = "Queue reset".into();
         }
         Action::SeekMs(ms) => {
-            app.ui.lyrics_manual_scroll=false;app.ui.lyrics_manual_until=None;settle_scroll(app,0);
+            app.ui.lyrics_manual_scroll = false;
+            app.ui.lyrics_manual_until = None;
+            settle_scroll(app, 0);
             command(app, Command::SeekMs(ms));
             app.snapshot.position = ms;
+            app.playback_clock
+                .sample(ms, std::time::Instant::now(), false);
             app.ui.position = ms;
         }
         Action::ToggleLyricsCoverMode => {
             app.ui.lyrics_cover_mode = !app.ui.lyrics_cover_mode;
-            let from=app.ui.lyrics_cover_mix.unwrap_or(if app.ui.lyrics_cover_mode{0.}else{1.});
-            let target=if app.ui.lyrics_cover_mode{1.}else{0.};
-            app.ui.lyrics_cover_mix=Some(from);
-            app.lyrics_mode_motion=Some((std::time::Instant::now(),from,target));
-            SetTimer(hwnd,2,16,None);
+            let from = app
+                .ui
+                .lyrics_cover_mix
+                .unwrap_or(if app.ui.lyrics_cover_mode { 0. } else { 1. });
+            let target = if app.ui.lyrics_cover_mode { 1. } else { 0. };
+            app.ui.lyrics_cover_mix = Some(from);
+            app.lyrics_mode_motion = Some((std::time::Instant::now(), from, target));
+            start_animation_timer(hwnd, 2);
         }
         Action::ToggleLyricsVisualizer => {
             if !app.ui.lyrics_visualizer {
@@ -4680,7 +7234,7 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
             }
             app.ui.save_preferences();
             if app.ui.lyrics_visualizer && app.playing() {
-                SetTimer(hwnd, 2, 16, None);
+                start_animation_timer(hwnd, 2);
             }
             rebuild(hwnd, app);
         }
@@ -4689,7 +7243,7 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
             app.ui.lyrics_visualizer = true;
             app.ui.save_preferences();
             if app.playing() {
-                SetTimer(hwnd, 2, 16, None);
+                start_animation_timer(hwnd, 2);
             }
             rebuild(hwnd, app);
         }
@@ -4697,6 +7251,56 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
             app.ui.corner_style = style;
             app.ui.save_preferences();
             material(hwnd, app);
+        }
+        Action::CustomTheme(light) => {
+            let saved = if light {
+                &app.ui.custom_light_colors
+            } else {
+                &app.ui.custom_dark_colors
+            }
+            .clone();
+            let colors = if saved.is_empty() {
+                let mut defaults = ui::Ui::default();
+                defaults.apply_solid_theme(if light { 12 } else { 1 });
+                if light {
+                    defaults.light_colors
+                } else {
+                    defaults.dark_colors
+                }
+            } else {
+                saved
+            };
+            app.ui.custom_theme_draft = Some((light, colors));
+        }
+        Action::CloseCustomTheme => {
+            app.ui.custom_theme_draft = None;
+        }
+        Action::ResetCustomTheme => {
+            if let Some((light, colors)) = &mut app.ui.custom_theme_draft {
+                let mut defaults = ui::Ui::default();
+                defaults.apply_solid_theme(if *light { 12 } else { 1 });
+                *colors = if *light {
+                    defaults.light_colors
+                } else {
+                    defaults.dark_colors
+                };
+            }
+        }
+        Action::SaveCustomTheme => {
+            if let Some((light, colors)) = app.ui.custom_theme_draft.take() {
+                if light {
+                    app.ui.light_colors = colors.clone();
+                    app.ui.custom_light_colors = colors;
+                } else {
+                    app.ui.dark_colors = colors.clone();
+                    app.ui.custom_dark_colors = colors;
+                }
+                app.ui.light = light;
+                app.ui.solid_color = app.ui.color("Background", app.ui.solid_color);
+                app.ui.solid_theme = ui::SOLID_THEMES.len() + usize::from(light);
+                app.ui.save_preferences();
+                material(hwnd, app);
+            }
         }
         Action::SolidTheme(theme) => {
             app.ui.apply_solid_theme(theme);
@@ -4709,6 +7313,10 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
         }
         Action::ToggleBool(key) => {
             let new_val = match key {
+                "auto_updates" => {
+                    app.ui.auto_updates = !app.ui.auto_updates;
+                    app.ui.auto_updates
+                }
                 "adaptive_colors" => {
                     app.ui.adaptive_colors = !app.ui.adaptive_colors;
                     update_background(hwnd, app);
@@ -4775,10 +7383,21 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
                 "jam_enabled" => {
                     app.ui.jam_enabled = !app.ui.jam_enabled;
                     if app.ui.jam_enabled {
-                        app.connect = crate::connect::ConnectHub::start(crate::connect::DEFAULT_PORT, app.worker.commands.clone());
-                    if let Some(connect) = &app.connect { connect.update(&app.snapshot); app.ui.jam_url = connect.share_url(); }
-                        else { app.ui.jam_enabled = false; app.notice = "Could not start Jam server".into(); }
-                } else { app.connect = None; app.ui.jam_url.clear(); }
+                        app.connect = crate::connect::ConnectHub::start(
+                            crate::connect::DEFAULT_PORT,
+                            app.worker.commands.clone(),
+                        );
+                        if let Some(connect) = &app.connect {
+                            connect.update(&app.snapshot);
+                            app.ui.jam_url = connect.share_url();
+                        } else {
+                            app.ui.jam_enabled = false;
+                            app.notice = "Could not start DeezNats Connect".into();
+                        }
+                    } else {
+                        app.connect = None;
+                        app.ui.jam_url.clear();
+                    }
                     app.ui.jam_enabled
                 }
                 "autoplay" => {
@@ -4808,7 +7427,7 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
                 "lyrics_visualizer" => {
                     app.ui.lyrics_visualizer = !app.ui.lyrics_visualizer;
                     if app.ui.lyrics_visualizer && app.playing() {
-                        SetTimer(hwnd, 2, 16, None);
+                        start_animation_timer(hwnd, 2);
                     }
                     app.ui.lyrics_visualizer
                 }
@@ -4880,7 +7499,7 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
                 let target_t = if new_val { 1.0 } else { 0.0 };
                 app.toggle_animations
                     .insert(anim_key, (cur_t, target_t, std::time::Instant::now()));
-                SetTimer(hwnd, 2, 16, None);
+                start_animation_timer(hwnd, 2);
             }
             if matches!(key, "window_controls" | "controls_right" | "traffic_lights") {
                 apply_window_controls(hwnd, app);
@@ -4916,7 +7535,7 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
             let target_t = if enabled { 1.0 } else { 0.0 };
             app.toggle_animations
                 .insert(anim_key, (cur_t, target_t, std::time::Instant::now()));
-            SetTimer(hwnd, 2, 16, None);
+            start_animation_timer(hwnd, 2);
             app.ui.save_preferences();
             if !app.snapshot.now.id.is_empty() {
                 let effective_mask = app.ui.lyrics_sources & crate::lyrics::SUPPORTED_SOURCES;
@@ -5019,13 +7638,52 @@ unsafe fn bitmap(dc: HDC, rect: RECT, image: &crate::catalog::Bitmap, radius: i3
 }
 
 thread_local! {static PAINT_PALETTE:std::cell::Cell<Option<[u32;9]>>=const {std::cell::Cell::new(None)};}
-struct PaintPalette(Option<[u32;9]>);
-impl PaintPalette{fn set(palette:[u32;9])->Self{Self(PAINT_PALETTE.with(|value|value.replace(Some(palette))))}}
-impl Drop for PaintPalette{fn drop(&mut self){PAINT_PALETTE.with(|value|value.set(self.0));}}
+struct PaintPalette(Option<[u32; 9]>);
+impl PaintPalette {
+    fn set(palette: [u32; 9]) -> Self {
+        Self(PAINT_PALETTE.with(|value| value.replace(Some(palette))))
+    }
+}
+impl Drop for PaintPalette {
+    fn drop(&mut self) {
+        PAINT_PALETTE.with(|value| value.set(self.0));
+    }
+}
+// Debug builds show the rate of application paints, excluding the counter's
+// own once-per-second refresh. An idle window does not continuously repaint.
+#[cfg(debug_assertions)]
+thread_local! {
+    static FPS_COUNTER: std::cell::RefCell<(u32, f64, std::time::Instant, bool)> =
+        std::cell::RefCell::new((0, 0.0, std::time::Instant::now(), false));
+}
+
+#[cfg(debug_assertions)]
+unsafe fn fps_rect(hwnd: HWND) -> RECT {
+    let mut client: RECT = zeroed();
+    GetClientRect(hwnd, &mut client);
+    let top = caption_height(hwnd) + 8;
+    RECT {
+        left: (client.right - 128).max(0),
+        top,
+        right: client.right - 8,
+        bottom: top + 24,
+    }
+}
+
 unsafe fn paint(hwnd: HWND, app: &App) {
+    #[cfg(feature = "diagnostics")]
+    let _timing = crate::diagnostics::span("ui.paint", app.ui.view.title());
+    #[cfg(feature = "diagnostics")]
+    let _page_allocations = crate::memory_profile::page_scope(app.ui.view as usize + 1 + 192);
     let mut ps = zeroed();
+    let update_region = CreateRectRgn(0, 0, 0, 0);
+    let region_kind = GetUpdateRgn(hwnd, update_region, 0);
     let dc = BeginPaint(hwnd, &mut ps);
-    if app.render_suspended{EndPaint(hwnd,&ps);return;}
+    if app.render_suspended {
+        DeleteObject(update_region);
+        EndPaint(hwnd, &ps);
+        return;
+    }
     let saved = SaveDC(dc);
     // Leave active text editors to Windows so repainting the player cannot erase
     // the caret, IME composition, text selection, or partially typed queries.
@@ -5039,7 +7697,56 @@ unsafe fn paint(hwnd: HWND, app: &App) {
             }
         }
     }
-    render(hwnd, app, dc);
+    #[cfg(debug_assertions)]
+    {
+        let rect = fps_rect(hwnd);
+        FPS_COUNTER.with(|counter| {
+            let mut counter = counter.borrow_mut();
+            if !counter.3 && SetTimer(hwnd, 90, 1000, None) != 0 {
+                counter.2 = std::time::Instant::now();
+                counter.3 = true;
+            }
+            if ps.rcPaint.left != rect.left
+                || ps.rcPaint.top != rect.top
+                || ps.rcPaint.right != rect.right
+                || ps.rcPaint.bottom != rect.bottom
+            {
+                counter.0 += 1;
+            }
+        });
+    }
+    render_region(
+        hwnd,
+        app,
+        dc,
+        Some(ps.rcPaint),
+        if region_kind == COMPLEXREGION {
+            update_region
+        } else {
+            null_mut()
+        },
+    );
+    DeleteObject(update_region);
+    #[cfg(debug_assertions)]
+    {
+        let rect = fps_rect(hwnd);
+        let brush = CreateSolidBrush(rgb(24, 24, 24));
+        FillRect(dc, &rect, brush);
+        DeleteObject(brush);
+        FPS_COUNTER.with(|counter| {
+            draw_text(
+                dc,
+                app.fonts[0],
+                &format!("Paint FPS: {:.0}", counter.borrow().1),
+                rect,
+                rgb(255, 255, 255),
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
+        });
+    }
+    if crate::drawing::artwork_preparation_pending() {
+        start_animation_timer(hwnd, 2);
+    }
     RestoreDC(dc, saved);
     EndPaint(hwnd, &ps);
 }
@@ -5424,18 +8131,91 @@ unsafe fn paint_caption(
     }
     BitBlt(dc, 0, 0, width, height, memory, 0, 0, SRCCOPY);
 }
-unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
-    let _palette=PaintPalette::set(app.interpolated_palette_and_accent());
+fn copy_backdrop(
+    source: &[u32],
+    destination: &mut [u32],
+    width: usize,
+    height: usize,
+    stride: usize,
+) {
+    if stride == width {
+        destination[..width * height].copy_from_slice(&source[..width * height]);
+    } else {
+        for y in 0..height {
+            destination[y * stride..y * stride + width]
+                .copy_from_slice(&source[y * width..(y + 1) * width]);
+        }
+    }
+}
+unsafe fn render(hwnd: HWND, app: &App, dc: HDC, paint_rect: Option<RECT>) {
+    render_region(hwnd, app, dc, paint_rect, null_mut());
+}
+
+unsafe fn render_region(
+    hwnd: HWND,
+    app: &App,
+    dc: HDC,
+    paint_rect: Option<RECT>,
+    update_region: HRGN,
+) {
+    #[cfg(feature = "diagnostics")]
+    let _timing = crate::diagnostics::span("ui.render", app.ui.view.title());
+    #[cfg(test)]
+    let profile_start = std::time::Instant::now();
+    #[cfg(test)]
+    let profile_enabled = std::env::var_os("DEEZNATS_PROFILE_RENDER").is_some();
+    #[cfg(test)]
+    let mut profile_marks = Vec::new();
+    #[cfg(feature = "diagnostics")]
+    let mut stage_start = std::time::Instant::now();
+    macro_rules! render_mark {
+        ($name:literal) => {
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::diagnostics::record(
+                    concat!("render.", $name),
+                    app.ui.view.title(),
+                    stage_start.elapsed(),
+                );
+                stage_start = std::time::Instant::now();
+            }
+            #[cfg(test)]
+            if profile_enabled {
+                profile_marks.push(($name, profile_start.elapsed().as_secs_f64() * 1000.0));
+            }
+        };
+    }
+
+    let _palette = PaintPalette::set(app.interpolated_palette_and_accent());
     let mut bounds = zeroed();
     GetClientRect(hwnd, &mut bounds);
     let caption = caption_height(hwnd);
     if bounds.right <= 0 || bounds.bottom <= caption * 2 {
         return;
     }
+    let (_, logical_height) = size(hwnd, app);
+    let scroll_rect = scroll_repaint_rect(app, bounds.right, logical_height, caption);
+    let partial_scroll = scroll_repaint_enabled()
+        && !matches!(app.ui.view, View::Settings | View::Lyrics)
+        && scroll_repaint_avoids_search(app, &scroll_rect, caption)
+        && paint_rect.is_some_and(|rect| {
+            rect.left == scroll_rect.left
+                && rect.top == scroll_rect.top
+                && rect.right == scroll_rect.right
+                && rect.bottom == scroll_rect.bottom
+        });
+    let partial_paint = !partial_scroll
+        && paint_rect.is_some_and(|paint| {
+            paint.top >= caption
+                && paint.bottom <= bounds.bottom + caption
+                && scroll_repaint_avoids_search(app, &paint, caption)
+        });
     bounds.bottom -= caption;
     let params = BP_PAINTPARAMS {
         cbSize: size_of::<BP_PAINTPARAMS>() as u32,
-        dwFlags: BPPF_ERASE,
+        // The backdrop initialization below writes the dirty area. Erasing
+        // the entire allocation first defeats partial scroll repainting.
+        dwFlags: 0,
         ..zeroed()
     };
     let mut memory = null_mut();
@@ -5464,15 +8244,75 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
         SelectClipRgn(memory, null_mut());
         let mut initial = null_mut();
         let mut initial_stride = 0;
-        if GetBufferedPaintBits(buffer, &mut initial, &mut initial_stride) == 0 {
-            std::ptr::write_bytes(
-                initial.cast::<u8>(),
-                0,
-                (initial_stride * bounds.bottom).max(0) as usize * 4,
-            );
+        GetBufferedPaintBits(buffer, &mut initial, &mut initial_stride);
+        let gpu_dirty = if partial_scroll { Some(RECT {
+            top: scroll_rect.top - caption, bottom: scroll_rect.bottom - caption, ..scroll_rect
+        }) } else if partial_paint { paint_rect.map(|r| RECT {
+            top: r.top - caption, bottom: r.bottom - caption, ..r
+        }) } else { None };
+        let had_gpu=gpu::available();
+        let accelerated = !initial.is_null()
+            && (!cfg!(test) || std::env::var_os("DEEZNATS_TEST_GPU_RENDER").is_some())
+            && std::env::var_os("DEEZNATS_SOFTWARE_RENDERING").is_none()
+            && gpu::begin_with_region(hwnd, null(), initial_stride, bounds.right, bounds.bottom, caption, gpu_dirty, update_region);
+        if had_gpu && !accelerated && gpu_dirty.is_some() {
+            // Losing a retained GPU surface also loses every untouched pixel.
+            // Repaint the entire frame before switching presentation paths.
+            gpu::hide(); EndBufferedPaint(buffer,0);
+            render_region(hwnd,app,dc,None,null_mut()); return;
         }
         let palette = app.palette();
-        if !app.background_source.is_empty() {
+        if accelerated {
+            if !app.background_source.is_empty() {
+                let (image,alpha)=backdrop.active_image();
+                gpu::background(image,alpha,backdrop.tint,backdrop.opacity,backdrop.brightness,caption,gpu_dirty,None);
+            } else {
+                let solid=if app.acrylic {0} else {crate::drawing::argb(
+                    if app.ui.background_mode==3 {app.ui.solid_background()} else {palette[0]},255)};
+                gpu::background(None,0,0,0,100,caption,gpu_dirty,Some(solid));
+            }
+        }
+        if !accelerated && !initial.is_null()
+            && app.acrylic
+            && app.background_source.is_empty()
+        {
+            if partial_paint || partial_scroll {
+                let r = if partial_scroll {
+                    RECT {
+                        top: scroll_rect.top - caption,
+                        bottom: scroll_rect.bottom - caption,
+                        ..scroll_rect
+                    }
+                } else {
+                    let p = paint_rect.unwrap();
+                    RECT {
+                        top: p.top - caption,
+                        bottom: p.bottom - caption,
+                        ..p
+                    }
+                };
+                let y_start = (r.top.max(0) as usize).min(bounds.bottom as usize);
+                let y_end = (r.bottom.max(0) as usize).min(bounds.bottom as usize);
+                let x_start = r.left.clamp(0, bounds.right) as usize;
+                let x_end = r.right.clamp(x_start as i32, bounds.right) as usize;
+                for y in y_start..y_end {
+                    std::ptr::write_bytes(
+                        initial
+                            .offset((y * initial_stride as usize + x_start) as isize)
+                            .cast::<u8>(),
+                        0,
+                        (x_end - x_start) * 4,
+                    );
+                }
+            } else {
+                std::ptr::write_bytes(
+                    initial.cast::<u8>(),
+                    0,
+                    (initial_stride * bounds.bottom).max(0) as usize * 4,
+                );
+            }
+        }
+        if !accelerated && !app.background_source.is_empty() {
             let key = BackdropKey {
                 current: backdrop.current.map(|p| p.id),
                 previous: backdrop.previous.map(|p| p.id),
@@ -5490,6 +8330,8 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
                 cache
                     .1
                     .resize((bounds.right * bounds.bottom).max(0) as usize, 0);
+                // Resizing down must also release the former full-window allocation.
+                cache.1.shrink_to_fit();
                 backdrop.fill_buffer(
                     &mut cache.1,
                     bounds.right,
@@ -5498,19 +8340,48 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
                     bounds.bottom + caption,
                 );
             }
-            let mut bits = null_mut();
-            let mut stride = 0;
-            if GetBufferedPaintBits(buffer, &mut bits, &mut stride) == 0 {
-                for y in 0..bounds.bottom {
-                    std::ptr::copy_nonoverlapping(
-                        cache.1.as_ptr().offset((y * bounds.right) as isize),
-                        bits.cast::<u32>().offset((y * stride) as isize),
+            if !initial.is_null() {
+                let destination = std::slice::from_raw_parts_mut(
+                    initial.cast::<u32>(),
+                    (initial_stride * bounds.bottom).max(0) as usize,
+                );
+                if partial_paint || partial_scroll {
+                    let r = if partial_scroll {
+                        RECT {
+                            top: scroll_rect.top - caption,
+                            bottom: scroll_rect.bottom - caption,
+                            ..scroll_rect
+                        }
+                    } else {
+                        let p = paint_rect.unwrap();
+                        RECT {
+                            top: p.top - caption,
+                            bottom: p.bottom - caption,
+                            ..p
+                        }
+                    };
+                    let y_start = (r.top.max(0) as usize).min(bounds.bottom as usize);
+                    let y_end = (r.bottom.max(0) as usize).min(bounds.bottom as usize);
+                    let x_start = r.left.clamp(0, bounds.right) as usize;
+                    let x_end = r.right.clamp(x_start as i32, bounds.right) as usize;
+                    for y in y_start..y_end {
+                        let source = y * bounds.right as usize;
+                        let target = y * initial_stride as usize;
+                        destination[target + x_start..target + x_end]
+                            .copy_from_slice(&cache.1[source + x_start..source + x_end]);
+                    }
+                } else {
+                    copy_backdrop(
+                        &cache.1,
+                        destination,
                         bounds.right as usize,
+                        bounds.bottom as usize,
+                        initial_stride as usize,
                     );
                 }
             }
         }
-        if !app.acrylic && app.background_source.is_empty() && !initial.is_null() {
+        if !accelerated && !app.acrylic && app.background_source.is_empty() && !initial.is_null() {
             let color = crate::drawing::argb(
                 if app.ui.background_mode == 3 {
                     app.ui.solid_background()
@@ -5519,12 +8390,63 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
                 },
                 255,
             );
-            std::slice::from_raw_parts_mut(
-                initial.cast::<u32>(),
-                (initial_stride * bounds.bottom).max(0) as usize,
-            )
-            .fill(color);
+            if partial_paint || partial_scroll {
+                let r = if partial_scroll {
+                    RECT {
+                        top: scroll_rect.top - caption,
+                        bottom: scroll_rect.bottom - caption,
+                        ..scroll_rect
+                    }
+                } else {
+                    let p = paint_rect.unwrap();
+                    RECT {
+                        top: p.top - caption,
+                        bottom: p.bottom - caption,
+                        ..p
+                    }
+                };
+                let y_start = (r.top.max(0) as usize).min(bounds.bottom as usize);
+                let y_end = (r.bottom.max(0) as usize).min(bounds.bottom as usize);
+                let x_start = r.left.clamp(0, bounds.right) as usize;
+                let x_end = r.right.clamp(x_start as i32, bounds.right) as usize;
+                let dest = std::slice::from_raw_parts_mut(
+                    initial.cast::<u32>(),
+                    (initial_stride * bounds.bottom).max(0) as usize,
+                );
+                for y in y_start..y_end {
+                    dest[y * initial_stride as usize + x_start
+                        ..y * initial_stride as usize + x_end]
+                        .fill(color);
+                }
+            } else {
+                std::slice::from_raw_parts_mut(
+                    initial.cast::<u32>(),
+                    (initial_stride * bounds.bottom).max(0) as usize,
+                )
+                .fill(color);
+            }
         }
+        render_mark!("setup");
+        let moving=main_scroll_animating(app)||app.scrolling||app.queue_glide.is_some()||app.queue_scroll_drag||app.middle_scroll.is_some();
+        let (layer_w,layer_h)=size(hwnd,app);
+        let safe=accelerated&&moving&&app.scene.auth_modal.is_none()&&app.scene.login_underlay.is_none()&&app.scene.volume_popup.is_none()
+            &&!matches!(app.ui.view,View::Lyrics|View::Settings|View::FlowTune|View::Account|View::TrackInfo|View::PlaylistEdit);
+        let queue_w=if app.ui.right_sidebar_open(){280.min(layer_w/3)}else{0};
+        let main_request=(safe&&app.ui.page.is_some()&&!app.scene.content_buttons.is_empty()).then(||gpu::LayerRequest{
+            viewport:app.rect(Rect::new(if app.ui.sidebar_collapsed{70}else{246},app.scene.content_top,
+                (layer_w-queue_w-30-if app.ui.sidebar_collapsed{70}else{246}).max(1),(content_bottom(app,layer_h)-app.scene.content_top).max(1))),
+            layout_offset:app.px(app.ui.scroll),shown_offset:(if main_scroll_animating(app){app.scroll_position}else{app.ui.scroll as f64})*app.scale,overscan:app.px(ui::SCROLL_OVERSCAN),
+        });
+        let queue_request=if safe&&app.scene.device_sidebar.is_none(){app.scene.queue_viewport.map(|viewport|gpu::LayerRequest{
+            viewport:app.rect(viewport),layout_offset:app.px((app.ui.queue_scroll*24+app.ui.queue_scroll_offset) as i32),
+            shown_offset:app.queue_glide.map_or((app.ui.queue_scroll*24+app.ui.queue_scroll_offset) as f64,|state|state.0)*app.scale,overscan:app.px(144),
+        })}else{None};
+        let key=app.interpolated_palette_and_accent().into_iter().fold(0u64,|key,c|key.rotate_left(7)^c as u64);
+        let recording=accelerated&&gpu::configure_layers(main_request,queue_request,key);
+        let retained_canvas=if recording{gpu::RetainedCanvas::new(bounds.right,bounds.bottom,app.px(ui::SCROLL_OVERSCAN))}else{None};
+        if recording&&retained_canvas.is_none(){gpu::configure_layers(None,None,key);}
+        let native_memory=memory;
+        let memory=retained_canvas.as_ref().map_or(memory,|canvas|canvas.dc());
         let frame = crate::drawing::Frame::begin(
             memory,
             initial.cast(),
@@ -5533,6 +8455,34 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
             bounds.bottom,
             app.ui.light,
         );
+        if accelerated && frame.is_none() {
+            gpu::abandon(); EndBufferedPaint(buffer,0);
+            render_region(hwnd,app,dc,None,null_mut()); return;
+        }
+        if retained_canvas.is_none()&&partial_scroll {
+            IntersectClipRect(
+                memory,
+                scroll_rect.left,
+                scroll_rect.top - caption,
+                scroll_rect.right,
+                scroll_rect.bottom - caption,
+            );
+        } else if retained_canvas.is_none()&&partial_paint {
+            let paint = paint_rect.unwrap();
+            IntersectClipRect(
+                memory,
+                paint.left,
+                paint.top - caption,
+                paint.right,
+                paint.bottom - caption,
+            );
+        }
+        // Preserve the holes between independent marquee invalidations.
+        if retained_canvas.is_none()&&!update_region.is_null() && (partial_paint || partial_scroll) {
+            OffsetRgn(update_region, 0, -caption);
+            ExtSelectClipRgn(memory, update_region, RGN_AND);
+            OffsetRgn(update_region, 0, caption);
+        }
         if app.acrylic && app.background_source.is_empty() {
             // Native Acrylic exposes no backdrop-opacity property. A true
             // alpha tint above it lets the same control work without replacing
@@ -5560,7 +8510,13 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
 
         if app.ui.view == View::Lyrics && app.ui.lyrics_visualizer {
             let visual_rect = if app.ui.visualizer_style == 2 {
-                app.rect(app.scene.lyrics_area.unwrap_or(Rect::new(0, 0, w, h - 64)))
+                let mut rect =
+                    app.rect(app.scene.lyrics_area.unwrap_or(Rect::new(0, 0, w, h - 64)));
+                if let Some(cover) = app.scene.lyrics_cover {
+                    let cover = app.rect(cover);
+                    rect.left = rect.left.max((cover.right + app.px(16)).min(rect.right));
+                }
+                rect
             } else {
                 RECT {
                     left: 0,
@@ -5591,8 +8547,21 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
                             &app.ui.eq,
                         );
                         let is_light = app.is_effectively_light();
-                        let rear_wave:Vec<_>=fg_wave.iter().map(|(x,y)|(*x,baseline_y-(baseline_y-*y)*0.58)).collect();
-                        crate::drawing::wave_landscape(memory,&rear_wave,baseline_y,argb(accent,24),argb(accent,0),argb(accent,85),app.px(1)as f32,0);
+                        let rear_wave: Vec<_> = fg_wave
+                            .iter()
+                            .zip(fg_wave.iter().rev())
+                            .map(|((x, _), (_, y))| (*x, *y))
+                            .collect();
+                        crate::drawing::wave_landscape(
+                            memory,
+                            &rear_wave,
+                            baseline_y,
+                            argb(accent, if is_light { 70 } else { 45 }),
+                            argb(accent, 0),
+                            argb(accent, if is_light { 145 } else { 100 }),
+                            app.px(2) as f32,
+                            argb(accent, if is_light { 80 } else { 55 }),
+                        );
                         crate::drawing::wave_landscape(
                             memory,
                             &fg_wave,
@@ -5625,14 +8594,15 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
                         );
                     }
                     2 => {
-                        // Trap Nation sits low in the lyrics background, below the active line.
+                        // Trap Nation stays in the right-hand pane when lyrics are hidden.
                         let cx = (visual_rect.left + visual_rect.right) as f32 / 2.0;
                         let cy = visual_rect.top as f32
-                            + (visual_rect.bottom - visual_rect.top) as f32 * 0.74;
+                            + (visual_rect.bottom - visual_rect.top) as f32 * 0.5;
                         let base_r = ((visual_rect.right - visual_rect.left) as f32 * 0.18)
                             .clamp(45.0, 140.0);
                         let max_spike = (base_r * 0.65).clamp(35.0, 95.0);
-                        let (spikes, bass_pump) = app.visualizer.compute_trap_nation(199, max_spike);
+                        let (spikes, bass_pump) =
+                            app.visualizer.compute_trap_nation(199, max_spike);
                         crate::drawing::trap_nation_circle(
                             memory,
                             cx,
@@ -5651,7 +8621,8 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
         }
 
         for (index, panel) in app.scene.panels.iter().enumerate() {
-            let _surface=crate::drawing::SurfaceOpacity::set(app.ui.surface_opacity);
+            if !gpu::select_layer(if app.scene.content_panels.contains(&index){gpu::Layer::Main}else{gpu::Layer::Direct}){continue;}
+            let _surface = crate::drawing::SurfaceOpacity::set(app.ui.surface_opacity);
             if panel.kind == 5 {
                 continue;
             }
@@ -5665,7 +8636,7 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
                 } else {
                     app.px(246)
                 };
-                let queue_w = if app.ui.queue_sidebar_open {
+                let queue_w = if app.ui.right_sidebar_open() {
                     280.min(w / 3)
                 } else {
                     0
@@ -5678,16 +8649,20 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
                 IntersectClipRect(
                     memory,
                     left_c,
-                    app.px(app.scene.content_top),
+                    app.px(app.scene.content_top-if gpu::is_recording(gpu::Layer::Main){ui::SCROLL_OVERSCAN}else{0}),
                     right_c,
                     app.px(if app.ui.view == View::Lyrics {
                         h - 64
                     } else {
-                        content_bottom(app, h)
+                        content_bottom(app, h)+if gpu::is_recording(gpu::Layer::Main){ui::SCROLL_OVERSCAN}else{0}
                     }),
                 );
             }
             let r = app.rect(panel.rect);
+            if RectVisible(memory, &r) == 0 {
+                RestoreDC(memory, saved);
+                continue;
+            }
             match panel.kind {
                 21 => {
                     crate::drawing::fill(memory, r, argb(palette[1], 255), 0.0);
@@ -5703,15 +8678,27 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
                         1.0,
                     );
                 }
+                18 => {
+                    crate::drawing::fill(memory, r, argb(palette[3], 180), app.corner(14) as f32);
+                    crate::drawing::stroke(
+                        memory,
+                        r,
+                        argb(accent, 255),
+                        app.corner(14) as f32,
+                        1.5,
+                    );
+                }
                 6 | 17 => {
                     let hover_scroll = PtInRect(&r, cursor) != 0 || app.scrolling;
                     let thumb_color = if hover_scroll { accent } else { palette[5] };
                     let thumb_alpha = if hover_scroll { 215 } else { 170 };
-                    crate::drawing::fill(
+                    let offset=shown_scrollbar_y(app,panel,h).map_or(0.,|y| (y*app.scale-r.top as f64) as f32);
+                    crate::drawing::fill_offset_y(
                         memory,
                         r,
                         argb(thumb_color, thumb_alpha),
                         (r.right - r.left) as f32 / 2.0,
+                        offset,
                     );
                 }
                 7 => {
@@ -6047,8 +9034,10 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
             RestoreDC(memory, saved);
         }
 
+        render_mark!("panels");
         for (index, node) in app.scene.buttons.iter().enumerate() {
-            if matches!(node.action, Action::OpenItem(_)) {
+            if !gpu::select_layer(if app.scene.content_buttons.contains(&index){gpu::Layer::Main}else{gpu::Layer::Direct}){continue;}
+            if !moving&&matches!(node.action, Action::OpenItem(_)) {
                 if is_track_row(node) {
                     let left_c = if app.ui.view == View::Lyrics {
                         app.px(20)
@@ -6057,7 +9046,7 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
                     } else {
                         app.px(246)
                     };
-                    let queue_w = if app.ui.queue_sidebar_open {
+                    let queue_w = if app.ui.right_sidebar_open() {
                         280.min(w / 3)
                     } else {
                         0
@@ -6067,13 +9056,13 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
                     } else {
                         app.px(w - 30)
                     };
-                    let base_x =
-                        (node.rect.x - 48).max(if app.ui.sidebar_collapsed { 74 } else { 260 });
-                    let cw =
-                        w - base_x - queue_w - if app.ui.view == View::Lyrics { 32 } else { 40 };
-                    let row_x = base_x + 2;
-                    let row_w = (cw - 4).max(100);
-                    let row_rect = app.rect(Rect::new(row_x, node.rect.y - 2, row_w, 52));
+                    let row_rect = app.rect(track_row_rect(
+                        node,
+                        w,
+                        queue_w,
+                        app.ui.sidebar_collapsed,
+                        app.ui.view == View::Lyrics,
+                    ));
                     if PtInRect(&row_rect, cursor) != 0 {
                         let saved = SaveDC(memory);
                         if app.scene.content_buttons.contains(&index) {
@@ -6108,25 +9097,37 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
             }
         }
 
-    let is_artist_header = app.ui.view == View::Artist
+        let is_artist_header = app.ui.view == View::Artist
             && app
                 .ui
                 .page
                 .as_ref()
                 .and_then(|p| p.entity.as_ref())
                 .is_some_and(|e| e.kind == "artist");
+        render_mark!("buttons");
         for (picture_index, (rect, url)) in app.scene.pictures.iter().enumerate() {
-            let player = !app.scene.content_pictures.contains(&picture_index) && rect.y >= content_bottom(app, h);
+            let layer=if app.scene.content_pictures.contains(&picture_index){gpu::Layer::Main}else if app.scene.queue_pictures.contains(&picture_index){gpu::Layer::Queue}else{gpu::Layer::Direct};
+            if !gpu::select_layer(layer){continue;}
+            let player = !app.scene.content_pictures.contains(&picture_index)
+                && rect.y >= content_bottom(app, h);
             let is_lyrics_cover =
                 app.ui.view == View::Lyrics && !player && app.scene.lyrics_cover == Some(*rect);
-            let current = app.images.get(url).or_else(|| {
-                if app.ui.view == View::Lyrics && app.scene.lyrics_cover == Some(*rect) {
-                    app.images.get(&app.ui.now.artwork)
-                } else {
-                    None
-                }
-            });
-            let previous = if player || is_lyrics_cover {
+            let current = app
+                .images
+                .get(url)
+                .filter(|_| !crate::catalog::is_default_cover(url))
+                .or_else(|| {
+                    if app.ui.view == View::Lyrics && app.scene.lyrics_cover == Some(*rect) {
+                        app.images.get(&app.ui.now.artwork)
+                    } else {
+                        None
+                    }
+                });
+            let previous = if (player || is_lyrics_cover)
+                && !url.is_empty()
+                && !crate::catalog::is_default_cover(url)
+                && !app.image_retry_at.contains_key(url)
+            {
                 app.previous_cover.as_ref()
             } else {
                 None
@@ -6142,6 +9143,9 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
             };
             if let Some(image) = current.or(previous) {
                 let saved = SaveDC(memory);
+                if app.scene.queue_pictures.contains(&picture_index) {
+                    if let Some(viewport)=app.scene.queue_viewport {let r=gpu::expanded_clip(app.rect(viewport),gpu::Layer::Queue);IntersectClipRect(memory,r.left,r.top,r.right,r.bottom);}
+                }
                 if app.scene.content_pictures.contains(&picture_index) {
                     let left_c = if app.ui.view == View::Lyrics {
                         app.px(20)
@@ -6150,7 +9154,7 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
                     } else {
                         app.px(246)
                     };
-                    let queue_w = if app.ui.queue_sidebar_open {
+                    let queue_w = if app.ui.right_sidebar_open() {
                         280.min(w / 3)
                     } else {
                         0
@@ -6163,14 +9167,19 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
                     IntersectClipRect(
                         memory,
                         left_c,
-                        app.px(app.scene.content_top),
+                        app.px(app.scene.content_top-if gpu::is_recording(gpu::Layer::Main){ui::SCROLL_OVERSCAN}else{0}),
                         right_c,
                         app.px(if app.ui.view == View::Lyrics {
                             h - 64
                         } else {
-                            content_bottom(app, h)
+                            content_bottom(app, h)+if gpu::is_recording(gpu::Layer::Main){ui::SCROLL_OVERSCAN}else{0}
                         }),
                     );
+                }
+                // Avoid resizing and drawing artwork entirely outside the current clip.
+                if RectVisible(memory, &app.rect(*rect)) == 0 {
+                    RestoreDC(memory, saved);
+                    continue;
                 }
                 let cover_alpha = app.cover_changed.map_or(0, |started| {
                     let t =
@@ -6230,9 +9239,29 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
                     bitmap(memory, app.rect(*rect), image, rad);
                 }
                 RestoreDC(memory, saved);
+            } else if player {
+                crate::drawing::fill(memory, app.rect(*rect), argb(palette[1], 255), rad as f32);
+                draw_text(
+                    memory,
+                    app.fonts[4],
+                    "\u{e8d6}",
+                    app.rect(*rect),
+                    palette[5],
+                    DT_CENTER | DT_VCENTER,
+                );
             }
         }
+        render_mark!("pictures");
         for (index, label) in app.scene.labels.iter().enumerate() {
+            if !gpu::select_layer(if app.scene.content_labels.contains(&index){gpu::Layer::Main}else{gpu::Layer::Direct}){continue;}
+            // Queue rows are painted by the button pass below. Paint their labels
+            // afterwards so the row background does not cover the animation.
+            if app.ui.queue_sidebar_open
+                && app.scene.auth_modal.is_none()
+                && app.scene.queue_labels.contains(&index)
+            {
+                continue;
+            }
             // Modal labels are painted with their surface after all background
             // buttons. GDI+ logo paths cannot be hidden using a GDI clip box.
             if app
@@ -6254,7 +9283,8 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
                 } else {
                     content_bottom(app, h)
                 };
-                if label.rect.y + label.rect.h < top - 8 || label.rect.y > bottom + 8 {
+                let margin=if gpu::is_recording(gpu::Layer::Main){ui::SCROLL_OVERSCAN}else{0};
+                if label.rect.y + label.rect.h < top - 8-margin || label.rect.y > bottom + 8+margin {
                     continue;
                 }
             }
@@ -6267,7 +9297,7 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
                 } else {
                     app.px(246)
                 };
-                let queue_w = if app.ui.queue_sidebar_open {
+                let queue_w = if app.ui.right_sidebar_open() {
                     280.min(w / 3)
                 } else {
                     0
@@ -6280,14 +9310,26 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
                 let top_c = if app.ui.view == View::Lyrics {
                     0
                 } else {
-                    app.px(app.scene.content_top)
+                    app.px(app.scene.content_top-if gpu::is_recording(gpu::Layer::Main){ui::SCROLL_OVERSCAN}else{0})
                 };
                 let bottom_c = if app.ui.view == View::Lyrics {
                     app.px(h)
                 } else {
-                    app.px(content_bottom(app, h))
+                    app.px(content_bottom(app, h)+if gpu::is_recording(gpu::Layer::Main){ui::SCROLL_OVERSCAN}else{0})
                 };
                 IntersectClipRect(memory, left_c, top_c, right_c, bottom_c);
+            }
+            let label_bounds = app.rect(label.rect);
+            let padding = app.px(if app.ui.view == View::Lyrics { 32 } else { 2 });
+            let visible_bounds = RECT {
+                left: label_bounds.left - padding,
+                top: label_bounds.top - padding,
+                right: label_bounds.right + padding,
+                bottom: label_bounds.bottom + padding,
+            };
+            if RectVisible(memory, &visible_bounds) == 0 {
+                RestoreDC(memory, saved);
+                continue;
             }
             let font = if app.ui.view == View::Lyrics && !app.scene.queue_labels.contains(&index) {
                 if let Some((_, _, f_act, f_inact, f_plain)) = app.lyrics_fonts {
@@ -6330,7 +9372,12 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
                 DT_LEFT
             };
             if label.kind == 17 {
-                crate::drawing::fill(memory, app.rect(label.rect), argb(palette[5], 45), app.px(2) as f32);
+                crate::drawing::fill(
+                    memory,
+                    app.rect(label.rect),
+                    argb(palette[5], 45),
+                    app.px(2) as f32,
+                );
             }
             let is_light = app.is_effectively_light();
             let color = match label.kind {
@@ -6353,19 +9400,37 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
                     if is_light {
                         palette[4]
                     } else {
-                        let position = app.snapshot.position
-                            + if app.playing() {
-                                app.playback_tick.elapsed().as_millis().min(500) as u64
-                            } else {
-                                0
-                            };
+                        let position = app.playback_position();
                         let value = (210.0 + 35.0 * (position as f32 / 380.0).sin()) as u32;
                         rgb(value, value, value)
                     }
                 }
                 _ => palette[4],
             };
-            if matches!(label.kind,12|13|14|15){crate::drawing::lyric_shadow(memory,font,&label.text,app.rect(label.rect),align);}
+            let drawn_blur = if label.kind == 12 && app.ui.blur_inactive_lyrics {
+                let blur_color = palette[5];
+                crate::drawing::blurred_text(
+                    memory,
+                    font,
+                    &label.text,
+                    app.rect(label.rect),
+                    blur_color,
+                    align,
+                    2.0 * app.scale as f32,
+                )
+            } else {
+                false
+            };
+            // Blurred glyphs must not sit on top of a separate sharp shadow.
+            if !drawn_blur && matches!(label.kind, 12 | 13 | 14 | 15) {
+                crate::drawing::lyric_shadow(
+                    memory,
+                    font,
+                    &label.text,
+                    app.rect(label.rect),
+                    align,
+                );
+            }
             let drawn_karaoke = if label.kind == 13 && app.ui.karaoke_lyrics {
                 if app.scene.karaoke_preview == Some(index) {
                     let line = crate::lyrics::karaoke_example();
@@ -6382,11 +9447,7 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
                     )
                 } else if let Some(row) = app.scene.lyric_rows.iter().find(|row| row.label == index)
                 {
-                    let position = app.snapshot.position.saturating_add(if app.playing() {
-                        app.playback_tick.elapsed().as_millis().min(500) as u64
-                    } else {
-                        0
-                    });
+                    let position = app.playback_position();
                     app.ui.rich_lyrics.get(row.line).is_some_and(|line| {
                         draw_karaoke_row(
                             memory,
@@ -6406,23 +9467,14 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
             } else {
                 false
             };
-            let drawn_blur = if label.kind == 12 && app.ui.blur_inactive_lyrics {
-                let blur_color = palette[5];
-                crate::drawing::blurred_text(
-                    memory,
-                    font,
-                    &label.text,
-                    app.rect(label.rect),
-                    blur_color,
-                    align,
-                    1.6 * app.scale as f32,
-                )
-            } else {
-                false
-            };
             if !drawn_blur && !drawn_karaoke {
                 if !matches!(label.kind, 12 | 13 | 14 | 15) {
-                    let draw_label=if app.ui.view==View::Lyrics && matches!(label.kind,10|11){draw_automatic_text}else{draw_hover_text};
+                    let draw_label = if app.ui.view == View::Lyrics && matches!(label.kind, 10 | 11)
+                    {
+                        draw_automatic_text
+                    } else {
+                        draw_hover_text
+                    };
                     draw_label(
                         hwnd,
                         memory,
@@ -6454,15 +9506,18 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
             }
             RestoreDC(memory, saved);
         }
+        gpu::select_layer(gpu::Layer::Direct);
         let pos = app.ui.position / 1000;
         let hide_focus = SendMessageW(hwnd, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS as isize != 0;
         for (index, node) in app.scene.buttons.iter().enumerate() {
+            let layer=if app.scene.content_buttons.contains(&index){gpu::Layer::Main}else if matches!(node.action,Action::QueueJump(_)){gpu::Layer::Queue}else if matches!(node.action,Action::QueueReturn){gpu::Layer::Overlay}else{gpu::Layer::Direct};
+            if !gpu::select_layer(layer){continue;}
             if let Some((rect, first_label, first_button)) = app.scene.login_underlay {
                 if index == first_button {
                     crate::drawing::fill(
                         memory,
                         app.rect(rect),
-                        crate::drawing::argb(palette[1], app.ui.surface_opacity * 255 / 100),
+                        crate::drawing::argb(palette[1], 255),
                         app.corner(24) as f32,
                     );
                     crate::drawing::stroke(
@@ -6494,10 +9549,18 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
             }
             if let Some((rect, first_label, first_button)) = app.scene.auth_modal {
                 if index == first_button {
+                    let popup_alpha = if app.scene.device_popover_anchor.is_some()
+                        || app.ui.deezer_login_open
+                        || app.ui.onboarding_open
+                    {
+                        255
+                    } else {
+                        app.ui.surface_opacity * 255 / 100
+                    };
                     crate::drawing::fill(
                         memory,
                         app.rect(rect),
-                        crate::drawing::argb(palette[1], app.ui.surface_opacity * 255 / 100),
+                        crate::drawing::argb(palette[1], popup_alpha),
                         app.corner(24) as f32,
                     );
                     crate::drawing::stroke(
@@ -6507,7 +9570,11 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
                         app.corner(24) as f32,
                         1.0,
                     );
-                    if let Some(anchor) = app.scene.device_popover_anchor {
+                    if let Some(anchor) = app
+                        .scene
+                        .device_popover_anchor
+                        .filter(|_| app.scene.device_sidebar.is_none())
+                    {
                         let center =
                             (anchor.x + anchor.w / 2).clamp(rect.x + 16, rect.x + rect.w - 16);
                         let above = rect.y + rect.h <= anchor.y;
@@ -6529,7 +9596,7 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
                         crate::drawing::polygon(
                             memory,
                             &points,
-                            crate::drawing::argb(palette[1], app.ui.surface_opacity * 255 / 100),
+                            crate::drawing::argb(palette[1], popup_alpha),
                         );
                         for edge in [(0, 2), (1, 2)] {
                             crate::drawing::line(
@@ -6563,7 +9630,7 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
                     }
                 }
             }
-            let content = app.scene.content_buttons.contains(&index);
+            let content = app.scene.content_buttons.contains(&index)||matches!(node.action,Action::QueueJump(_));
             let viewport = button_viewport(app, node, w, h);
             if content
                 && (node.rect.y + node.rect.h <= viewport.y
@@ -6587,26 +9654,54 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
                     app.px(viewport.y + viewport.h),
                 );
             }
+            let test_rect = if let Some(group) = node.artist_credit_group {
+                app.rect(group)
+            } else {
+                app.rect(node.rect)
+            };
+            if RectVisible(memory, &test_rect) == 0 {
+                RestoreDC(memory, saved);
+                continue;
+            }
             let button = app.buttons.get(index).copied().unwrap_or(null_mut());
-            let state = SendMessageW(button, BM_GETSTATE, 0, 0) as u32;
+            let canvas = canvas_track_button(app, index);
+            let state = if canvas || button.is_null() {
+                0
+            } else {
+                SendMessageW(button, BM_GETSTATE, 0, 0) as u32
+            };
             let draw = DRAWITEMSTRUCT {
                 CtlID: 1000 + index as u32,
+                hwndItem: if button.is_null() { hwnd } else { button },
                 hDC: memory,
                 rcItem: app.rect(node.rect),
-                itemState: (if state & BST_PUSHED != 0 {
+                itemState: (if state & BST_PUSHED != 0
+                    || (canvas
+                        && app
+                            .canvas_pressed
+                            .as_ref()
+                            .is_some_and(|(pressed, _)| *pressed == index))
+                {
                     ODS_SELECTED
                 } else {
                     0
-                }) | (if state & BST_FOCUS != 0 && !hide_focus {
+                }) | (if (state & BST_FOCUS != 0
+                    || (canvas
+                        && app.canvas_focus == Some(index)
+                        && (GetFocus() == hwnd || GetFocus() == app.canvas_keyboard)))
+                    && !hide_focus
+                {
                     ODS_FOCUS
                 } else {
                     0
-                }) | (if !node.enabled || IsWindowEnabled(button) == 0 {
+                }) | (if !scene_button_enabled(app, index)
+                    || (!canvas && !button.is_null() && IsWindowEnabled(button) == 0)
+                {
                     ODS_DISABLED
                 } else {
                     0
                 }) | ({
-                    let is_hovered = if content {
+                    let is_hovered = if content&&moving {false} else if content {
                         let mut b = node.rect;
                         b.x = b.x.max(viewport.x);
                         b.y = b.y.max(viewport.y);
@@ -6626,9 +9721,42 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
                 }),
                 ..zeroed()
             };
-            draw_button(app, &draw);
+            draw_button(hwnd, app, &draw);
             RestoreDC(memory, saved);
         }
+        if app.ui.queue_sidebar_open && app.scene.auth_modal.is_none() {
+            for (offset,label) in app.scene.labels[app.scene.queue_labels.clone()].iter().enumerate() {
+                let row=app.scene.queue_row_labels.contains(&(app.scene.queue_labels.start+offset));
+                if !gpu::select_layer(if row{gpu::Layer::Queue}else{gpu::Layer::Direct}){continue;}
+                let saved=SaveDC(memory);
+                if app.scene.queue_row_labels.contains(&(app.scene.queue_labels.start+offset)) {
+                    if let Some(viewport)=app.scene.queue_viewport {let r=gpu::expanded_clip(app.rect(viewport),gpu::Layer::Queue);IntersectClipRect(memory,r.left,r.top,r.right,r.bottom);}
+                }
+                let font = match label.kind {
+                    5..=9 => app.fonts[label.kind as usize],
+                    2 => app.fonts[2],
+                    3 => app.fonts[3],
+                    4 => app.fonts[4],
+                    _ => app.fonts[0],
+                };
+                draw_automatic_text(
+                    hwnd,
+                    memory,
+                    font,
+                    &label.text,
+                    app.rect(label.rect),
+                    if label.kind == 1 {
+                        palette[5]
+                    } else {
+                        palette[4]
+                    },
+                    DT_LEFT | DT_VCENTER,
+                    app.scale,
+                );
+                RestoreDC(memory,saved);
+            }
+        }
+        gpu::select_layer(gpu::Layer::Direct);
         if let Some(popup) = app.scene.volume_popup {
             crate::drawing::fill(
                 memory,
@@ -6655,7 +9783,10 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
             );
         for (id, rect) in sliders {
             if let Some(rect) = rect {
-                if id >= 600 && (rect.y + rect.h <= app.scene.content_top || rect.y >= content_bottom(app, h)) {
+                if id >= 600
+                    && (rect.y + rect.h <= app.scene.content_top
+                        || rect.y >= content_bottom(app, h))
+                {
                     continue;
                 }
                 let maximum = if id == SEEK {
@@ -6739,7 +9870,11 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
                         (rect.w - 10).max(1) * value / maximum,
                         4,
                     )),
-                    if id < 600 && app.ui.view != View::Lyrics { palette[4] } else { accent },
+                    if id < 600 && app.ui.view != View::Lyrics {
+                        palette[4]
+                    } else {
+                        accent
+                    },
                     app.px(4),
                 );
                 let knob = app.rect(Rect::new(
@@ -6763,7 +9898,11 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
         let dur = app.ui.duration / 1000;
         draw_text(
             memory,
-            if app.ui.view == View::Lyrics {app.fonts[7]} else {app.fonts[0]},
+            if app.ui.view == View::Lyrics {
+                app.fonts[7]
+            } else {
+                app.fonts[0]
+            },
             &format!("{}:{:02}", pos / 60, pos % 60),
             app.rect(app.scene.elapsed.unwrap_or(Rect::new(0, 0, 0, 0))),
             palette[5],
@@ -6771,7 +9910,11 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
         );
         draw_text(
             memory,
-            if app.ui.view == View::Lyrics {app.fonts[7]} else {app.fonts[0]},
+            if app.ui.view == View::Lyrics {
+                app.fonts[7]
+            } else {
+                app.fonts[0]
+            },
             &format!("{}:{:02}", dur / 60, dur % 60),
             app.rect(app.scene.remaining.unwrap_or(Rect::new(0, 0, 0, 0))),
             palette[5],
@@ -6781,6 +9924,7 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
                 DT_LEFT
             },
         );
+        render_mark!("labels");
         let mut pixels = null_mut();
         let mut stride = 0;
         if frame.is_none() && GetBufferedPaintBits(buffer, &mut pixels, &mut stride) == 0 {
@@ -6832,14 +9976,46 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
                 }
             }
         }
+        render_mark!("composite");
         drop(frame);
-        cache_search_backdrop(
-            app,
-            initial.cast(),
-            initial_stride,
-            bounds.right,
-            bounds.bottom,
-        );
+        let memory=native_memory;
+        drop(retained_canvas);
+        if !accelerated && !partial_scroll && !partial_paint {
+            cache_search_backdrop(
+                app,
+                initial.cast(),
+                initial_stride,
+                bounds.right,
+                bounds.bottom,
+            );
+        }
+        render_mark!("finalize");
+        let gpu_presented = accelerated && gpu::finish();
+        if accelerated && !gpu_presented {
+            EndBufferedPaint(buffer, 0);
+            render_region(hwnd, app, dc, None, null_mut());
+            return;
+        }
+        if gpu_presented {
+            if !partial_scroll && !partial_paint {
+                if let Some(rect) = app.scene.search.map(|r| app.rect(r)) {
+                    if let Some(pixels) = gpu::snapshot(rect) {
+                        let next=EditBackdrop { width:rect.right-rect.left,height:rect.bottom-rect.top,pixels };
+                        let mut cached=app.search_backdrop.borrow_mut();
+                        if cached.as_ref()!=Some(&next) {
+                            *cached=Some(next);
+                            if let Some(control)=app.edits.get(&SEARCH) { InvalidateRect(*control,null(),0); }
+                        }
+                    }
+                } else { app.search_backdrop.borrow_mut().take(); }
+            }
+            let clear=gpu_dirty.unwrap_or(RECT{left:0,top:0,right:bounds.right,bottom:bounds.bottom});
+            for y in clear.top.max(0)..clear.bottom.min(bounds.bottom) {
+                let left=clear.left.clamp(0,bounds.right);
+                let right=clear.right.clamp(left,bounds.right);
+                std::ptr::write_bytes(initial.cast::<u32>().offset((y*initial_stride+left) as isize),0,(right-left) as usize);
+            }
+        } else { gpu::hide(); }
         BitBlt(
             dc,
             0,
@@ -6851,19 +10027,27 @@ unsafe fn render(hwnd: HWND, app: &App, dc: HDC) {
             0,
             SRCCOPY,
         );
-        paint_caption(
-            hwnd,
-            app,
-            dc,
-            memory,
-            initial.cast(),
-            initial_stride,
-            bounds.right,
-            caption,
-            bounds.bottom + caption,
-            &backdrop,
-        );
+        if !partial_scroll && !partial_paint {
+            paint_caption(
+                hwnd,
+                app,
+                dc,
+                memory,
+                initial.cast(),
+                initial_stride,
+                bounds.right,
+                caption,
+                bounds.bottom + caption,
+                &backdrop,
+            );
+        }
+        render_mark!("present");
         EndBufferedPaint(buffer, 0);
+        render_memory_metrics(app);
+        #[cfg(test)]
+        if profile_enabled {
+            eprintln!("RENDER_STAGES {:?}", profile_marks);
+        }
     }
 }
 fn lerp_argb(c1: u32, c2: u32, t: f32) -> u32 {
@@ -6885,8 +10069,8 @@ fn lerp_argb(c1: u32, c2: u32, t: f32) -> u32 {
 
     (a << 24) | (r << 16) | (g << 8) | b
 }
-unsafe fn draw_button(app: &App, draw: &DRAWITEMSTRUCT) {
-    let _surface=crate::drawing::SurfaceOpacity::set(app.ui.surface_opacity);
+unsafe fn draw_button(hwnd: HWND, app: &App, draw: &DRAWITEMSTRUCT) {
+    let _surface = crate::drawing::SurfaceOpacity::set(app.ui.surface_opacity);
     let index = (draw.CtlID as usize).saturating_sub(1000);
     let Some(node) = app.scene.buttons.get(index) else {
         return;
@@ -6902,6 +10086,10 @@ unsafe fn draw_button(app: &App, draw: &DRAWITEMSTRUCT) {
     r.bottom -= 3;
     let argb = crate::drawing::argb;
     let accent = app.accent();
+    if matches!(node.action, Action::SpotifyLogo) {
+        crate::drawing::spotify_logo(draw.hDC, r);
+        return;
+    }
     if matches!(node.action, Action::DeezerLogo) {
         crate::drawing::deezer_logo(draw.hDC, r);
         return;
@@ -7116,9 +10304,33 @@ unsafe fn draw_button(app: &App, draw: &DRAWITEMSTRUCT) {
         }
     }
 
-    if let Action::SolidTheme(theme_idx) = node.action {
-        if let Some(&(_, _, bg, panel, raised, border, text_col, accent_col)) =
-            ui::SOLID_THEMES.get(theme_idx)
+    let theme_card =
+        match node.action {
+            Action::SolidTheme(index) => ui::SOLID_THEMES.get(index).map(
+                |&(_, _, bg, panel, raised, border, text, accent)| {
+                    (bg, panel, raised, border, text, accent)
+                },
+            ),
+            Action::CustomTheme(light) if node.text != "Edit" => {
+                let defaults = ui::SOLID_THEMES[if light { 12 } else { 1 }];
+                let colors = if light {
+                    &app.ui.custom_light_colors
+                } else {
+                    &app.ui.custom_dark_colors
+                };
+                let color = |key: &str, fallback| colors.get(key).copied().unwrap_or(fallback);
+                Some((
+                    color("Background", defaults.2),
+                    color("Panel", defaults.3),
+                    color("Raised", defaults.4),
+                    color("Border", defaults.5),
+                    color("Text", defaults.6),
+                    color("Accent", defaults.7),
+                ))
+            }
+            _ => None,
+        };
+    if let Some((bg, panel, raised, border, text_col, accent_col)) = theme_card {
         {
             let rad = (app.corner(14) as f32).min((r.bottom - r.top) as f32 * 0.3);
             crate::drawing::gradient(draw.hDC, r, argb(panel, 252), argb(bg, 252), rad);
@@ -7237,24 +10449,38 @@ unsafe fn draw_button(app: &App, draw: &DRAWITEMSTRUCT) {
         return;
     }
 
-    if node.text.is_empty() && matches!(node.action, Action::PlayerLayout(_) | Action::PlayerFullscreen) {
-        let ink = argb(if hover {accent} else {palette[4]}, 235);
-        let cx = (r.left+r.right) as f32/2.;
-        let cy = (r.top+r.bottom) as f32/2.;
+    if node.text.is_empty()
+        && matches!(
+            node.action,
+            Action::PlayerLayout(_) | Action::PlayerFullscreen
+        )
+    {
+        let ink = argb(if hover { accent } else { palette[4] }, 235);
+        let cx = (r.left + r.right) as f32 / 2.;
+        let cy = (r.top + r.bottom) as f32 / 2.;
         let unit = app.scale as f32;
         if matches!(node.action, Action::PlayerLayout(_)) {
-            crate::drawing::fill(draw.hDC, r, argb(palette[2], if hover {180} else {95}), (r.bottom-r.top) as f32/2.);
-            let square = |x:f32,y:f32| RECT { left:(cx+x*unit) as i32, top:(cy+y*unit) as i32,
-                right:(cx+(x+10.)*unit) as i32, bottom:(cy+(y+10.)*unit) as i32 };
-            crate::drawing::stroke(draw.hDC, square(-7.,-7.), ink, unit, 1.6*unit);
-            crate::drawing::fill(draw.hDC, square(-3.,-3.), argb(palette[1],255), unit);
-            crate::drawing::stroke(draw.hDC, square(-3.,-3.), ink, unit, 1.6*unit);
+            crate::drawing::fill(
+                draw.hDC,
+                r,
+                argb(palette[2], if hover { 180 } else { 95 }),
+                (r.bottom - r.top) as f32 / 2.,
+            );
+            let square = |x: f32, y: f32| RECT {
+                left: (cx + x * unit) as i32,
+                top: (cy + y * unit) as i32,
+                right: (cx + (x + 10.) * unit) as i32,
+                bottom: (cy + (y + 10.) * unit) as i32,
+            };
+            crate::drawing::stroke(draw.hDC, square(-7., -7.), ink, unit, 1.6 * unit);
+            crate::drawing::fill(draw.hDC, square(-3., -3.), argb(palette[1], 255), unit);
+            crate::drawing::stroke(draw.hDC, square(-3., -3.), ink, unit, 1.6 * unit);
         } else {
-            for (x,y) in [(-1.,-1.),(1.,-1.),(-1.,1.),(1.,1.)] {
-                let px=cx+x*7.*unit;
-                let py=cy+y*7.*unit;
-                crate::drawing::line(draw.hDC,px,py,px-x*5.*unit,py,ink,1.8*unit);
-                crate::drawing::line(draw.hDC,px,py,px,py-y*5.*unit,ink,1.8*unit);
+            for (x, y) in [(-1., -1.), (1., -1.), (-1., 1.), (1., 1.)] {
+                let px = cx + x * 7. * unit;
+                let py = cy + y * 7. * unit;
+                crate::drawing::line(draw.hDC, px, py, px - x * 5. * unit, py, ink, 1.8 * unit);
+                crate::drawing::line(draw.hDC, px, py, px, py - y * 5. * unit, ink, 1.8 * unit);
             }
         }
         return;
@@ -7397,11 +10623,121 @@ unsafe fn draw_button(app: &App, draw: &DRAWITEMSTRUCT) {
     }
 
     if node.text_link {
-        let player_artist = node.artist_credit_group.is_some_and(|group|
-            app.scene.player_title.as_ref().is_some_and(|title| group.x == title.region.x && group.y == title.region.y+25));
-        let font = if player_artist {app.fonts[11]} else {app.fonts[0]};
-        draw_hover_text(
-            GetParent(draw.hwndItem),
+        if let Some(group) = node.artist_credit_group {
+            let player_artist =
+                app.scene.player_title.as_ref().is_some_and(|title| {
+                    group.x == title.region.x && group.y == title.region.y + 25
+                });
+            let font = if player_artist {
+                app.fonts[11]
+            } else {
+                app.fonts[0]
+            };
+            let group_rect = app.rect(group);
+            let group_w = (group_rect.right - group_rect.left).max(0);
+
+            // Credit buttons are consecutive. Measure each name once per font,
+            // then reuse the widths on every animation frame.
+            let start = (0..index)
+                .rev()
+                .take_while(|&i| app.scene.buttons[i].artist_credit_group == Some(group))
+                .last()
+                .unwrap_or(index);
+            let end = index
+                + app.scene.buttons[index..]
+                    .iter()
+                    .take_while(|button| button.artist_credit_group == Some(group))
+                    .count();
+            let mut total_w = 0i32;
+            let mut current_offset = 0i32;
+            let mut current_w = 0i32;
+            let mut group_text = String::new();
+            for (offset, btn) in app.scene.buttons[start..end].iter().enumerate() {
+                group_text.push_str(&btn.text);
+                let w = automatic_text_width(draw.hDC, font, &btn.text);
+                if start + offset == index {
+                    current_offset = total_w;
+                    current_w = w;
+                }
+                total_w += w;
+            }
+            let overflow = total_w - group_w;
+            if overflow <= 0 {
+                let start_x = group_rect.left
+                    + if node.text_centered {
+                        (group_w - total_w) / 2
+                    } else {
+                        0
+                    };
+                let text_rect = RECT {
+                    left: start_x + current_offset,
+                    top: group_rect.top,
+                    right: start_x + current_offset + current_w + 2,
+                    bottom: group_rect.bottom,
+                };
+                let saved = SaveDC(draw.hDC);
+                IntersectClipRect(
+                    draw.hDC,
+                    group_rect.left,
+                    group_rect.top,
+                    group_rect.right,
+                    group_rect.bottom,
+                );
+                draw_text(
+                    draw.hDC,
+                    font,
+                    &node.text,
+                    text_rect,
+                    if hover { accent } else { palette[5] },
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | crate::drawing::LYRICS_UNTRIMMED,
+                );
+                RestoreDC(draw.hDC, saved);
+                return;
+            }
+
+            let now = std::time::Instant::now();
+            let key = format!(
+                "group:{}:{}:{}:{}:{}",
+                group_rect.left, group_rect.top, group_rect.right, group_rect.bottom, group_text
+            );
+            let elapsed = AUTO_MARQUEES.with(|states| {
+                let mut states = states.borrow_mut();
+                let state = states.entry(key).or_insert((group_rect, now, now));
+                state.0 = group_rect;
+                state.2 = now;
+                state.1.elapsed().as_secs_f64()
+            });
+            start_animation_timer(hwnd, 4);
+            let shift = marquee_offset(elapsed, overflow as f64, 36. * app.scale) as i32;
+            let text_rect = RECT {
+                left: group_rect.left + current_offset - shift,
+                top: group_rect.top,
+                right: group_rect.left + current_offset - shift + current_w + 2,
+                bottom: group_rect.bottom,
+            };
+            let saved = SaveDC(draw.hDC);
+            IntersectClipRect(
+                draw.hDC,
+                group_rect.left,
+                group_rect.top,
+                group_rect.right,
+                group_rect.bottom,
+            );
+            draw_text(
+                draw.hDC,
+                font,
+                &node.text,
+                text_rect,
+                if hover { accent } else { palette[5] },
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | crate::drawing::LYRICS_UNTRIMMED,
+            );
+            RestoreDC(draw.hDC, saved);
+            return;
+        }
+
+        let font = app.fonts[0];
+        draw_automatic_text(
+            hwnd,
             draw.hDC,
             font,
             &node.text,
@@ -7473,7 +10809,7 @@ unsafe fn draw_button(app: &App, draw: &DRAWITEMSTRUCT) {
             ..r
         };
         draw_hover_text(
-            GetParent(draw.hwndItem),
+            hwnd,
             draw.hDC,
             app.fonts[0],
             &node.text,
@@ -7485,7 +10821,7 @@ unsafe fn draw_button(app: &App, draw: &DRAWITEMSTRUCT) {
         return;
     }
 
-    let profile = matches!(node.action, Action::Go(View::Account));
+    let profile = matches!(node.action, Action::Go(View::Account)) && node.text.is_empty();
     let card = matches!(&node.action, Action::OpenItem(_)) && !node.artwork.is_empty();
     let track = matches!(&node.action, Action::OpenItem(item) if item.playable())
         && !card
@@ -7554,20 +10890,20 @@ unsafe fn draw_button(app: &App, draw: &DRAWITEMSTRUCT) {
             return;
         }
         // Queue grip is geometry rather than a font glyph, so every Windows font works.
-    if matches!(node.action, Action::QueueJump(_)) && node.rect.h >= 64 {
-        for column in 0..2 {
-            for row in 0..3 {
-                let dot = app.rect(Rect::new(
-                    node.rect.x + 8 + column * 5,
-                    node.rect.y + 23 + row * 6,
-                    2,
-                    2,
-                ));
-                crate::drawing::fill(draw.hDC, dot, argb(palette[5], 230), app.px(1) as f32);
+        if matches!(node.action, Action::QueueJump(_)) && node.rect.h >= 64 {
+            for column in 0..2 {
+                for row in 0..3 {
+                    let dot = app.rect(Rect::new(
+                        node.rect.x + 8 + column * 5,
+                        node.rect.y + 23 + row * 6,
+                        2,
+                        2,
+                    ));
+                    crate::drawing::fill(draw.hDC, dot, argb(palette[5], 230), app.px(1) as f32);
+                }
             }
         }
-    }
-    let has_art = app.images.get(&node.artwork);
+        let has_art = app.images.get(&node.artwork);
         if let Some(image) = has_art {
             faded_bitmap(draw.hDC, r, image, r.right - r.left, 255);
         } else {
@@ -7630,13 +10966,7 @@ unsafe fn draw_button(app: &App, draw: &DRAWITEMSTRUCT) {
                 radius,
                 if is_light { 1.5 } else { 2.5 },
             );
-            crate::drawing::gradient(
-                draw.hDC,
-                r,
-                argb(top, 255),
-                argb(bottom, 255),
-                radius,
-            );
+            crate::drawing::gradient(draw.hDC, r, argb(top, 255), argb(bottom, 255), radius);
             crate::drawing::stroke(draw.hDC, r, argb(accent, 235), radius, 1.5);
         } else if is_light {
             let top = if hover || active { palette[1] } else { state };
@@ -7662,13 +10992,7 @@ unsafe fn draw_button(app: &App, draw: &DRAWITEMSTRUCT) {
             let top = state;
             let bottom = app.ui.color_with_light("GradientEnd", palette[1], is_light);
             crate::drawing::stroke(draw.hDC, r, 0x37000000, radius, 2.5);
-            crate::drawing::gradient(
-                draw.hDC,
-                r,
-                argb(top, 255),
-                argb(bottom, 255),
-                radius,
-            );
+            crate::drawing::gradient(draw.hDC, r, argb(top, 255), argb(bottom, 255), radius);
             let border_color = if hover { accent } else { palette[3] };
             crate::drawing::stroke(
                 draw.hDC,
@@ -7688,7 +11012,9 @@ unsafe fn draw_button(app: &App, draw: &DRAWITEMSTRUCT) {
         } else {
             rgb(255, 255, 255)
         };
-        app.ui.color_with_light("AccentText", def, is_light)
+        let preferred = app.ui.color_with_light("AccentText", def, is_light);
+        let (start, end) = app.gradient();
+        crate::appearance::gradient_foreground(preferred, start, end)
     } else if hover {
         app.ui.color_with_light("TextHover", palette[4], is_light)
     } else {
@@ -7696,14 +11022,6 @@ unsafe fn draw_button(app: &App, draw: &DRAWITEMSTRUCT) {
     };
     let has_art = app.images.get(&node.artwork);
     if let Some(image) = has_art {
-        let alpha = app
-            .image_times
-            .get(&node.artwork)
-            .map(|t| {
-                let p = (t.elapsed().as_millis() as f32 / ART_FADE_MS as f32).min(1.0);
-                (p * p * (3.0 - 2.0 * p) * 255.0) as u8
-            })
-            .unwrap_or(255);
         faded_bitmap(
             draw.hDC,
             r,
@@ -7713,7 +11031,7 @@ unsafe fn draw_button(app: &App, draw: &DRAWITEMSTRUCT) {
             } else {
                 app.corner(14)
             },
-            alpha,
+            255,
         );
     }
     if !node.glyph.is_empty() && has_art.is_none() {
@@ -7733,6 +11051,13 @@ unsafe fn draw_button(app: &App, draw: &DRAWITEMSTRUCT) {
         } else {
             app.px(20)
         };
+        if matches!(node.action, Action::Go(View::Offline))
+            && app.ui.downloads.iter().any(|job| !job.finished)
+        {
+            let offset = app.px([0, 1, 3, 5, 6, 5, 3, 1][app.ui.download_frame as usize]);
+            icon.top += offset;
+            icon.bottom += offset;
+        }
         icon.left += icon_pad;
         icon.right = if node.text.is_empty() {
             r.right
@@ -7781,18 +11106,13 @@ unsafe fn draw_button(app: &App, draw: &DRAWITEMSTRUCT) {
         };
         if media {
             draw_hover_text(
-                GetParent(draw.hwndItem),
-                draw.hDC,
-                font,
-                &node.text,
-                label,
-                ink,
-                flags,
-                app.scale,
+                hwnd, draw.hDC, font, &node.text, label, ink, flags, app.scale,
             );
         } else {
             if flags & DT_WORDBREAK == 0 {
-                draw_automatic_text(GetParent(draw.hwndItem), draw.hDC, font, &node.text, label, ink, flags, app.scale);
+                draw_automatic_text(
+                    hwnd, draw.hDC, font, &node.text, label, ink, flags, app.scale,
+                );
             } else {
                 draw_text(draw.hDC, font, &node.text, label, ink, flags);
             }
@@ -7868,6 +11188,23 @@ unsafe fn show_context_menu(hwnd: HWND, app: &mut App, pt: POINT) {
 
     if let Some(item) = target_item {
         let menu = CreatePopupMenu();
+        let removable = app.ui.view == View::Offline
+            && ((item.kind == "offline_collection" && !item.id.starts_with("__"))
+                || (item.playable()
+                    && app
+                        .entity
+                        .as_ref()
+                        .is_some_and(|e| e.kind == "offline_collection")));
+        if removable {
+            AppendMenuW(
+                menu,
+                MF_STRING,
+                15,
+                wide(app.ui.t("Delete download")).as_ptr(),
+            );
+            AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        }
+
         if item.playable() {
             AppendMenuW(menu, MF_STRING, 3, wide(app.ui.t("Add to queue")).as_ptr());
         } else {
@@ -7904,7 +11241,12 @@ unsafe fn show_context_menu(hwnd: HWND, app: &mut App, pt: POINT) {
         if item.kind == "track" {
             let sub = CreatePopupMenu();
             AppendMenuW(sub, MF_STRING, 13, wide(app.ui.t("New playlist")).as_ptr());
-            AppendMenuW(sub, MF_STRING, 10, wide(app.ui.t("Choose playlist")).as_ptr());
+            AppendMenuW(
+                sub,
+                MF_STRING,
+                10,
+                wide(app.ui.t("Choose playlist")).as_ptr(),
+            );
             AppendMenuW(
                 menu,
                 MF_POPUP,
@@ -7919,11 +11261,21 @@ unsafe fn show_context_menu(hwnd: HWND, app: &mut App, pt: POINT) {
             AppendMenuW(menu, MF_STRING, 9, wide(app.ui.t("Share")).as_ptr());
         }
 
-        if item.kind == "playlist" {
-            AppendMenuW(menu, MF_STRING, 11, wide(app.ui.t("Edit playlist")).as_ptr());
+        if crate::playlist::can_edit(&item, &app.ui.account) {
+            AppendMenuW(
+                menu,
+                MF_STRING,
+                11,
+                wide(app.ui.t("Edit playlist")).as_ptr(),
+            );
         }
         if item.kind == "track" && app.entity.as_ref().is_some_and(|e| e.kind == "playlist") {
-            AppendMenuW(menu, MF_STRING, 14, wide(app.ui.t("Remove from playlist")).as_ptr());
+            AppendMenuW(
+                menu,
+                MF_STRING,
+                14,
+                wide(app.ui.t("Remove from playlist")).as_ptr(),
+            );
         }
         let mut screen_pt = pt;
         content_to_screen(hwnd, &mut screen_pt);
@@ -7963,20 +11315,22 @@ unsafe fn show_context_menu(hwnd: HWND, app: &mut App, pt: POINT) {
             }
             8 => {
                 if let Some(engine) = app.snapshot.engine.clone() {
-                    let dl_id = app.ui.downloads.last().map(|j| j.id + 1).unwrap_or(1);
+                    let dl_id = app.ui.downloads.iter().map(|j| j.id).max().unwrap_or(0) + 1;
                     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let queued = app
-                        .downloads
-                        .requests
-                        .try_send(crate::downloads::Request {
-                            id: dl_id,
-                            engine,
-                            items: vec![item.clone()],
-                            quality: app.ui.value("Download quality"),
-                            cancelled: cancel.clone(),
-                        })
-                        .is_ok();
-                    if queued {
+                    let queued = app.downloads.enqueue(crate::downloads::Request {
+                        id: dl_id,
+                        engine,
+                        items: vec![{
+                            let mut single = item.clone();
+                            single.raw["_download_single"] = true.into();
+                            single
+                        }],
+                        quality: app.ui.value("Download quality"),
+                        cancelled: cancel.clone(),
+                    });
+                    if let Err(error) = queued {
+                        app.notice = error;
+                    } else {
                         app.download_cancels.insert(dl_id, cancel);
                         app.ui.downloads.push(crate::downloads::Status {
                             id: dl_id,
@@ -7986,8 +11340,6 @@ unsafe fn show_context_menu(hwnd: HWND, app: &mut App, pt: POINT) {
                             ..Default::default()
                         });
                         app.notice = "Download queued".into();
-                    } else {
-                        app.notice = "Download queue is full".into();
                     }
                 } else {
                     app.notice = "Connect to Deezer before downloading.".into();
@@ -8006,13 +11358,27 @@ unsafe fn show_context_menu(hwnd: HWND, app: &mut App, pt: POINT) {
             10 => activate(hwnd, app, Action::ChoosePlaylist(item.clone())),
             11 => activate(hwnd, app, Action::EditPlaylist(item.clone())),
             13 => {
-                if app.ui.playlist_busy { return; }
+                if app.ui.playlist_busy {
+                    return;
+                }
                 activate(hwnd, app, Action::Go(View::PlaylistEdit));
                 app.ui.playlist_draft.seed = Some(item.clone());
             }
+            15 if removable => {
+                match app.downloads.remove_selection(
+                    app.snapshot.engine.clone(),
+                    item.clone(),
+                    app.entity.clone(),
+                ) {
+                    Ok(()) => app.notice = "Removing download...".into(),
+                    Err(error) => app.notice = error,
+                }
+                rebuild(hwnd, app);
+            }
             14 => {
                 if let Some(playlist) = app.entity.as_ref().filter(|e| e.kind == "playlist") {
-                    let mutation = crate::playlist::Mutation::Remove(playlist.id.clone(), item.id.clone());
+                    let mutation =
+                        crate::playlist::Mutation::Remove(playlist.id.clone(), item.id.clone());
                     submit_playlist(app, mutation);
                 }
             }
@@ -8034,7 +11400,9 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
     let app = &mut *pointer;
+    if matches!(msg,WM_LBUTTONDOWN|WM_LBUTTONUP|WM_KEYDOWN|WM_CHAR|WM_SIZE|WM_DPICHANGED|WM_CONTEXTMENU){gpu::invalidate_layers();}
     match msg {
+        gpu::UPLOAD_WAKE=>{start_animation_timer(hwnd,9);return 0;}
         WM_CREATE => {
             SendMessageW(
                 hwnd,
@@ -8112,12 +11480,18 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                     BS_OWNERDRAW as u32,
                     app,
                 );
-                SetWindowTextW(button, wide(title).as_ptr());
+                SetWindowTextW(button, wide(app.ui.t(title)).as_ptr());
                 app.caption_buttons[i] = button;
             }
             material(hwnd, app);
             apply_window_controls(hwnd, app);
             sync_tray(hwnd, app);
+            app.shortcuts = Some(crate::shortcuts::Shortcuts::new(hwnd));
+            restore_shortcuts(app);
+            match crate::media_controls::Controls::new(hwnd) {
+                Ok(controls) => app.media_controls = Some(controls),
+                Err(error) => app.notice = format!("Windows media controls unavailable: {error}"),
+            }
             SetTimer(hwnd, 1, 200, None);
             SetWindowPos(
                 hwnd,
@@ -8128,9 +11502,18 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
             );
-            load_page(app);
+            if startup_provider(
+                crate::session::deezer_saved_exists(),
+                crate::spotify::api_configured(),
+            ) == crate::catalog::Provider::Spotify
+            {
+                switch_provider(app, crate::catalog::Provider::Spotify);
+            } else {
+                load_page(app);
+            }
             rebuild(hwnd, app);
             if std::env::var_os("DEEZNATS_NO_AUTOLOGIN").is_none()
+                && app.ui.provider == crate::catalog::Provider::Deezer
                 && command(app, Command::LoginSaved)
             {
                 let q = app.ui.value("Audio quality");
@@ -8146,31 +11529,36 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
         }
         WM_GETMINMAXINFO => {
             let limits = &mut *(lp as *mut MINMAXINFO);
-            limits.ptMinTrackSize = POINT {
-                x: app.px(480),
-                y: app.px(640) + caption_height(hwnd),
-            };
+            limits.ptMinTrackSize = POINT { x: 480, y: 360 };
             0
         }
         WM_SIZE => {
             if wp == SIZE_MINIMIZED as usize {
+                SetTimer(hwnd, 6, MINIMIZED_CACHE_DELAY_MS, None);
                 return 0;
             }
-            let (width, _) = size(hwnd, app);
-            app.ui.fit_sidebars(width);
+            KillTimer(hwnd, 6);
             rebuild(hwnd, app);
+            let (width, _) = size(hwnd, app);
+            let sidebars = (
+                app.ui.sidebar_collapsed,
+                app.ui.queue_sidebar_open,
+                app.ui.device_menu_open,
+            );
+            app.ui.fit_sidebars(width);
+            if sidebars
+                != (
+                    app.ui.sidebar_collapsed,
+                    app.ui.queue_sidebar_open,
+                    app.ui.device_menu_open,
+                )
+            {
+                rebuild(hwnd, app);
+            }
             0
         }
         WM_DPICHANGED => {
-            app.scale = ((wp & 0xffff) as f64) / 96.0;
-            let old_fonts = app.fonts;
-            app.fonts = make_fonts(app.scale);
-            for control in app.edits.values() {
-                SendMessageW(*control, WM_SETFONT, app.fonts[0] as usize, 1);
-            }
-            for font in old_fonts {
-                DeleteObject(font);
-            }
+            frame_pacing::refresh(hwnd);
             let rect = &*(lp as *const RECT);
             SetWindowPos(
                 hwnd,
@@ -8185,21 +11573,48 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
             0
         }
         WM_ERASEBKGND => 1,
+        WM_DISPLAYCHANGE | WM_MOVE => {
+            frame_pacing::refresh(hwnd);
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
         WM_ACTIVATE | WM_NCACTIVATE => {
-            if msg==WM_ACTIVATE{
-                app.render_suspended=wp&0xffff==WA_INACTIVE as usize || IsIconic(hwnd)!=0;
-                if app.render_suspended{
-                    app.visualizer.set_active(false);
-                    KillTimer(hwnd,2);KillTimer(hwnd,4);KillTimer(hwnd,5);
-                    SetTimer(hwnd,1,1000,None);
-                }else{
-                    SetTimer(hwnd,1,100,None);
-                    app.lyric_motion=None;app.lyric_motion_offset=0;
-                    app.lyrics_mode_motion=None;app.ui.lyrics_cover_mix=None;
-                    let target=app.scroll_target;settle_scroll(app,target);
-                    rebuild(hwnd,app);
-                    SetTimer(hwnd,2,16,None);
-                    InvalidateRect(hwnd,null(),0);
+            if msg == WM_ACTIVATE {
+                let inactive = wp & 0xffff == WA_INACTIVE as usize;
+                app.render_suspended = IsIconic(hwnd) != 0;
+                let interval = if inactive {
+                    match app.ui.value("Background FPS") {
+                        1 => 1_000_000_000 / 90,
+                        2 => 1_000_000_000 / 60,
+                        3 => 1_000_000_000 / 30,
+                        _ => 0,
+                    }
+                } else {
+                    0
+                };
+                BACKGROUND_FRAME_INTERVAL_NS.store(interval, std::sync::atomic::Ordering::Relaxed);
+                refresh_animation_timers(hwnd);
+                if inactive || app.render_suspended {
+                    if app.ui.shortcut_capture.take().is_some() {
+                        restore_shortcuts(app);
+                    }
+                    if app.render_suspended {
+                        app.visualizer.set_active(false);
+                        stop_animation_timer(hwnd, 2);
+                        stop_animation_timer(hwnd, 4);
+                    }
+                    KillTimer(hwnd, 5);
+                    SetTimer(hwnd, 1, 1000, None);
+                } else {
+                    SetTimer(hwnd, 1, 100, None);
+                    app.lyric_motion = None;
+                    app.lyric_motion_offset = 0;
+                    app.lyrics_mode_motion = None;
+                    app.ui.lyrics_cover_mix = None;
+                    let target = app.scroll_target;
+                    settle_scroll(app, target);
+                    rebuild(hwnd, app);
+                    start_animation_timer(hwnd, 2);
+                    InvalidateRect(hwnd, null(), 0);
                 }
             }
             let result = DefWindowProcW(hwnd, msg, wp, lp);
@@ -8209,7 +11624,9 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
             result
         }
         WM_PRINTCLIENT => {
-            if !app.render_suspended{render(hwnd, app, wp as HDC);}
+            if !app.render_suspended {
+                render(hwnd, app, wp as HDC, None);
+            }
             0
         }
         WM_PAINT => {
@@ -8248,8 +11665,8 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                 SetForegroundWindow(hwnd);
             } else if lp as u32 == WM_RBUTTONUP {
                 let menu = CreatePopupMenu();
-                AppendMenuW(menu, MF_STRING, 1, wide("Open DeezNats").as_ptr());
-                AppendMenuW(menu, MF_STRING, 2, wide("Quit").as_ptr());
+                AppendMenuW(menu, MF_STRING, 1, wide(app.ui.t("Open DeezNats")).as_ptr());
+                AppendMenuW(menu, MF_STRING, 2, wide(app.ui.t("Quit")).as_ptr());
                 let mut point: POINT = zeroed();
                 GetCursorPos(&mut point);
                 SetForegroundWindow(hwnd);
@@ -8305,38 +11722,19 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                 && app.ui.view == View::FlowTune
             {
                 app.ui.flow_filter = read(app.edits[&SEARCH]);
+                app.ui.flow_genre_limit = 30;
+                app.ui.scroll = 0;
                 rebuild(hwnd, app);
                 return 0;
             }
             if wp >> 16 == BN_CLICKED as usize {
                 let index = (wp & 0xffff).saturating_sub(1000);
-                if let Some(node) = app.scene.buttons.get(index).filter(|node| {
-                    node.glyph == "\u{e710}" && matches!(node.action, Action::Go(View::Add))
-                }) {
-                    let rect = app.rect(node.rect);
-                    let pt = if node.glyph == "\u{e710}" {
-                        POINT {
-                            x: (rect.left + rect.right) / 2,
-                            y: rect.top,
-                        }
-                    } else {
-                        POINT {
-                            x: (rect.left + rect.right) / 2,
-                            y: rect.bottom,
-                        }
-                    };
-                    show_context_menu(hwnd, app, pt);
-                    return 0;
-                }
-                if let Some(node) = app.scene.buttons.get(index) {
-                    let action = node.action.clone();
-                    activate(hwnd, app, action);
-                }
+                activate_scene_button(hwnd, app, index);
             }
             0
         }
         WM_MOUSEWHEEL => {
-            if app.ui.queue_sidebar_open {
+            if app.ui.right_sidebar_open() {
                 let mut pt: POINT = zeroed();
                 GetCursorPos(&mut pt);
                 screen_to_content(hwnd, &mut pt);
@@ -8348,26 +11746,58 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                     } else {
                         delta.signum() * ((delta.abs() / 120).max(1)) * 3
                     };
-                    app.ui.queue_scroll = (app.ui.queue_scroll as i32 - steps)
-                        .clamp(0, app.scene.queue_scroll_max as i32)
-                        as usize;
-                    rebuild(hwnd, app);
+                    if app.scene.device_sidebar.is_some() {
+                        app.ui.device_sidebar_scroll = (app.ui.device_sidebar_scroll - steps)
+                            .clamp(0, app.scene.queue_scroll_max as i32);
+                        rebuild(hwnd, app);
+                    } else {
+                        let mut lines = 3u32;
+                        SystemParametersInfoW(
+                            SPI_GETWHEELSCROLLLINES,
+                            0,
+                            (&mut lines as *mut u32).cast(),
+                            0,
+                        );
+                        let viewport = app.scene.queue_viewport.map_or(0, |r| r.h);
+                        let pixels =
+                            wheel_pixels(delta, lines, viewport, &mut app.queue_wheel_remainder);
+                        let current =
+                            (app.ui.queue_scroll * 24 + app.ui.queue_scroll_offset) as f64;
+                        if pixels==0 {return 0;}
+                        if app.ui.smooth_scrolling {
+                            app.queue_glide = Some(retarget_queue_glide(app.queue_glide,current,pixels,
+                                (app.scene.queue_scroll_max*24) as f64,std::time::Instant::now()));
+                            start_animation_timer(hwnd, 8);
+                        } else {
+                            app.queue_glide = None;
+                            set_queue_scroll(hwnd, app, current as i32 - pixels);
+                        }
+                    }
                     return 0;
                 }
             }
 
-            if app.ui.view==View::Lyrics && app.ui.timed_lyrics() && !app.ui.lyrics_manual_scroll {
-                let (_,height)=size(hwnd,app);
-                let position=app.scene.lyrics_anchor.map(|anchor|anchor+app.ui.scroll-(height/2-60)).unwrap_or(app.ui.scroll).max(0);
+            if app.ui.view == View::Lyrics && app.ui.timed_lyrics() && !app.ui.lyrics_manual_scroll
+            {
+                let position = app
+                    .scene
+                    .lyrics_anchor
+                    .map(|anchor| anchor + app.ui.scroll)
+                    .unwrap_or(app.ui.scroll)
+                    .max(0);
                 app.ui.hold_lyric_follow(std::time::Instant::now());
-                settle_scroll(app,position);
-                rebuild(hwnd,app);
+                settle_scroll(app, position);
+                rebuild(hwnd, app);
             }
             app.ui.hold_lyric_follow(std::time::Instant::now());
             let delta = ((wp >> 16) as u16) as i16 as i32;
             let (_, h) = size(hwnd, app);
-            let bottom=if app.ui.view==View::Lyrics{h-64}else{content_bottom(app,h)};
-            let maximum = (app.scene.content_height-bottom).max(0);
+            let bottom = if app.ui.view == View::Lyrics {
+                h - 64
+            } else {
+                content_bottom(app, h)
+            };
+            let maximum = (app.scene.content_height - bottom).max(0);
             let mut lines = 3u32;
             SystemParametersInfoW(
                 SPI_GETWHEELSCROLLLINES,
@@ -8382,6 +11812,18 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                 &mut app.wheel_remainder,
             );
             if pixels != 0 {
+                if app.ui.smooth_scrolling && app.scroll_target != app.ui.scroll {
+                    let now = std::time::Instant::now();
+                    (app.scroll_position, app.scroll_velocity) = smooth_scroll_step(
+                        app.scroll_position,
+                        app.scroll_velocity,
+                        app.scroll_target as f64,
+                        now.duration_since(app.scroll_tick).as_secs_f64(),
+                    );
+                    app.scroll_tick = now;
+                    let position = app.scroll_position.round() as i32;
+                    scroll_to(hwnd, app, position);
+                }
                 let idle = app.scroll_target == app.ui.scroll;
                 if idle || (app.scroll_target - app.ui.scroll).signum() == pixels.signum() {
                     app.scroll_target = app.ui.scroll;
@@ -8397,15 +11839,78 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                     {
                         app.scroll_velocity = 0.0;
                     }
-                    SetTimer(hwnd, 2, 10, None);
+                    start_animation_timer(hwnd, 2);
                 } else {
                     scroll_to(hwnd, app, app.scroll_target);
                 }
             }
             0
         }
+        WM_MBUTTONDOWN => {
+            if app.middle_scroll.take().is_some() {
+                return 0;
+            }
+            let x = ((lp as u32 & 0xffff) as i16) as f64 / app.scale;
+            let y = ((((lp as u32 >> 16) as u16) as i16) as i32 - caption_height(hwnd)) as f64
+                / app.scale;
+            let inside = |r: ui::Rect| {
+                x >= r.x as f64
+                    && x < (r.x + r.w) as f64
+                    && y >= r.y as f64
+                    && y < (r.y + r.h) as f64
+            };
+            let queue = app.ui.queue_sidebar_open && app.scene.queue_viewport.is_some_and(inside);
+            let lyrics =
+                app.ui.view == View::Lyrics && app.scene.lyrics_area.is_some_and(inside) && !queue;
+            if queue || lyrics {
+                if lyrics && app.ui.timed_lyrics() && !app.ui.lyrics_manual_scroll {
+                    let position = app
+                        .scene
+                        .lyrics_anchor
+                        .map(|anchor| anchor + app.ui.scroll)
+                        .unwrap_or(app.ui.scroll)
+                        .max(0);
+                    app.ui.hold_lyric_follow(std::time::Instant::now());
+                    settle_scroll(app, position);
+                    rebuild(hwnd, app);
+                }
+                app.queue_glide = None;
+                app.middle_scroll = Some((queue, y as i32, false, std::time::Instant::now()));
+                SetCapture(hwnd);
+                start_animation_timer(hwnd, 8);
+                return 0;
+            }
+            0
+        }
+        WM_MBUTTONUP => {
+            if let Some((_, origin, dragged, _)) = app.middle_scroll {
+                let y = ((((lp as u32 >> 16) as u16) as i16) as i32 - caption_height(hwnd)) as f64
+                    / app.scale;
+                if dragged || (y as i32 - origin).abs() > 8 {
+                    app.middle_scroll = None;
+                }
+                if GetCapture() == hwnd {
+                    ReleaseCapture();
+                }
+                return 0;
+            }
+            0
+        }
+        WM_RBUTTONDOWN if app.middle_scroll.is_some() => {
+            app.middle_scroll = None;
+            if GetCapture() == hwnd {
+                ReleaseCapture();
+            }
+            0
+        }
         WM_LBUTTONDOWN => {
-            let (_, h) = size(hwnd, app);
+            if app.middle_scroll.take().is_some() {
+                if GetCapture() == hwnd {
+                    ReleaseCapture();
+                }
+                return 0;
+            }
+            let (w, h) = size(hwnd, app);
             let x = ((lp as u32 & 0xffff) as i16) as f64 / app.scale;
             let y = ((((lp as u32 >> 16) as u16) as i16) as i32 - caption_height(hwnd)) as f64
                 / app.scale;
@@ -8417,6 +11922,7 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                         || y < rect.y as f64
                         || y > (rect.y + rect.h) as f64
                     {
+                        app.ui.device_menu_open = false;
                         rebuild(hwnd, app);
                     }
                     return 0;
@@ -8479,12 +11985,55 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                 app.scrolling = true;
                 app.ui.hold_lyric_follow(std::time::Instant::now());
                 SetCapture(hwnd);
-                let thumb=app.scene.panels.iter().find(|p|p.kind==6).map(|p|p.rect).unwrap_or(Rect::new(0,0,0,32));
-                app.scroll_grab_offset=if y>=thumb.y as f64 && y<=(thumb.y+thumb.h)as f64{y as i32-thumb.y}else{thumb.h/2};
-                let bottom=if app.ui.view==View::Lyrics{h-64}else{content_bottom(app,h)};
-                let position=scrollbar_position(&app.scene,y as i32,app.scroll_grab_offset,bottom);
-                settle_scroll(app,position);
-                rebuild(hwnd, app);
+                let thumb = app
+                    .scene
+                    .panels
+                    .iter()
+                    .find(|p| p.kind == 6)
+                    .map(|p| p.rect)
+                    .unwrap_or(Rect::new(0, 0, 0, 32));
+                app.scroll_grab_offset = if y >= thumb.y as f64 && y <= (thumb.y + thumb.h) as f64 {
+                    y as i32 - thumb.y
+                } else {
+                    thumb.h / 2
+                };
+                let bottom = if app.ui.view == View::Lyrics {
+                    h - 64
+                } else {
+                    content_bottom(app, h)
+                };
+                let position =
+                    scrollbar_position(&app.scene, y as i32, app.scroll_grab_offset, bottom);
+                scroll_to_scrollbar_position(hwnd, app, position);
+            }
+            if !app.scrolling {
+                if let Some(index) = canvas_track_hit(app, x as i32, y as i32, w, h) {
+                    if let Action::QueueJump(queue_index) = app.scene.buttons[index].action {
+                        app.queue_drag = Some((
+                            queue_index,
+                            app.px(y as i32),
+                            false,
+                            queue_index,
+                            app.ui.queue.iter().map(|e| e.id.clone()).collect(),
+                        ));
+                        app.canvas_focus = Some(index);
+                        SetFocus(hwnd);
+                        SetCapture(hwnd);
+                        InvalidateRect(hwnd, null(), 0);
+                        return 0;
+                    }
+                    let key = canvas_action_key(&app.scene.buttons[index].action);
+                    SetFocus(hwnd);
+                    SetCapture(hwnd);
+                    app.canvas_focus = Some(index);
+                    app.canvas_pressed = Some((index, key));
+                    InvalidateRect(hwnd, null(), 0);
+                    return 0;
+                }
+                app.canvas_focus = None;
+                if !app.canvas_keyboard.is_null() && GetFocus() == app.canvas_keyboard {
+                    SetFocus(hwnd);
+                }
             }
             0
         }
@@ -8534,6 +12083,21 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
             };
             TrackMouseEvent(&mut tracking);
 
+            let (w, h) = size(hwnd, app);
+            let x = ((lp as u32 & 0xffff) as i16) as f64 / app.scale;
+            let y = ((((lp as u32 >> 16) as u16) as i16) as i32 - caption_height(hwnd)) as f64
+                / app.scale;
+            let hovered = canvas_track_hit(app, x as i32, y as i32, w, h);
+            if app.canvas_hover != hovered {
+                app.canvas_hover = hovered;
+                // Scrolling suppresses row hover painting. Keep its retained
+                // lists intact; the final animation paint restores hover.
+                if !main_scroll_animating(app)&&app.queue_glide.is_none()&&!app.scrolling&&!app.queue_scroll_drag {
+                    gpu::invalidate_layers();
+                    InvalidateRect(hwnd, null(), 0);
+                }
+            }
+
             if app.ui.view == View::Lyrics {
                 let mut pt: POINT = zeroed();
                 GetCursorPos(&mut pt);
@@ -8545,7 +12109,7 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                 };
                 if app.ui.lyrics_cover_hovered != hovered {
                     app.set_lyrics_cover_hover(hovered);
-                    SetTimer(hwnd, 2, 16, None);
+                    start_animation_timer(hwnd, 2);
                     rebuild(hwnd, app);
                 }
             }
@@ -8555,10 +12119,14 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                 let (_, h) = size(hwnd, app);
                 let y = ((((lp as u32 >> 16) as u16) as i16) as i32 - caption_height(hwnd)) as f64
                     / app.scale;
-                let bottom=if app.ui.view==View::Lyrics{h-64}else{content_bottom(app,h)};
-                let position=scrollbar_position(&app.scene,y as i32,app.scroll_grab_offset,bottom);
-                settle_scroll(app,position);
-                rebuild(hwnd, app);
+                let bottom = if app.ui.view == View::Lyrics {
+                    h - 64
+                } else {
+                    content_bottom(app, h)
+                };
+                let position =
+                    scrollbar_position(&app.scene, y as i32, app.scroll_grab_offset, bottom);
+                scroll_to_scrollbar_position(hwnd, app, position);
                 return 0;
             }
             if let Some((mode, band)) = app.eq_drag {
@@ -8579,6 +12147,9 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
             0
         }
         WM_MOUSELEAVE => {
+            if app.canvas_hover.take().is_some() {
+                InvalidateRect(hwnd, null(), 0);
+            }
             if app.ui.view == View::Lyrics && app.ui.lyrics_cover_hovered {
                 let mut pt: POINT = zeroed();
                 GetCursorPos(&mut pt);
@@ -8590,19 +12161,36 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                 };
                 if !still_in_cover {
                     app.set_lyrics_cover_hover(false);
-                    SetTimer(hwnd, 2, 16, None);
+                    start_animation_timer(hwnd, 2);
                     rebuild(hwnd, app);
                 }
             }
             0
         }
         WM_CAPTURECHANGED => {
+            app.canvas_pressed = None;
             app.queue_drag = None;
             app.queue_scroll_drag = false;
             KillTimer(hwnd, 5);
             0
         }
         WM_LBUTTONUP => {
+            if let Some((index, key)) = app.canvas_pressed.take() {
+                let (w, h) = size(hwnd, app);
+                let x = ((lp as u32 & 0xffff) as i16) as f64 / app.scale;
+                let y = ((((lp as u32 >> 16) as u16) as i16) as i32 - caption_height(hwnd)) as f64
+                    / app.scale;
+                let valid = canvas_track_hit(app, x as i32, y as i32, w, h)
+                    .filter(|&hit| hit == index)
+                    .and_then(|hit| app.scene.buttons.get(hit))
+                    .is_some_and(|node| canvas_action_matches(&key, &node.action));
+                ReleaseCapture();
+                if valid {
+                    activate_scene_button(hwnd, app, index);
+                }
+                InvalidateRect(hwnd, null(), 0);
+                return 0;
+            }
             if let Some((from, _, active, to, expected)) = app.queue_drag.take() {
                 KillTimer(hwnd, 5);
                 ReleaseCapture();
@@ -8640,10 +12228,23 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
             let x = ((lp as i32) & 0xffff) as i16 as i32;
             let y = (((lp as i32) >> 16) & 0xffff) as i16 as i32;
             let pt = if x == -1 && y == -1 {
-                let mut cursor = zeroed();
-                GetCursorPos(&mut cursor);
-                screen_to_content(hwnd, &mut cursor);
-                cursor
+                if let Some(node) = app
+                    .canvas_focus
+                    .filter(|&index| canvas_track_button(app, index))
+                    .and_then(|index| app.scene.buttons.get(index))
+                    .filter(|_| GetFocus() == hwnd || GetFocus() == app.canvas_keyboard)
+                {
+                    let rect = app.rect(node.rect);
+                    POINT {
+                        x: (rect.left + rect.right) / 2,
+                        y: (rect.top + rect.bottom) / 2,
+                    }
+                } else {
+                    let mut cursor = zeroed();
+                    GetCursorPos(&mut cursor);
+                    screen_to_content(hwnd, &mut cursor);
+                    cursor
+                }
             } else {
                 let mut pt = POINT { x, y };
                 screen_to_content(hwnd, &mut pt);
@@ -8677,10 +12278,12 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                         _ => &mut app.ui.surface_opacity,
                     };
                     *target = pos;
-                    let prefix = app.ui.t(key);
-                    for label in &mut app.scene.labels {
-                        if label.text.starts_with(prefix) {
-                            label.text = format!("{}: {}%", prefix, pos);
+                    if let Some((rect, _, _)) = app.scene.sliders.iter().find(|(_, k, _)| *k == key)
+                    {
+                        for label in &mut app.scene.labels {
+                            if label.rect.x == rect.x + rect.w + 8 && label.rect.y == rect.y + 6 {
+                                label.text = format!("{}%", pos);
+                            }
                         }
                     }
                     if key == "Image blur" {
@@ -8696,13 +12299,55 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                 app.volume = value;
                 app.ui.initial_volume = value;
                 SetTimer(hwnd, 3, 300, None);
-                command(app, Command::Volume(value));
+                if command(app, Command::Volume(value)) {
+                    KillTimer(hwnd, 7);
+                } else {
+                    SetTimer(hwnd, 7, 75, None);
+                }
                 rebuild(hwnd, app);
             } else if id == SEEK && (wp as u32 & 0xffff) == TB_ENDTRACK {
                 let position = app.ui.duration.saturating_mul(value as u64) / SEEK_STEPS as u64;
                 command(app, Command::SeekMs(position));
                 app.snapshot.position = position;
+                app.playback_clock
+                    .sample(position, std::time::Instant::now(), false);
                 app.ui.position = position;
+            }
+            0
+        }
+        #[cfg(debug_assertions)]
+        WM_TIMER if wp == 90 => {
+            FPS_COUNTER.with(|counter| {
+                let mut counter = counter.borrow_mut();
+                let now = std::time::Instant::now();
+                let elapsed = now.duration_since(counter.2).as_secs_f64();
+                if elapsed > 0.0 {
+                    counter.1 = counter.0 as f64 / elapsed;
+                }
+                counter.0 = 0;
+                counter.2 = now;
+            });
+            if IsIconic(hwnd) == 0 && IsWindowVisible(hwnd) != 0 {
+                InvalidateRect(hwnd, &fps_rect(hwnd), 0);
+            }
+            0
+        }
+        WM_TIMER if wp == 7 => {
+            KillTimer(hwnd, 7);
+            command(app, Command::Volume(app.volume));
+            0
+        }
+        WM_TIMER if wp == 6 => {
+            KillTimer(hwnd, 6);
+            if IsIconic(hwnd) != 0 {
+                gpu::hide();
+                *app.backdrop_cache.borrow_mut() = Default::default();
+                crate::drawing::clear_lyric_rasters();
+                trim_minimized_artwork(app);
+                let current = page_key(app);
+                trim_inactive_pages(&mut app.page_cache, &current);
+                app.catalog.session.release_inactive_pages(app.generation);
+                crate::catalog::expire_public_cache();
             }
             0
         }
@@ -8725,6 +12370,7 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                         as usize;
                     if next != app.ui.queue_scroll {
                         app.ui.queue_scroll = next;
+                        app.ui.queue_scroll_offset = 0;
                         rebuild(hwnd, app);
                         // Recompute the drop row after autoscrolling, even with a stationary pointer.
                         let target = app
@@ -8753,6 +12399,7 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
             let mut cursor: POINT = zeroed();
             GetCursorPos(&mut cursor);
             screen_to_content(hwnd, &mut cursor);
+            let mut marquee_rects = Vec::new();
             let active = MARQUEE.with(|state| {
                 let mut state = state.borrow_mut();
                 let active = state.as_ref().is_some_and(|(_, rect, _, painted)| {
@@ -8763,12 +12410,113 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                 });
                 if !active {
                     *state = None;
+                } else if let Some((_, rect, _, _)) = state.as_ref() {
+                    marquee_rects.push(*rect);
                 }
                 active
             });
-            let automatic=AUTO_MARQUEES.with(|states|{let mut states=states.borrow_mut();states.retain(|_,(_,_,painted)|painted.elapsed().as_millis()<250);!states.is_empty()}) && GetForegroundWindow()==hwnd && IsIconic(hwnd)==0;
-            if !active && !automatic {KillTimer(hwnd,4);}
-            if active || automatic {InvalidateRect(hwnd,null(),0);}
+            let automatic = AUTO_MARQUEES.with(|states| {
+                let mut states = states.borrow_mut();
+                states.retain(|_, (_, _, painted)| painted.elapsed().as_millis() < 250);
+                for (rect, _, _) in states.values() {
+                    marquee_rects.push(*rect);
+                }
+                !states.is_empty()
+            }) && IsIconic(hwnd) == 0;
+            if !active && !automatic {
+                stop_animation_timer(hwnd, 4);
+            }
+            if active || automatic {
+                if marquee_rects.is_empty() {
+                    InvalidateRect(hwnd, null(), 0);
+                } else {
+                    let caption = caption_height(hwnd);
+                    for rect in marquee_rects {
+                        let client_rect = RECT {
+                            left: rect.left,
+                            top: rect.top + caption,
+                            right: rect.right,
+                            bottom: rect.bottom + caption,
+                        };
+                        InvalidateRect(hwnd, &client_rect, 0);
+                    }
+                }
+            }
+            0
+        }
+        WM_TIMER if wp == 9 => {
+            let deferred=gpu::take_deferred_uploads();
+            if IsIconic(hwnd)!=0||!deferred {
+                stop_animation_timer(hwnd,9);
+            }else{
+                let (_,h)=size(hwnd,app);let caption=caption_height(hwnd);
+                for rect in artwork_damage::all(&app.scene,content_bottom(app,h)).rects {
+                    let mut rect=app.rect(rect);rect.top+=caption;rect.bottom+=caption;
+                    InvalidateRect(hwnd,&rect,0);
+                }
+            }
+            0
+        }
+        WM_TIMER if wp==10=>{
+            KillTimer(hwnd,10);
+            if !app.render_suspended {let (_,h)=size(hwnd,app);trim_artwork(app,h);}
+            0
+        }
+        WM_TIMER if wp == 8 => {
+            let now = std::time::Instant::now();
+            if let Some((position, velocity, target, tick)) = app.queue_glide.take() {
+                if app.ui.queue_sidebar_open && !app.queue_scroll_drag {
+                    let (next, speed) = smooth_scroll_step(
+                        position,
+                        velocity,
+                        target,
+                        now.saturating_duration_since(tick).as_secs_f64(),
+                    );
+                    let before=app.ui.queue_scroll*24+app.ui.queue_scroll_offset;
+                    set_queue_scroll(hwnd, app, next.round() as i32);
+                    if before as i32==next.round() as i32&&gpu::available(){if let Some(frame)=app.scene.queue_frame{let mut r=app.rect(frame);let caption=caption_height(hwnd);r.top+=caption;r.bottom+=caption;InvalidateRect(hwnd,&r,0);}}
+                    if (next - target).abs() >= 0.25 || speed.abs() >= 5.0 {
+                        app.queue_glide = Some((next, speed, target, now));
+                    }
+                }
+            }
+            if let Some((queue, origin, dragged, tick)) = app.middle_scroll.take() {
+                if (queue && app.ui.queue_sidebar_open) || (!queue && app.ui.view == View::Lyrics) {
+                    let mut cursor: POINT = zeroed();
+                    GetCursorPos(&mut cursor);
+                    screen_to_content(hwnd, &mut cursor);
+                    let displacement = (cursor.y as f64 / app.scale) as i32 - origin;
+                    let dt = now.saturating_duration_since(tick).as_secs_f64().min(0.1);
+                    let pixels = if displacement.abs() > 8 {
+                        ((displacement.signum() as f64)
+                            * ((displacement.abs() - 8) as f64)
+                            * 4.0
+                            * dt)
+                            .round() as i32
+                    } else {
+                        0
+                    };
+                    if pixels != 0 {
+                        if queue {
+                            let current =
+                                (app.ui.queue_scroll * 24 + app.ui.queue_scroll_offset) as i32;
+                            set_queue_scroll(hwnd, app, current.saturating_add(pixels));
+                        } else {
+                            app.ui.hold_lyric_follow(now);
+                            let (_, h) = size(hwnd, app);
+                            let max = (app.scene.content_height - (h - 64)).max(0);
+                            let position = app.ui.scroll.saturating_add(pixels).clamp(0, max);
+                            scroll_to(hwnd, app, position);
+                            settle_scroll(app, position);
+                        }
+                    }
+                    app.middle_scroll =
+                        Some((queue, origin, dragged || displacement.abs() > 8, now));
+                }
+            }
+            if app.queue_glide.is_none() && app.middle_scroll.is_none() {
+                stop_animation_timer(hwnd, 8);
+            }
             0
         }
         WM_TIMER if wp == 3 => {
@@ -8780,22 +12528,43 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
         }
         WM_TIMER if wp == 2 => {
             app.visualizer.set_output_volume(app.volume);
-            app.visualizer.set_active(!app.render_suspended && app.ui.view==View::Lyrics && app.playing() && crate::connect::visualizer_spectrum().is_none());
-            if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 || GetForegroundWindow()!=hwnd {
-                KillTimer(hwnd, 2);
+            app.visualizer.set_active(
+                !app.render_suspended
+                    && app.ui.view == View::Lyrics
+                    && app.ui.lyrics_visualizer
+                    && app.playing()
+            );
+            if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
+                stop_animation_timer(hwnd, 2);
                 return 0;
             }
             let distance = app.scroll_target - app.ui.scroll;
-            let mut dirty = false;
-            if let Some((started,from,target))=app.lyrics_mode_motion{
-                let progress=(started.elapsed().as_secs_f32()/0.32).min(1.);
-                let ease=progress*progress*(3.-2.*progress);
-                app.ui.lyrics_cover_mix=Some(from+(target-from)*ease);
-                if progress>=1. || app.ui.view!=View::Lyrics{app.lyrics_mode_motion=None;app.ui.lyrics_cover_mix=None;}
-                rebuild(hwnd,app);dirty=true;
+            let prepared_artwork_changed = crate::drawing::poll_prepared_artwork();
+            let mut dirty = prepared_artwork_changed;
+            let lyrics_active =
+                app.ui.view == View::Lyrics && app.ui.timed_lyrics() && app.playing();
+            if lyrics_active {
+                let position = app.playback_position();
+                let changed = app.lyric_layout_changed(position);
+                app.ui.position = position;
+                if changed {
+                    rebuild(hwnd, app);
+                    dirty = true;
+                }
+            }
+            if let Some((started, from, target)) = app.lyrics_mode_motion {
+                let progress = (started.elapsed().as_secs_f32() / 0.32).min(1.);
+                let ease = progress * progress * (3. - 2. * progress);
+                app.ui.lyrics_cover_mix = Some(from + (target - from) * ease);
+                if progress >= 1. || app.ui.view != View::Lyrics {
+                    app.lyrics_mode_motion = None;
+                    app.ui.lyrics_cover_mix = None;
+                }
+                rebuild(hwnd, app);
+                dirty = true;
             }
             let now = std::time::Instant::now();
-            if distance != 0 {
+            if distance != 0||main_scroll_animating(app) {
                 if app.scroll_position.round() as i32 != app.ui.scroll {
                     app.scroll_position = app.ui.scroll as f64;
                     app.scroll_velocity = 0.0;
@@ -8809,8 +12578,12 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                     elapsed,
                 );
                 let position = app.scroll_position.round() as i32;
+                let before=app.ui.scroll;
                 scroll_to(hwnd, app, position);
-                dirty = true;
+                if before==position&&gpu::available(){let (w,h)=size(hwnd,app);let r=scroll_repaint_rect(app,app.px(w),h,caption_height(hwnd));InvalidateRect(hwnd,&r,0);}
+                // Let WM_PAINT combine scrolling with artwork/fade invalidations
+                // from this tick. Synchronous painting here rendered a second
+                // frame when the remainder of the handler invalidated again.
             }
             app.background_transition.advance(now);
             let background_fading = app.background_transition.animating();
@@ -8847,12 +12620,11 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                     .as_millis()
                     < 180;
             // Cached offscreen artwork must not keep the entire window animating.
-            let image_fading = app
+            let image_fading = app.ui.view==View::Lyrics && app
                 .scene
                 .pictures
                 .iter()
                 .map(|(_, url)| url)
-                .chain(app.scene.buttons.iter().map(|button| &button.artwork))
                 .any(|url| {
                     app.images.contains_key(url)
                         && app.image_times.get(url).is_some_and(|started| {
@@ -8892,65 +12664,147 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                             .rich_lyrics
                             .iter()
                             .any(|line| !line.syllables.is_empty())));
+            // Wave and bars only occupy the bottom of the client area. Keep
+            // their animation from repainting the artwork and lyrics above it.
+            let visualizer_only = visualizer_active
+                && app.ui.visualizer_style < 2
+                && !dirty
+                && !karaoke_active
+                && !notes_active
+                && distance == 0
+                && !main_scroll_animating(app);
             if visualizer_active || karaoke_active || notes_active {
                 dirty = true;
             }
-            let finished = app.scroll_target == app.ui.scroll
+            let finished = !main_scroll_animating(app)
                 && app.lyrics_mode_motion.is_none()
                 && !fading
                 && !toggling
                 && !visualizer_active
                 && !karaoke_active
                 && !notes_active
-                && app.lyric_motion.is_none();
+                && !lyrics_active
+                && app.lyric_motion.is_none()
+                && !crate::drawing::artwork_preparation_pending();
             if finished {
-                KillTimer(hwnd, 2);
+                stop_animation_timer(hwnd, 2);
                 // Commit the exact end state even if this tick crossed a fade's deadline.
                 dirty = true;
             }
-            if fading || toggling || finished {
-                for button in &app.buttons {
-                    InvalidateRect(*button, null(), 0);
-                }
-            }
+            // Buttons are painted into the parent's buffered frame. Invalidating
+            // every native hit target adds redundant WM_PAINT/WM_DRAWITEM work.
             if dirty {
-                InvalidateRect(hwnd, null(), 0);
+                let player_artwork_fading =
+                    app.image_times
+                        .get(&app.ui.now.artwork)
+                        .is_some_and(|started| {
+                            now.saturating_duration_since(*started).as_millis() < ART_FADE_MS + 20
+                        });
+                let content_only = image_fading
+                    && !prepared_artwork_changed
+                    && !background_fading
+                    && !cover_fading
+                    && !palette_fading
+                    && !player_artwork_fading
+                    && !toggling
+                    && !matches!(app.ui.view, View::Settings | View::Lyrics);
+                let mut client: RECT = zeroed();
+                GetClientRect(hwnd, &mut client);
+                let (_, height) = size(hwnd, app);
+                let region = scroll_repaint_rect(app, client.right, height, caption_height(hwnd));
+                if visualizer_only {
+                    let region = RECT {
+                        left: 0,
+                        top: (client.bottom - 220 - app.px(4)).max(caption_height(hwnd)),
+                        right: client.right,
+                        bottom: client.bottom,
+                    };
+                    InvalidateRect(hwnd, &region, 0);
+                } else if content_only
+                    && scroll_repaint_enabled()
+                    && scroll_repaint_avoids_search(app, &region, caption_height(hwnd))
+                {
+                    InvalidateRect(hwnd, &region, 0);
+                } else {
+                    InvalidateRect(hwnd, null(), 0);
+                }
             }
             0
         }
         WM_TIMER => {
-            if !app.render_suspended && !app.scrolling && app.ui.resume_lyric_follow(std::time::Instant::now()){
-                let previous_scroll=app.ui.scroll;settle_scroll(app,0);rebuild(hwnd,app);
-                if let Some(anchor)=app.scene.lyrics_anchor{
-                    let (_,height)=size(hwnd,app);let offset=anchor-previous_scroll-(height/2-60);
-                    app.lyric_motion=Some((std::time::Instant::now(),offset));app.lyric_motion_offset=offset;
-                    shift_scroll_content(&mut app.scene,offset);
-                    let (width,height)=size(hwnd,app);position_content_buttons(app,width,height);SetTimer(hwnd,2,16,None);
+            let refreshing = crate::spotify::web::refreshing();
+            if app.ui.spotify_credentials_refreshing != refreshing {
+                app.ui.spotify_credentials_refreshing = refreshing;
+                if !app.render_suspended {
+                    rebuild(hwnd, app);
                 }
             }
-            if let Some(snapshot) = app.worker.updates.try_iter().last() {
+            #[cfg(feature = "memory-profile")]
+            if wp == 1 {
+                crate::memory_profile::sample();
+            }
+            if !app.render_suspended && app.ui.downloads.iter().any(|job| !job.finished) {
+                app.ui.download_frame = (app.ui.download_frame + 1) % 8;
+                rebuild(hwnd, app);
+            }
+            if process_updates(hwnd, app) {
+                return 0;
+            }
+            if !app.render_suspended
+                && !app.scrolling
+                && app.ui.resume_lyric_follow(std::time::Instant::now())
+            {
+                let previous_scroll = app.ui.scroll;
+                settle_scroll(app, 0);
+                rebuild(hwnd, app);
+                if let Some(anchor) = app.scene.lyrics_anchor {
+                    let offset = anchor - previous_scroll;
+                    app.lyric_motion = Some((std::time::Instant::now(), offset));
+                    app.lyric_motion_offset = offset;
+                    shift_scroll_content(&mut app.scene, offset);
+                    let (width, height) = size(hwnd, app);
+                    position_content_buttons(app, width, height);
+                    start_animation_timer(hwnd, 2);
+                }
+            }
+            if let Some(snapshot) = app
+                .worker
+                .updates
+                .try_iter()
+                .filter(|snapshot| snapshot.provider == app.ui.provider)
+                .last()
+            {
                 let progress_changed = app.snapshot.position != snapshot.position
                     || app.snapshot.duration != snapshot.duration
                     || app.snapshot.message != snapshot.message;
                 let newly_connected = !app.snapshot.connected && snapshot.connected;
                 let queue_data_changed = !Arc::ptr_eq(&app.snapshot.queue, &snapshot.queue);
+                let queue_track_changed = app.snapshot.queue_index != snapshot.queue_index
+                    || app.snapshot.now.id != snapshot.now.id;
                 let queue_changed =
                     app.snapshot.queue_index != snapshot.queue_index || queue_data_changed;
-                let lyric_layout_changed = app.ui.view == View::Lyrics
-                    && (app
-                        .ui
-                        .rich_lyrics
-                        .iter()
-                        .rposition(|l| l.start_ms <= snapshot.position)
-                        != app
-                            .ui
-                            .rich_lyrics
-                            .iter()
-                            .rposition(|l| l.start_ms <= app.ui.position)
-                        || app.ui.lyrics.iter().rposition(|l| l.0 <= snapshot.position)
-                            != app.ui.lyrics.iter().rposition(|l| l.0 <= app.ui.position)
-);
-                let changed = app.snapshot.connected != snapshot.connected
+                let clock_changed = app.snapshot.position != snapshot.position
+                    || app.snapshot.state != snapshot.state
+                    || app.snapshot.now.id != snapshot.now.id;
+                if clock_changed {
+                    let smooth = app.playing()
+                        && snapshot.state == "Playing"
+                        && app.snapshot.now.id == snapshot.now.id;
+                    app.playback_clock
+                        .sample(snapshot.position, std::time::Instant::now(), smooth);
+                }
+                let position = app
+                    .playback_clock
+                    .position(std::time::Instant::now(), snapshot.state == "Playing");
+                let lyric_layout_changed = app.lyric_layout_changed(position);
+                let unavailable = snapshot
+                    .unavailable_at
+                    .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(4));
+                let unavailable_changed = app.ui.playback_unavailable != unavailable;
+                app.ui.playback_unavailable = unavailable;
+                let changed = unavailable_changed
+                    || app.snapshot.connected != snapshot.connected
+                    || app.snapshot.account != snapshot.account
                     || app.snapshot.title != snapshot.title
                     || app.snapshot.state != snapshot.state
                     || app.snapshot.now.artwork != snapshot.now.artwork
@@ -8976,10 +12830,22 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                     }
                 }
                 app.snapshot = snapshot;
+                if newly_connected && app.ui.provider == crate::catalog::Provider::Deezer {
+                    if let Some(engine) = app.snapshot.engine.clone() {
+                        for (status, cancel) in app.downloads.resume(engine) {
+                            app.download_cancels.insert(status.id, cancel);
+                            app.ui.downloads.push(status);
+                        }
+                    }
+                }
+                if let Some(controls) = &mut app.media_controls {
+                    if let Err(error) = controls.update(&app.snapshot) {
+                        app.notice = format!("Windows media controls: {error}");
+                    }
+                }
                 if let Some(connect) = &app.connect {
                     connect.update(&app.snapshot);
                 }
-                app.playback_tick = std::time::Instant::now();
                 if app.snapshot.connected
                     && !app.library_loaded
                     && matches!(app.ui.view, View::Show | View::Playlists | View::Podcasts)
@@ -8997,6 +12863,10 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                     app.ui.show_on_discord = config["enabled"].as_bool().unwrap_or(false);
                     app.ui.discord_paused = config["show_paused"].as_bool().unwrap_or(false);
                     app.ui.discord_badge = config["badge"].as_bool().unwrap_or(true);
+                    app.ui.choices.insert(
+                        "Status name",
+                        config["status_name"].as_u64().unwrap_or(0).min(3) as usize,
+                    );
                     app.ui.discord_hide_details = config["hide_details"].as_bool().unwrap_or(false);
                     app.ui.discord_btn_service = config["service_button"].as_bool().unwrap_or(true);
                     app.ui.discord_btn_app = config["app_button"].as_bool().unwrap_or(true);
@@ -9067,7 +12937,7 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                 }
                 app.ui.account = app.snapshot.account.clone();
                 {
-                    app.ui.position = app.snapshot.position;
+                    app.ui.position = app.playback_position();
                     app.ui.duration = app.snapshot.duration;
                     app.ui.repeat = app.snapshot.repeat;
                     app.ui.shuffle = app.snapshot.shuffle;
@@ -9075,22 +12945,38 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                         app.ui.autoplay = app.snapshot.autoplay;
                         app.ui.save_preferences();
                     }
+                    if queue_track_changed {
+                        let viewport = app.scene.queue_viewport.map_or(0, |r| r.h.max(0) as usize);
+                        let anchor = app
+                            .snapshot
+                            .queue_index
+                            .saturating_mul(72)
+                            .saturating_sub(viewport / 4);
+                        app.ui.queue_scroll = anchor / 24;
+                        app.ui.queue_scroll_offset = anchor % 24;
+                        app.queue_glide = None;
+                    }
                     if !app.snapshot.queue.is_empty() {
                         if queue_data_changed || app.ui.queue.is_empty() {
                             app.ui.queue = (*app.snapshot.queue).clone();
                         }
                         app.ui.queue_index = app.snapshot.queue_index;
-                    } else if app.ui.queue.is_empty() && !app.snapshot.now.id.is_empty() {
+                    } else if !app.snapshot.now.id.is_empty() {
                         app.ui.queue = vec![app.snapshot.now.clone()];
+                        app.ui.queue_index = 0;
+                    } else {
+                        app.ui.queue.clear();
                         app.ui.queue_index = 0;
                     }
                 }
                 if newly_connected {
-                    let q = app.ui.value("Audio quality");
-                    command(
-                        app,
-                        Command::Api("DZSetQuality".into(), vec![serde_json::json!(q)]),
-                    );
+                    if app.ui.provider == crate::catalog::Provider::Deezer {
+                        let q = app.ui.value("Audio quality");
+                        command(
+                            app,
+                            Command::Api("DZSetQuality".into(), vec![serde_json::json!(q)]),
+                        );
+                    }
                     // Preserve the startup page and any navigation made while signing in.
                     app.ui.history.clear();
                     app.navigation.clear();
@@ -9099,8 +12985,10 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                     load_page(app);
                 }
                 if app.lyrics_id != app.snapshot.now.id && !app.snapshot.now.id.is_empty() {
-                    app.ui.lyrics_manual_scroll=false;
-                    if app.ui.view==View::Lyrics{settle_scroll(app,0);}
+                    app.ui.lyrics_manual_scroll = false;
+                    if app.ui.view == View::Lyrics {
+                        settle_scroll(app, 0);
+                    }
                     app.lyrics_id = app.snapshot.now.id.clone();
                     app.ui.lyrics.clear();
                     app.ui.rich_lyrics.clear();
@@ -9131,7 +13019,7 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                                 .any(|line| !line.syllables.is_empty())))
                     && app.playing()
                 {
-                    SetTimer(hwnd, 2, 16, None);
+                    start_animation_timer(hwnd, 2);
                 }
                 if changed || completed {
                     rebuild(hwnd, app);
@@ -9156,7 +13044,140 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
             process_data(hwnd, app);
             0
         }
+        crate::media_controls::MESSAGE => {
+            use crate::media_controls as media;
+            match wp {
+                media::PLAY => {
+                    command(app, Command::SetPlaying(true));
+                }
+                media::PAUSE => {
+                    command(app, Command::SetPlaying(false));
+                }
+                media::NEXT => {
+                    command(app, Command::Next);
+                }
+                media::PREVIOUS => {
+                    command(app, Command::Previous);
+                }
+                media::STOP => {
+                    command(app, Command::Stop);
+                }
+                media::SEEK if app.snapshot.duration > 0 => {
+                    command(
+                        app,
+                        Command::SeekMs((lp.max(0) as u64).min(app.snapshot.duration)),
+                    );
+                }
+                _ => {}
+            }
+            0
+        }
+        WM_HOTKEY => {
+            if let Some(action) = app
+                .shortcuts
+                .as_ref()
+                .and_then(|shortcuts| shortcuts.action(wp))
+            {
+                shortcut_action(hwnd, app, action);
+            }
+            0
+        }
         WM_KEYDOWN => {
+            if let Some(current) = app
+                .canvas_focus
+                .filter(|&index| canvas_track_button(app, index))
+            {
+                if wp == 13 || wp == 32 {
+                    activate_scene_button(hwnd, app, current);
+                    return 0;
+                }
+                if [VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT].contains(&(wp as u16)) {
+                    let origin = app.scene.buttons[current].rect;
+                    let horizontal = wp == VK_LEFT as usize || wp == VK_RIGHT as usize;
+                    let center = if horizontal {
+                        origin.y + origin.h / 2
+                    } else {
+                        origin.x + origin.w / 2
+                    };
+                    let direction = if wp == VK_UP as usize || wp == VK_LEFT as usize {
+                        -1
+                    } else {
+                        1
+                    };
+                    let queue_focus =
+                        matches!(app.scene.buttons[current].action, Action::QueueJump(_));
+                    let next = (0..app.scene.buttons.len())
+                        .filter(|&index| {
+                            let node = &app.scene.buttons[index];
+                            let (start, end, delta) = if horizontal {
+                                (
+                                    node.rect.y,
+                                    node.rect.y + node.rect.h,
+                                    node.rect.x - origin.x,
+                                )
+                            } else {
+                                (
+                                    node.rect.x,
+                                    node.rect.x + node.rect.w,
+                                    node.rect.y - origin.y,
+                                )
+                            };
+                            canvas_track_button(app, index)
+                                && scene_button_enabled(app, index)
+                                && matches!(node.action, Action::QueueJump(_)) == queue_focus
+                                && center >= start
+                                && center < end
+                                && delta * direction > 0
+                        })
+                        .min_by_key(|&index| {
+                            let rect = app.scene.buttons[index].rect;
+                            if horizontal {
+                                (rect.x - origin.x).abs()
+                            } else {
+                                (rect.y - origin.y).abs()
+                            }
+                        });
+                    if let Some(next) = next {
+                        let node = &app.scene.buttons[next];
+                        let key = canvas_action_key(&node.action);
+                        let (w, h) = size(hwnd, app);
+                        let viewport = button_viewport(app, node, w, h);
+                        let adjustment = if node.rect.y < viewport.y {
+                            node.rect.y - viewport.y
+                        } else if node.rect.y + node.rect.h > viewport.y + viewport.h {
+                            node.rect.y + node.rect.h - viewport.y - viewport.h
+                        } else {
+                            0
+                        };
+                        if adjustment != 0 && !queue_focus {
+                            let bottom = content_bottom(app, h);
+                            let target = (app.ui.scroll + adjustment)
+                                .clamp(0, (app.scene.content_height - bottom).max(0));
+                            scroll_to(hwnd, app, target);
+                            settle_scroll(app, target);
+                        }
+                        app.canvas_focus = (0..app.scene.buttons.len()).find(|&index| {
+                            canvas_track_button(app, index)
+                                && canvas_action_matches(&key, &app.scene.buttons[index].action)
+                        });
+                        InvalidateRect(hwnd, null(), 0);
+                    }
+                    return 0;
+                }
+            }
+            if wp == 27 && app.ui.custom_theme_draft.is_some() {
+                app.ui.custom_theme_draft = None;
+                rebuild(hwnd, app);
+                return 0;
+            }
+            if wp == 27
+                && app.ui.device_menu_open
+                && app.ui.provider != crate::catalog::Provider::Spotify
+            {
+                app.ui.device_menu_open = false;
+                rebuild(hwnd, app);
+                return 0;
+            }
             if wp == 27 && app.ui.deezer_login_open {
                 if app.ui.deezer_login_advanced {
                     app.ui.deezer_login_advanced = false;
@@ -9179,12 +13200,27 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
             0
         }
         WM_DESTROY => {
+            gpu::hide();
+            stop_animation_timer(hwnd, 2);
+            stop_animation_timer(hwnd, 4);
+            stop_animation_timer(hwnd, 8);
+            stop_animation_timer(hwnd, 9);
+            if let Some((cancel, _)) = app.spotify_auth.take() {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            app.spotify_service.take();
+            if let Some((cancel, _)) = app.spotify_setup.take() {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            app.media_controls.take();
+            app.shortcuts.take();
             let show_tray = app.ui.show_in_tray;
             app.ui.show_in_tray = false;
             sync_tray(hwnd, app);
             app.ui.show_in_tray = show_tray;
 
             KillTimer(hwnd, 1);
+            KillTimer(hwnd, 6);
             if let Some((_, _, f_act, f_inact, f_plain)) = app.lyrics_fonts {
                 DeleteObject(f_act);
                 DeleteObject(f_inact);
@@ -9237,7 +13273,20 @@ unsafe fn make_fonts(scale: f64) -> [HFONT; 12] {
 
     fonts
 }
+fn startup_provider(deezer_saved: bool, spotify_saved: bool) -> crate::catalog::Provider {
+    if spotify_saved && !deezer_saved {
+        crate::catalog::Provider::Spotify
+    } else {
+        crate::catalog::Provider::Deezer
+    }
+}
+
 pub fn run() -> Result<(), String> {
+    let _ = std::thread::Builder::new()
+        .name("soloist-update".into())
+        .spawn(|| {
+            let _ = crate::spotify::setup::background_update();
+        });
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let controls = INITCOMMONCONTROLSEX {
@@ -9262,37 +13311,67 @@ pub fn run() -> Result<(), String> {
         let fonts = make_fonts(scale);
         let storage_error = crate::storage::initialize().err();
         if let Some(error) = &storage_error {
-            MessageBoxW(null_mut(), wide(error).as_ptr(), wide("DeezNats").as_ptr(), MB_OK | MB_ICONERROR);
+            MessageBoxW(
+                null_mut(),
+                wide(error).as_ptr(),
+                wide("DeezNats").as_ptr(),
+                MB_OK | MB_ICONERROR,
+            );
             if !crate::storage::data_dir().is_ok_and(|path| path.is_dir()) {
                 return Err(error.clone());
             }
         }
         let mut preferences = Ui::load_preferences();
+        preferences.onboarding_open =
+            !crate::session::deezer_saved_exists() && !crate::spotify::api_configured();
+        if let Some(message) = crate::updater::startup_result() {
+            preferences.update.error = message;
+        }
         let initial_volume = preferences.initial_volume;
         let worker = Worker::start();
-        let _ = worker.commands.send(Command::Autoplay(preferences.autoplay));
-        let connect = if preferences.jam_enabled { crate::connect::ConnectHub::start(crate::connect::DEFAULT_PORT, worker.commands.clone()) } else { None };
+        let _ = worker
+            .commands
+            .send(Command::Autoplay(preferences.autoplay));
+        let connect = if preferences.jam_enabled {
+            crate::connect::ConnectHub::start(crate::connect::DEFAULT_PORT, worker.commands.clone())
+        } else {
+            None
+        };
         preferences.jam_enabled = connect.is_some();
-        preferences.jam_url = connect.as_ref().map(|hub| hub.share_url()).unwrap_or_default();
+        preferences.jam_url = connect
+            .as_ref()
+            .map(|hub| hub.share_url())
+            .unwrap_or_default();
         let mut app = Box::new(App {
             queue_drag: None,
             queue_scroll_drag: false,
+            queue_wheel_remainder: 0.0,
+            queue_glide: None,
+            middle_scroll: None,
             caption_buttons: [null_mut(); 3],
             collapse_button: null_mut(),
             tray_added: false,
             search_backdrop: Default::default(),
             worker,
+            updater: crate::updater::Worker::start(),
+            media_controls: None,
+            shortcuts: None,
             connect,
             snapshot: Snapshot::default(),
-            playback_tick: std::time::Instant::now(),
+            playback_clock: PlaybackClock::default(),
             karaoke_preview_started: std::time::Instant::now(),
             lyric_motion: None,
-                lyrics_mode_motion:None,
+            lyrics_mode_motion: None,
             lyric_motion_offset: 0,
             lyric_motion_track: String::new(),
             ui: preferences,
             scene: Scene::default(),
             buttons: Vec::new(),
+            button_text: Vec::new(),
+            canvas_pressed: None,
+            canvas_hover: None,
+            canvas_focus: None,
+            canvas_keyboard: null_mut(),
             edits: HashMap::new(),
             fonts,
             lyrics_fonts: None,
@@ -9300,14 +13379,21 @@ pub fn run() -> Result<(), String> {
             scale,
             acrylic: false,
             pending: None,
-            notice: storage_error.unwrap_or_else(|| "Open your profile to connect to Deezer.".into()),
+            notice: storage_error
+                .unwrap_or_else(|| "Open your profile to connect to Deezer.".into()),
             volume: initial_volume,
             scrolling: false,
-                render_suspended:false,
-                layout_dirty:false,
-                scroll_grab_offset:0,
+            render_suspended: false,
+            layout_dirty: false,
+            scroll_grab_offset: 0,
             catalog: crate::catalog::Worker::start(),
 
+            spotify_service: None,
+            spotify_opened: false,
+            spotify_setup: None,
+            spotify_auth: None,
+            spotify_device_request: None,
+            spotify_jam_request: None,
             deezer_auth: None,
 
             artwork: crate::catalog::Artwork::start(),
@@ -9338,6 +13424,8 @@ pub fn run() -> Result<(), String> {
             scroll_tick: std::time::Instant::now(),
             wheel_remainder: 0.0,
             layout_scroll: 0,
+            artwork_prefetch_scroll: 0,
+            artwork_prefetch_upward: false,
             scroll_started: std::time::Instant::now(),
             backdrop_cache: Default::default(),
             palette_state: Default::default(),
@@ -9353,6 +13441,7 @@ pub fn run() -> Result<(), String> {
             visualizer: crate::visualizer::Visualizer::new(),
             podcast_ids: HashSet::new(),
             library_pending: None,
+            playlist_generation: None,
             discord_seen: serde_json::Value::Null,
             library_loaded: false,
             lyrics_hover_start: std::time::Instant::now(),
@@ -9384,22 +13473,59 @@ pub fn run() -> Result<(), String> {
         if hwnd.is_null() {
             return Err("Could not create native window".into());
         }
+        // Recompute on every launch, using this window's monitor and DPI.
+        // rcWork excludes the taskbar; leave a little room around the window.
+        let mut monitor: MONITORINFO = zeroed();
+        monitor.cbSize = size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(
+            MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
+            &mut monitor,
+        ) != 0
+        {
+            let work = monitor.rcWork;
+            let available_width = (work.right - work.left).max(1);
+            let available_height = (work.bottom - work.top).max(1);
+            let dpi = GetDpiForWindow(hwnd).max(96) as f64 / 96.0;
+            let width = ((1320.0 * dpi).round() as i32).min(available_width * 95 / 100);
+            let height = ((880.0 * dpi).round() as i32).min(available_height * 95 / 100);
+            SetWindowPos(
+                hwnd,
+                null_mut(),
+                work.left + (available_width - width) / 2,
+                work.top + (available_height - height) / 2,
+                width.max(1),
+                height.max(1),
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
         ShowWindow(hwnd, SW_SHOW);
         let mut message = zeroed();
         loop {
-            let result = GetMessageW(&mut message, null_mut(), 0, 0);
+            let result = next_ui_message(&mut message);
             if result < 0 {
                 return Err("Window message loop failed".into());
             }
             if result == 0 {
                 break;
             }
+            if app.ui.shortcut_capture.is_some()
+                && matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN)
+            {
+                if message.lParam & (1 << 30) == 0 {
+                    capture_shortcut(hwnd, &mut app, message.wParam as u32);
+                }
+                continue;
+            }
             if message.message == WM_KEYDOWN && message.wParam == 13 {
                 let focused = windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus();
                 let id = GetDlgCtrlID(focused);
 
                 if id == SESSION {
-                    login(hwnd, &mut app);
+                    if app.ui.provider == crate::catalog::Provider::Spotify {
+                        activate(hwnd, &mut app, Action::SpotifyLogin);
+                    } else {
+                        login(hwnd, &mut app);
+                    }
                     continue;
                 }
 
@@ -9428,18 +13554,600 @@ pub fn run() -> Result<(), String> {
     }
 }
 
+unsafe fn next_ui_message(message: &mut MSG) -> i32 {
+    unsafe { frame_pacing::next_message(message) }
+}
+
 #[cfg(test)]
 mod behavior_tests {
+    use super::*;
+    unsafe fn test_app() -> App {
+        let scale = 1.0;
+        let fonts = make_fonts(scale);
+        App {
+            queue_drag: None,
+            queue_scroll_drag: false,
+            queue_wheel_remainder: 0.0,
+            queue_glide: None,
+            middle_scroll: None,
+            caption_buttons: [null_mut(); 3],
+            collapse_button: null_mut(),
+            tray_added: false,
+            search_backdrop: Default::default(),
+            worker: Worker::start(),
+            updater: crate::updater::Worker::start(),
+            media_controls: None,
+            shortcuts: None,
+            connect: None,
+            snapshot: Snapshot::default(),
+            playback_clock: PlaybackClock::default(),
+            karaoke_preview_started: std::time::Instant::now(),
+            lyric_motion: None,
+            lyrics_mode_motion: None,
+            lyric_motion_offset: 0,
+            lyric_motion_track: String::new(),
+            ui: Ui::default(),
+            scene: Scene::default(),
+            buttons: Vec::new(),
+            button_text: Vec::new(),
+            canvas_pressed: None,
+            canvas_hover: None,
+            canvas_focus: None,
+            canvas_keyboard: null_mut(),
+            edits: HashMap::new(),
+            fonts,
+            lyrics_fonts: None,
+            brush: CreateSolidBrush(rgb(29, 29, 29)),
+            scale,
+            acrylic: false,
+            pending: None,
+            notice: String::new(),
+            volume: 70,
+            scrolling: false,
+            render_suspended: false,
+            layout_dirty: false,
+            scroll_grab_offset: 0,
+            catalog: crate::catalog::Worker::start(),
+            spotify_service: None,
+            spotify_opened: false,
+            spotify_setup: None,
+            spotify_auth: None,
+            spotify_device_request: None,
+            spotify_jam_request: None,
+            deezer_auth: None,
+            artwork: crate::catalog::Artwork::start(),
+            images: HashMap::new(),
+            image_order: VecDeque::new(),
+            image_pending: HashSet::new(),
+            image_retry_at: HashMap::new(),
+            generation: 0,
+            entity: None,
+            query: String::new(),
+            navigation: Vec::new(),
+            lyrics_id: String::new(),
+            background: None,
+            background_source: String::new(),
+            background_requested: false,
+            backdrop_worker: crate::appearance::Worker::start(),
+            previous_background: None,
+            background_transition: BackgroundTransition::Complete,
+            previous_cover: None,
+            cover_source: String::new(),
+            cover_changed: None,
+            custom_background: String::new(),
+            image_times: HashMap::new(),
+            scroll_target: 0,
+            scroll_origin: 0,
+            scroll_position: 0.0,
+            scroll_velocity: 0.0,
+            scroll_tick: std::time::Instant::now(),
+            wheel_remainder: 0.0,
+            layout_scroll: 0,
+            artwork_prefetch_scroll: 0,
+            artwork_prefetch_upward: false,
+            scroll_started: std::time::Instant::now(),
+            backdrop_cache: Default::default(),
+            palette_state: Default::default(),
+            cover_luminance_cache: Default::default(),
+            downloads: crate::downloads::Worker::start(),
+            download_cancels: HashMap::new(),
+            flow_save_expected: None,
+            flow_verify_attempt: 0,
+            search_hint: String::new(),
+            page_cache: VecDeque::new(),
+            toggle_animations: HashMap::new(),
+            eq_drag: None,
+            visualizer: crate::visualizer::Visualizer::new(),
+            podcast_ids: HashSet::new(),
+            library_pending: None,
+            playlist_generation: None,
+            discord_seen: serde_json::Value::Null,
+            library_loaded: false,
+            lyrics_hover_start: std::time::Instant::now(),
+            lyrics_hover_from: 0.0,
+            lyrics_hover_to: 0.0,
+        }
+    }
+
     #[test]
-    fn scrollbar_drag_preserves_grab_position_on_very_long_lists(){
-        let mut scene=Scene::default();scene.content_height=10_000_000;
-        scene.panels.push(ui::Panel{rect:Rect::new(100,190,9,600),kind:5});
-        scene.panels.push(ui::Panel{rect:Rect::new(100,190,9,32),kind:6});
-        let bottom=790;
-        assert_eq!(scrollbar_position(&scene,206,16,bottom),0);
-        assert_eq!(scrollbar_position(&scene,774,16,bottom),scene.content_height-bottom);
-        let middle=scrollbar_position(&scene,490,16,bottom);
-        assert!(middle>4_000_000 && middle<6_000_000);
+    fn queue_rows_use_canvas_hit_testing_outside_main_content() {
+        unsafe {
+            let mut app = test_app();
+            app.scene.buttons = vec![ui::Button {
+                rect: Rect::new(900, 150, 200, 66),
+                action: Action::QueueJump(2),
+                enabled: true,
+                ..Default::default()
+            }];
+            app.scene.content_buttons = 0..0;
+            assert!(canvas_track_button(&app, 0));
+            assert_eq!(canvas_track_hit(&app, 950, 180, 1200, 800), Some(0));
+            assert_eq!(canvas_track_hit(&app, 850, 180, 1200, 800), None);
+        }
+    }
+    #[test]
+    fn queue_wheel_retargeting_keeps_elapsed_time_and_reverses_pending_motion() {
+        let start=std::time::Instant::now();
+        let mut state=None;let mut remainder=0.;
+        for i in 0..8 {
+            let pixels=wheel_pixels(-15,3,600,&mut remainder);
+            assert!(pixels<0);
+            state=Some(retarget_queue_glide(state,100.,pixels,1000.,start+std::time::Duration::from_millis(i)));
+        }
+        let (position,velocity,target,tick)=state.unwrap();
+        assert_eq!(tick,start,"high-resolution input must not restart the frame clock");
+        assert!(target>100.);
+        let (next,speed)=smooth_scroll_step(position,velocity,target,0.016);
+        assert!(next>position&&next<target&&speed>0.);
+        let reversed=retarget_queue_glide(Some((next,speed,target,tick)),next,9,1000.,start+std::time::Duration::from_millis(17));
+        assert!(reversed.2<next&&reversed.1==0.);
+    }
+
+    #[test]
+    #[ignore = "Requires Windows hardware Direct3D and DirectComposition"]
+    fn gpu_pages_render_both_providers_with_acrylic_and_opaque_backgrounds() {
+        unsafe {
+            std::env::set_var("DEEZNATS_TEST_GPU_RENDER","1");
+            let hwnd=CreateWindowExW(0,wide("STATIC").as_ptr(),null(),WS_POPUP,0,0,1000,800,
+                null_mut(),null_mut(),null_mut(),null());
+            assert!(!hwnd.is_null());
+            BufferedPaintInit();
+            let dc=GetDC(hwnd);
+            let mut app=test_app();
+            app.snapshot.connected=true;
+            app.images.insert("fixture-cover".into(),Arc::new(crate::catalog::Bitmap::new(16,16,vec![0xff665544;256])));
+            app.image_times.insert("fixture-cover".into(),std::time::Instant::now());
+            let page=Arc::new(crate::catalog::Page {
+                rows:(0..100).map(|i|crate::catalog::Entry { id:format!("track-{i}"),title:format!("Track {i}"),
+                    subtitle:"Fixture artist".into(),kind:"track".into(),..Default::default() }).collect(),
+                sections:(0..4).map(|section|crate::catalog::Section {
+                    title:format!("Shelf {section}"),entries:(0..12).map(|i|crate::catalog::Entry {
+                        id:format!("playlist-{section}-{i}"),title:format!("A longer playlist title on shelf {section}, item {i}"),
+                        subtitle:"Fixture artist".into(),kind:"playlist".into(),artwork:"fixture-cover".into(),..Default::default()
+                    }).collect(),..Default::default()
+                }).collect(),
+                ..Default::default()
+            });
+            app.ui.queue=page.rows.iter().cloned().map(|mut row|{row.artwork="fixture-cover".into();row}).collect();
+            let mut home=(*page).clone();home.rows.clear();let home=Arc::new(home);
+            for provider in [crate::catalog::Provider::Deezer,crate::catalog::Provider::Spotify] {
+                app.ui.provider=provider;
+                app.snapshot.provider=provider;
+                for acrylic in [false,true] {
+                    app.acrylic=acrylic;
+                    for view in [View::Favorites,View::Home,View::Settings,View::Lyrics] {
+                        app.ui.view=view; app.ui.scroll=0; app.ui.page=Some(if view==View::Home{home.clone()}else{page.clone()});
+                        app.scroll_target=180;app.scroll_position=0.;
+                        app.ui.queue_sidebar_open=view==View::Favorites;
+                        app.ui.queue_scroll=0;app.ui.queue_scroll_offset=0;
+                        reset_marquees();
+                        app.scene=ui::build(&app.ui,(1000,800),true,false,"",false,70);
+                        app.layout_scroll=0;
+                        expand_media_text(&mut app.scene,984);fit_text_links(hwnd,&mut app.scene,&app.fonts,app.scale);
+                        render(hwnd,&app,dc,None);
+                        if view==View::Home {
+                            let art=app.scene.buttons.iter().find(|b|b.artwork=="fixture-cover"&&b.rect.y>=app.scene.content_top&&b.rect.y+50<600).unwrap();
+                            assert_eq!(gpu::snapshot(RECT{left:art.rect.x+30,top:art.rect.y+30,right:art.rect.x+31,bottom:art.rect.y+31}).unwrap()[0],0xff665544,"new catalog artwork must be opaque before entering a retained scroll layer");
+                        }
+                        if view==View::Favorites {
+                            let frame=app.scene.queue_frame.unwrap();
+                            let rect=RECT{left:0,top:0,right:frame.x,bottom:600};
+                            let main_before=gpu::snapshot(rect).unwrap();
+                            let main_label=app.scene.content_labels.clone().next().map(|i|app.scene.labels[i].text.as_ptr());
+                            set_queue_scroll(hwnd,&mut app,73);
+                            assert_eq!(main_label,app.scene.content_labels.clone().next().map(|i|app.scene.labels[i].text.as_ptr()));
+                            let mut dirty=app.rect(frame);let caption=caption_height(hwnd);dirty.top+=caption;dirty.bottom+=caption;
+                            render(hwnd,&app,dc,Some(dirty));
+                            assert_eq!(main_before,gpu::snapshot(rect).unwrap(),"queue scrolling repainted the main page");
+                        }
+                        let snapshot=gpu::snapshot(RECT{left:0,top:0,right:900,bottom:600});
+                        assert!(snapshot.as_ref().is_some_and(|p|p.iter().any(|p|*p!=0)),
+                            "GPU render fell back for {provider:?}, {view:?}, Acrylic={acrylic}");
+                        if matches!(view,View::Favorites|View::Home) {
+                            let caption=caption_height(hwnd);
+                            let region=CreateRectRgn(420,300+caption,800,350+caption);
+                            let second=CreateRectRgn(420,480+caption,800,520+caption);
+                            CombineRgn(region,region,second,RGN_OR);
+                            reset_marquees();
+                            render_region(hwnd,&app,dc,Some(RECT{left:420,top:300+caption,right:800,bottom:520+caption}),region);
+                            DeleteObject(region); DeleteObject(second);
+                            let after=gpu::snapshot(RECT{left:0,top:0,right:900,bottom:600}).unwrap();
+                            let before=snapshot.as_ref().unwrap();
+                            let differences:Vec<_>=before.iter().zip(&after).enumerate().filter(|(_, (a,b))|a!=b).map(|(i,_)|(i%900,i/900)).collect();
+                            let outside=differences.iter().filter(|&&(x,y)|x<420||x>=800||!(300..350).contains(&y)&&!(480..520).contains(&y)).count();
+                            assert_eq!(outside,0,"disjoint repaint erased retained pixels between update rectangles");
+                            let max_delta=differences.iter().flat_map(|&(x,y)|[0,8,16,24].map(|shift|((before[y*900+x]>>shift)&255).abs_diff((after[y*900+x]>>shift)&255))).max().unwrap_or(0);
+                            let worst=differences.iter().max_by_key(|&&(x,y)|[0,8,16,24].map(|shift|((before[y*900+x]>>shift)&255).abs_diff((after[y*900+x]>>shift)&255)).into_iter().max().unwrap()).map(|&(x,y)|(x,y,before[y*900+x],after[y*900+x]));
+                            assert!(max_delta<=1,"partial repaint changed static content by {max_delta} levels at {worst:?}, {provider:?} acrylic={acrylic}");
+                            // A resize can replace the retained surface during
+                            // a partial paint. It must reconstruct the whole
+                            // frame instead of dropping untouched content.
+                            SetWindowPos(hwnd,null_mut(),0,0,1010,810,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+                            render(hwnd,&app,dc,Some(RECT{left:420,top:300+caption,right:800,bottom:520+caption}));
+                            assert!(gpu::snapshot(RECT{left:1000,top:0,right:1010,bottom:600}).is_some(),"resize must rebuild the complete GPU surface");
+                            SetWindowPos(hwnd,null_mut(),0,0,1000,800,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+                            render(hwnd,&app,dc,None);
+                            app.ui.scroll=64;app.scroll_position=64.; shift_scroll_content(&mut app.scene,-64);
+                            let caption=caption_height(hwnd);
+                            let rect=scroll_repaint_rect(&app,1000,800,caption);
+                            render(hwnd,&app,dc,Some(rect));
+                            assert!(gpu::snapshot(RECT{left:0,top:0,right:900,bottom:600}).is_some());
+                            let check=RECT{left:300,top:260,right:650,bottom:560};
+                            let replayed=gpu::snapshot(check).unwrap();
+                            gpu::invalidate_layers();
+                            render(hwnd,&app,dc,Some(rect));
+                            let recaptured=gpu::snapshot(check).unwrap();
+                            let delta=replayed.iter().zip(&recaptured).flat_map(|(a,b)|[0,8,16,24].map(move |shift|((a>>shift)&255).abs_diff((b>>shift)&255))).max().unwrap_or(0);
+                            assert!(delta<=1,"scroll replay differs from fresh capture by {delta}, {provider:?}, {view:?}, acrylic={acrylic}");
+                            for position in [360,720,300,0] {
+                                app.scroll_position=position as f64;
+                                scroll_to(hwnd,&mut app,position);
+                                render(hwnd,&app,dc,None);
+                                let retained=gpu::snapshot(check).unwrap();
+                                let fresh=ui::build(&app.ui,(1000,800),true,false,"",false,70);
+                                let previous=std::mem::replace(&mut app.scene,fresh);
+                                expand_media_text(&mut app.scene,984);fit_text_links(hwnd,&mut app.scene,&app.fonts,app.scale);
+                                gpu::invalidate_main_layer();render(hwnd,&app,dc,None);
+                                let expected=gpu::snapshot(check).unwrap();
+                                let delta=retained.iter().zip(&expected).flat_map(|(a,b)|[0,8,16,24].map(move |shift|((a>>shift)&255).abs_diff((b>>shift)&255))).max().unwrap_or(0);
+                                assert!(delta<=1,"incremental catalog pixels differ from a fresh layout by {delta} at {position}, {provider:?}, {view:?}, acrylic={acrylic}");
+                                app.scene=previous;gpu::invalidate_main_layer();
+                            }
+                        }
+                    }
+                }
+            }
+            gpu::hide(); ReleaseDC(hwnd,dc); DestroyWindow(hwnd); BufferedPaintUnInit();
+            std::env::remove_var("DEEZNATS_TEST_GPU_RENDER");
+        }
+    }
+
+    #[test]
+    fn canvas_hit_tests_header_and_modal_buttons() {
+        unsafe {
+            let mut app = test_app();
+            app.scene.buttons = vec![
+                ui::Button {
+                    rect: Rect::new(20, 20, 80, 30),
+                    action: Action::Back,
+                    enabled: true,
+                    ..Default::default()
+                },
+                ui::Button {
+                    rect: Rect::new(500, 200, 100, 30),
+                    action: Action::Search,
+                    enabled: true,
+                    ..Default::default()
+                },
+            ];
+            app.scene.content_buttons = 0..0;
+            assert_eq!(canvas_track_hit(&app, 40, 30, 1200, 800), Some(0));
+            app.scene.auth_modal = Some((Rect::new(450, 150, 300, 200), 0, 1));
+            assert_eq!(canvas_track_hit(&app, 40, 30, 1200, 800), None);
+            assert_eq!(canvas_track_hit(&app, 550, 210, 1200, 800), Some(1));
+        }
+    }
+
+    #[test]
+    fn lyrics_seek_regions_cannot_steal_floating_controls_or_bottom_strip() {
+        unsafe {
+            let mut app=test_app();
+            app.ui.view=View::Lyrics;
+            app.ui.lyrics_manual_scroll=true;
+            app.ui.lyrics=vec![(0,"First lyric".into()),(1000,"Second lyric".into())];
+            for (w,h) in [(746,490),(1200,800),(1600,1000)] {
+                app.scene=ui::build(&app.ui,(w,h),true,false,"Track",true,70);
+                for action in [Action::ToggleLyricsCoverMode,Action::ToggleQueueSidebar,Action::ToggleLyricsVisualizer] {
+                    let control=app.scene.buttons.iter().position(|b|std::mem::discriminant(&b.action)==std::mem::discriminant(&action)).unwrap();
+                    let rect=app.scene.buttons[control].rect;
+                    let seek=app.scene.buttons.len();
+                    app.scene.buttons.push(ui::Button{rect,action:Action::SeekMs(1000),enabled:true,..Default::default()});
+                    app.scene.content_buttons.end=app.scene.buttons.len();
+                    assert_eq!(canvas_track_hit(&app,rect.x+rect.w/2,rect.y+rect.h/2,w,h),Some(control),"floating lyrics control must win over overlapping seek region");
+                    app.scene.buttons.remove(seek);app.scene.content_buttons.end=app.scene.buttons.len();
+                }
+                let area=app.scene.lyrics_area.unwrap();
+                let seek=app.scene.buttons.len();
+                app.scene.buttons.push(ui::Button{rect:Rect::new(area.x,h-100,area.w,100),action:Action::SeekMs(2000),enabled:true,..Default::default()});
+                app.scene.content_buttons.end=app.scene.buttons.len();
+                assert_eq!(canvas_track_hit(&app,area.x+10,h-80,w,h),Some(seek));
+                assert_ne!(canvas_track_hit(&app,area.x+10,h-30,w,h),Some(seek),"lyric seek must stop at the bottom of the lyrics viewport");
+            }
+        }
+    }
+
+    #[test]
+    fn canvas_action_identity_distinguishes_tracks_and_sort_actions() {
+        use super::*;
+        let track = Action::OpenItem(crate::catalog::Entry {
+            kind: "track".into(),
+            id: "spotify:track:123".into(),
+            ..Default::default()
+        });
+        let other = Action::OpenItem(crate::catalog::Entry {
+            kind: "track".into(),
+            id: "spotify:track:456".into(),
+            ..Default::default()
+        });
+        let key = canvas_action_key(&track);
+        assert!(canvas_action_matches(&key, &track));
+        assert!(!canvas_action_matches(&key, &other));
+        assert!(!canvas_action_matches(
+            &key,
+            &Action::ToggleCheck("spotify:track:123".into())
+        ));
+        assert!(canvas_action_matches(
+            &canvas_action_key(&Action::Sort(4)),
+            &Action::Sort(4)
+        ));
+        assert!(!canvas_action_matches(
+            &canvas_action_key(&Action::Sort(4)),
+            &Action::Sort(5)
+        ));
+    }
+
+    #[test]
+    fn native_control_sync_preserves_visibility_enabled_and_accessible_text() {
+        use super::*;
+        unsafe {
+            let instance = GetModuleHandleW(null());
+            let parent = CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                wide("").as_ptr(),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                100,
+                100,
+                null_mut(),
+                null_mut(),
+                instance,
+                null(),
+            );
+            assert!(!parent.is_null());
+            let button = CreateWindowExW(
+                0,
+                wide("BUTTON").as_ptr(),
+                wide("").as_ptr(),
+                WS_CHILD,
+                0,
+                0,
+                20,
+                20,
+                parent,
+                null_mut(),
+                instance,
+                null(),
+            );
+            assert!(!button.is_null());
+            let mut cached = String::new();
+            assert!(set_cached_control_text(button, &mut cached, "Play"));
+            assert!(!set_cached_control_text(button, &mut cached, "Play"));
+            assert!(set_cached_control_text(button, &mut cached, "Pause"));
+            let mut text = [0u16; 16];
+            let n = GetWindowTextW(button, text.as_mut_ptr(), text.len() as i32);
+            assert_eq!(String::from_utf16_lossy(&text[..n as usize]), "Pause");
+            set_control_visible(button, true);
+            set_control_visible(button, true);
+            assert_ne!(GetWindowLongW(button, GWL_STYLE) as u32 & WS_VISIBLE, 0);
+            set_control_visible(button, false);
+            assert_eq!(GetWindowLongW(button, GWL_STYLE) as u32 & WS_VISIBLE, 0);
+            set_control_enabled(button, false);
+            set_control_enabled(button, false);
+            assert_ne!(GetWindowLongW(button, GWL_STYLE) as u32 & WS_DISABLED, 0);
+            set_control_enabled(button, true);
+            assert_eq!(GetWindowLongW(button, GWL_STYLE) as u32 & WS_DISABLED, 0);
+            DestroyWindow(parent);
+        }
+    }
+
+    #[test]
+    fn lyric_clock_absorbs_sample_jitter_without_jumping_or_reversing() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut clock = super::PlaybackClock::default();
+        clock.sample(1000, start, false);
+        let mut previous = 1000;
+        for frame in 1..=100 {
+            let now = start + Duration::from_millis(frame * 10);
+            let before = clock.position(now, true);
+            if frame % 10 == 0 {
+                let jitter = if frame % 20 == 0 { -35 } else { 25 };
+                clock.sample((1000 + frame as i64 * 10 + jitter) as u64, now, true);
+                assert_eq!(clock.position(now, true), before, "sample must not jump");
+            }
+            let position = clock.position(now, true);
+            assert!(position >= previous, "word animation must not reverse");
+            assert!(position - previous <= 15, "correction must be gradual");
+            previous = position;
+        }
+        assert!(previous.abs_diff(2000) < 50);
+    }
+
+    #[test]
+    fn lyric_clock_crosses_sparse_updates_and_resets_for_discontinuities() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut clock = super::PlaybackClock::default();
+        clock.sample(1000, start, false);
+        assert_eq!(
+            clock.position(start + Duration::from_millis(1000), true),
+            2000
+        );
+        // A real seek must not spend time easing across intervening words.
+        clock.sample(9000, start + Duration::from_secs(1), true);
+        assert_eq!(clock.position(start + Duration::from_secs(1), true), 9000);
+        clock.sample(9050, start + Duration::from_millis(1050), false);
+        assert_eq!(clock.position(start + Duration::from_secs(2), false), 9050);
+        clock.sample(0, start + Duration::from_secs(2), false);
+        assert_eq!(clock.position(start + Duration::from_secs(2), true), 0);
+    }
+
+    #[test]
+    fn minimized_pages_keep_current_and_two_newest() {
+        let mut pages: std::collections::VecDeque<_> = ["old", "current", "recent", "newest"]
+            .into_iter()
+            .map(|key| {
+                (
+                    key.to_owned(),
+                    std::sync::Arc::new(crate::catalog::Page::default()),
+                )
+            })
+            .collect();
+        super::trim_inactive_pages(&mut pages, "current");
+        assert_eq!(
+            pages
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>(),
+            ["current", "recent", "newest"]
+        );
+    }
+    #[test]
+    fn minimized_artwork_preserves_protected_images_and_discards_cold_ones() {
+        let mut images = std::collections::HashMap::new();
+        let mut order = std::collections::VecDeque::new();
+        for key in ["current", "cold", "newer"] {
+            images.insert(
+                key.to_owned(),
+                std::sync::Arc::new(crate::catalog::Bitmap::new(1, 1, vec![0])),
+            );
+            order.push_back(key.to_owned());
+        }
+        let protected = std::collections::HashSet::from(["current".to_owned()]);
+        let removed = super::trim_artwork_entries_to(&mut images, &mut order, &protected, 4);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].0, "cold");
+        assert!(images.contains_key("current"));
+        assert!(images.contains_key("newer"));
+    }
+    #[test]
+    fn native_dpi_preserves_readable_size_and_narrow_layout() {
+        for dpi in [96, 120, 144, 192, 288] {
+            let scale = super::native_ui_scale(dpi);
+            assert_eq!(scale, dpi as f64 / 96.0);
+            // Resizing must change the logical viewport, not shrink its contents.
+            for (width, height) in [(484, 1050), (800, 560), (1320, 800)] {
+                let physical = (
+                    (width as f64 * scale).round(),
+                    (height as f64 * scale).round(),
+                );
+                let viewport = (
+                    (physical.0 / scale).round() as i32,
+                    (physical.1 / scale).round() as i32,
+                );
+                assert_eq!(viewport, (width, height));
+                let mut ui = crate::ui::Ui::default();
+                ui.go(crate::ui::View::Settings);
+                ui.fit_sidebars(viewport.0);
+                let scene = crate::ui::build(&ui, viewport, true, false, "Track", true, 50);
+                for button in &scene.buttons {
+                    assert!(
+                        button.rect.x >= 0 && button.rect.x + button.rect.w <= viewport.0,
+                        "Control exceeds native-DPI viewport at {dpi} DPI: {:?}",
+                        button.rect
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn artwork_trimming_keeps_protected_and_recent_covers() {
+        let mut images = HashMap::new();
+        let mut order = VecDeque::new();
+        let mut protected = HashSet::new();
+        for i in 0..300 {
+            let key = format!("cover-{i}");
+            let image = Arc::new(crate::catalog::Bitmap::new(192, 192, vec![0; 192 * 192]));
+            images.insert(key.clone(), image);
+            order.push_back(key.clone());
+            if i < 20 {
+                protected.insert(key);
+            }
+        }
+        let removed = trim_artwork_entries(&mut images, &mut order, &protected);
+        assert!(!removed.is_empty());
+        assert!(protected.iter().all(|key| images.contains_key(key)));
+        assert!(!images.contains_key("cover-20"));
+        assert!(images.contains_key("cover-299"));
+        let offscreen: usize = images
+            .iter()
+            .filter(|(key, _)| !protected.contains(*key))
+            .map(|(_, image)| image.pixels.len() * 4)
+            .sum();
+        assert!(offscreen <= OFFSCREEN_ARTWORK_BYTES);
+        assert_eq!(order.len(), images.len());
+    }
+    #[test]
+    fn artwork_trimming_never_evicts_protected_images_over_budget() {
+        let image = Arc::new(crate::catalog::Bitmap::new(512, 512, vec![0; 512 * 512]));
+        let mut images = HashMap::new();
+        let mut order = VecDeque::new();
+        let mut protected = HashSet::new();
+        for i in 0..70 {
+            let key = format!("cover-{i}");
+            images.insert(key.clone(), image.clone());
+            order.push_back(key.clone());
+            protected.insert(key);
+        }
+        assert!(trim_artwork_entries(&mut images, &mut order, &protected).is_empty());
+        assert_eq!(images.len(), 70);
+    }
+
+    #[test]
+    fn artwork_grace_defers_soft_trims_but_never_the_hard_budget(){
+        let mut images=HashMap::new();let mut order=VecDeque::new();let mut recent=HashSet::new();
+        for i in 0..50 {let image=Arc::new(crate::catalog::Bitmap::new(512,512,vec![0;512*512]));recent.insert(image.id);let key=i.to_string();images.insert(key.clone(),image);order.push_back(key);}
+        assert!(trim_artwork_recent(&mut images,&mut order,&HashSet::new(),&recent,false).is_empty(),"recent covers need a grace period");
+        assert!(trim_artwork_recent(&mut images,&mut order,&HashSet::new(),&HashSet::new(),true).is_empty(),"routine trimming must wait for scrolling to settle");
+        for i in 50..70 {let image=Arc::new(crate::catalog::Bitmap::new(512,512,vec![0;512*512]));recent.insert(image.id);let key=i.to_string();images.insert(key.clone(),image);order.push_back(key);}
+        assert!(!trim_artwork_recent(&mut images,&mut order,&HashSet::new(),&recent,true).is_empty());
+        assert!(images.values().map(|i|i.pixels.len()*4).sum::<usize>()<=RESIDENT_ARTWORK_BYTES);
+        trim_artwork_recent(&mut images,&mut order,&HashSet::new(),&HashSet::new(),false);
+        assert!(images.values().map(|i|i.pixels.len()*4).sum::<usize>()<=OFFSCREEN_ARTWORK_BYTES);
+    }
+    #[test]
+    fn scrollbar_drag_preserves_grab_position_on_very_long_lists() {
+        let mut scene = Scene::default();
+        scene.content_height = 10_000_000;
+        scene.panels.push(ui::Panel {
+            rect: Rect::new(100, 190, 9, 600),
+            kind: 5,
+        });
+        scene.panels.push(ui::Panel {
+            rect: Rect::new(100, 190, 9, 32),
+            kind: 6,
+        });
+        let bottom = 790;
+        assert_eq!(scrollbar_position(&scene, 206, 16, bottom), 0);
+        assert_eq!(
+            scrollbar_position(&scene, 774, 16, bottom),
+            scene.content_height - bottom
+        );
+        let middle = scrollbar_position(&scene, 490, 16, bottom);
+        assert!(middle > 4_000_000 && middle < 6_000_000);
     }
     #[test]
     fn timed_lyrics_render_full_words_and_real_blur_fixture() {
@@ -9567,7 +14275,7 @@ mod behavior_tests {
             ready_at: None,
         };
         assert_eq!(transition.progress(start), 0.0);
-        assert!((transition.progress(at(BACKGROUND_FADE_OUT_MS/2)) - 0.25).abs() < 0.001);
+        assert!((transition.progress(at(BACKGROUND_FADE_OUT_MS / 2)) - 0.25).abs() < 0.001);
         transition.advance(at(BACKGROUND_FADE_OUT_MS));
         assert!(matches!(
             transition,
@@ -9577,10 +14285,10 @@ mod behavior_tests {
         assert_eq!(transition.progress(at(5000)), 0.5);
         transition.texture_ready(at(5000));
         assert_eq!(transition.progress(at(5000)), 0.5);
-        assert!((transition.progress(at(5000+BACKGROUND_FADE_IN_MS/2)) - 0.75).abs() < 0.001);
-        transition.advance(at(5000+BACKGROUND_FADE_IN_MS));
+        assert!((transition.progress(at(5000 + BACKGROUND_FADE_IN_MS / 2)) - 0.75).abs() < 0.001);
+        transition.advance(at(5000 + BACKGROUND_FADE_IN_MS));
         assert!(matches!(transition, super::BackgroundTransition::Complete));
-        assert_eq!(transition.progress(at(5000+BACKGROUND_FADE_IN_MS)), 1.0);
+        assert_eq!(transition.progress(at(5000 + BACKGROUND_FADE_IN_MS)), 1.0);
     }
 
     #[test]
@@ -9593,10 +14301,17 @@ mod behavior_tests {
             ready_at: None,
         };
         transition.texture_ready(at(20));
-        assert!((transition.progress(at(BACKGROUND_FADE_OUT_MS/2)) - 0.25).abs() < 0.001);
+        assert!((transition.progress(at(BACKGROUND_FADE_OUT_MS / 2)) - 0.25).abs() < 0.001);
         assert_eq!(transition.progress(at(BACKGROUND_FADE_OUT_MS)), 0.5);
-        assert!((transition.progress(at(BACKGROUND_FADE_OUT_MS+BACKGROUND_FADE_IN_MS/2)) - 0.75).abs() < 0.001);
-        assert_eq!(transition.progress(at(BACKGROUND_FADE_OUT_MS+BACKGROUND_FADE_IN_MS)), 1.0);
+        assert!(
+            (transition.progress(at(BACKGROUND_FADE_OUT_MS + BACKGROUND_FADE_IN_MS / 2)) - 0.75)
+                .abs()
+                < 0.001
+        );
+        assert_eq!(
+            transition.progress(at(BACKGROUND_FADE_OUT_MS + BACKGROUND_FADE_IN_MS)),
+            1.0
+        );
 
         // Delivery after fade-out, before a timer tick, starts at delivery time.
         let mut delayed = super::BackgroundTransition::FadeOut {
@@ -9605,7 +14320,7 @@ mod behavior_tests {
         };
         delayed.texture_ready(at(5000));
         assert_eq!(delayed.progress(at(5000)), 0.5);
-        assert!((delayed.progress(at(5000+BACKGROUND_FADE_IN_MS/2)) - 0.75).abs() < 0.001);
+        assert!((delayed.progress(at(5000 + BACKGROUND_FADE_IN_MS / 2)) - 0.75).abs() < 0.001);
     }
 
     #[test]
@@ -9668,28 +14383,40 @@ mod behavior_tests {
                         let mut ui = Ui::default();
                         ui.player_layout = layout;
                         ui.dpi_scale = scale;
-                        ui.now = crate::catalog::Entry {id:"fixture".into(),title:"rodeo dr".into(),subtitle:"Gunna".into(),
-                            raw:serde_json::json!({"explicit":true}),..Default::default()};
-                        let mut scene = ui::build(&ui,(width,700),true,false,&ui.now.title,true,70);
-                        fit_text_links(null_mut(),&mut scene,&fonts,scale);
+                        ui.now = crate::catalog::Entry {
+                            id: "fixture".into(),
+                            title: "rodeo dr".into(),
+                            subtitle: "Gunna".into(),
+                            raw: serde_json::json!({"explicit":true}),
+                            ..Default::default()
+                        };
+                        let mut scene =
+                            ui::build(&ui, (width, 700), true, false, &ui.now.title, true, 70);
+                        fit_text_links(null_mut(), &mut scene, &fonts, scale);
                         let title = scene.player_title.as_ref().unwrap();
                         let label = &scene.labels[title.label];
                         let value = wide(&label.text);
-                        SelectObject(dc,fonts[10]);
+                        SelectObject(dc, fonts[10]);
                         let mut extent: SIZE = zeroed();
-                        GetTextExtentPoint32W(dc,value.as_ptr(),(value.len()-1) as i32,&mut extent);
-                        let needed = ((extent.cx as f64/scale).ceil() as i32).min(title.region.w-58);
+                        GetTextExtentPoint32W(
+                            dc,
+                            value.as_ptr(),
+                            (value.len() - 1) as i32,
+                            &mut extent,
+                        );
+                        let needed =
+                            ((extent.cx as f64 / scale).ceil() as i32).min(title.region.w - 22);
                         assert!(label.rect.w >= needed);
                         let badge = scene.labels[title.badge.unwrap()].rect;
-                        let favorite = scene.buttons[title.favorite].rect;
-                        assert!(label.rect.x+label.rect.w <= badge.x);
-                        assert!(badge.x+badge.w <= favorite.x);
-                        assert!(favorite.x+favorite.w <= title.region.x+title.region.w);
+                        assert!(label.rect.x + label.rect.w <= badge.x);
+                        assert!(badge.x + badge.w <= title.region.x + title.region.w);
                     }
                 }
-                SelectObject(dc,previous);
-                ReleaseDC(null_mut(),dc);
-                for font in fonts {DeleteObject(font);}
+                SelectObject(dc, previous);
+                ReleaseDC(null_mut(), dc);
+                for font in fonts {
+                    DeleteObject(font);
+                }
             }
         }
     }
@@ -9703,9 +14430,21 @@ mod behavior_tests {
             ..Default::default()
         };
         let mut scene = ui::build(&ui, (1400, 900), true, false, &ui.now.title, true, 50);
-        let original = scene.labels.iter().find(|l| l.text == ui.now.title).unwrap().rect;
-        unsafe { expand_media_text(&mut scene, 1384); }
-        let expanded = scene.labels.iter().find(|l| l.text == ui.now.title).unwrap().rect;
+        let original = scene
+            .labels
+            .iter()
+            .find(|l| l.text == ui.now.title)
+            .unwrap()
+            .rect;
+        unsafe {
+            expand_media_text(&mut scene, 1384);
+        }
+        let expanded = scene
+            .labels
+            .iter()
+            .find(|l| l.text == ui.now.title)
+            .unwrap()
+            .rect;
         assert!(expanded.w >= original.w);
         for button in &scene.buttons {
             let r = button.rect;
@@ -9716,7 +14455,9 @@ mod behavior_tests {
         let slot = Rect::new(10, 10, 80, 20);
         let mut empty = Scene::default();
         assert_eq!(available_text_rect(&empty, slot, 400).w, 390);
-        empty.pictures.push((Rect::new(240, 10, 32, 32), String::new()));
+        empty
+            .pictures
+            .push((Rect::new(240, 10, 32, 32), String::new()));
         assert_eq!(available_text_rect(&empty, slot, 400).w, 224);
         empty.pictures[0].0.y = 50;
         assert_eq!(available_text_rect(&empty, slot, 400).w, 390);
@@ -9730,7 +14471,180 @@ mod behavior_tests {
         assert_eq!(super::marquee_offset(4.95, 120.0, 40.0), 0.0);
     }
 
-    use super::*;
+    #[test]
+    fn artist_credit_group_names_scroll_together_with_shared_marquee() {
+        unsafe {
+            let class = wide("ArtistCreditMarqueeTest");
+            let instance = GetModuleHandleW(null());
+            let wnd_class = WNDCLASSEXW {
+                cbSize: size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(DefWindowProcW),
+                hInstance: instance,
+                lpszClassName: class.as_ptr(),
+                ..zeroed()
+            };
+            RegisterClassExW(&wnd_class);
+            let hwnd = CreateWindowExW(
+                0,
+                class.as_ptr(),
+                class.as_ptr(),
+                WS_POPUP,
+                0,
+                0,
+                600,
+                400,
+                null_mut(),
+                null_mut(),
+                instance,
+                null_mut(),
+            );
+            assert!(!hwnd.is_null());
+            let dc = GetDC(hwnd);
+            let mut app = test_app();
+            let fonts = make_fonts(1.0);
+            app.fonts = fonts;
+
+            let group = Rect::new(50, 50, 100, 20);
+            let group_rect = app.rect(group);
+
+            let artists = vec![
+                ui::Button {
+                    text: "Kendrick Lamar".into(),
+                    text_link: true,
+                    rect: Rect::new(50, 50, 60, 20),
+                    artist_credit_group: Some(group),
+                    ..Default::default()
+                },
+                ui::Button {
+                    text: ", SZA".into(),
+                    text_link: true,
+                    rect: Rect::new(110, 50, 40, 20),
+                    artist_credit_group: Some(group),
+                    ..Default::default()
+                },
+            ];
+            app.scene.buttons = artists;
+
+            AUTO_MARQUEES.with(|states| states.borrow_mut().clear());
+
+            let draw0 = DRAWITEMSTRUCT {
+                CtlID: 1000,
+                hwndItem: hwnd,
+                hDC: dc,
+                rcItem: app.rect(app.scene.buttons[0].rect),
+                ..zeroed()
+            };
+            let draw1 = DRAWITEMSTRUCT {
+                CtlID: 1001,
+                hwndItem: hwnd,
+                hDC: dc,
+                rcItem: app.rect(app.scene.buttons[1].rect),
+                ..zeroed()
+            };
+
+            draw_button(hwnd, &app, &draw0);
+            draw_button(hwnd, &app, &draw1);
+
+            let states_count = AUTO_MARQUEES.with(|states| states.borrow().len());
+            assert_eq!(
+                states_count, 1,
+                "both buttons in group must share a single marquee entry"
+            );
+
+            let has_group_key = AUTO_MARQUEES.with(|states| {
+                let states = states.borrow();
+                states.keys().any(|k| {
+                    k.starts_with(&format!(
+                        "group:{}:{}:{}:{}",
+                        group_rect.left, group_rect.top, group_rect.right, group_rect.bottom
+                    ))
+                })
+            });
+            assert!(
+                has_group_key,
+                "group marquee key must match group rectangle"
+            );
+
+            ReleaseDC(hwnd, dc);
+            for f in fonts {
+                DeleteObject(f);
+            }
+            DestroyWindow(hwnd);
+            UnregisterClassW(class.as_ptr(), instance);
+            let mut msg: MSG = zeroed();
+            while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {}
+        }
+    }
+
+    #[test]
+    fn marquee_timer_invalidates_partial_rect_instead_of_full_window() {
+        unsafe {
+            let class = wide("MarqueePartialInvalidationTest");
+            let instance = GetModuleHandleW(null());
+            let wnd_class = WNDCLASSEXW {
+                cbSize: size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(procedure),
+                hInstance: instance,
+                lpszClassName: class.as_ptr(),
+                ..zeroed()
+            };
+            RegisterClassExW(&wnd_class);
+            let mut app = Box::new(test_app());
+            let hwnd = CreateWindowExW(
+                0,
+                class.as_ptr(),
+                class.as_ptr(),
+                WS_POPUP,
+                100,
+                100,
+                800,
+                600,
+                null_mut(),
+                null_mut(),
+                instance,
+                (&mut *app as *mut App).cast::<c_void>(),
+            );
+            assert!(!hwnd.is_null());
+
+            let target_rect = RECT {
+                left: 40,
+                top: 80,
+                right: 200,
+                bottom: 100,
+            };
+            // Hidden windows do not reliably retain a Win32 update region.
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            UpdateWindow(hwnd);
+            AUTO_MARQUEES.with(|states| {
+                let mut states = states.borrow_mut();
+                states.clear();
+                let now = std::time::Instant::now();
+                states.insert("test_key".into(), (target_rect, now, now));
+            });
+
+            ValidateRect(hwnd, null());
+
+            SendMessageW(hwnd, WM_TIMER, 4, 0);
+
+            let mut update: RECT = zeroed();
+            GetUpdateRect(hwnd, &mut update, 0);
+
+            let caption = caption_height(hwnd);
+            assert_eq!(update.left, target_rect.left);
+            assert_eq!(update.top, target_rect.top + caption);
+            assert_eq!(update.right, target_rect.right);
+            assert_eq!(update.bottom, target_rect.bottom + caption);
+
+            let mut client: RECT = zeroed();
+            GetClientRect(hwnd, &mut client);
+            assert!(update.right < client.right);
+            assert!(update.bottom < client.bottom);
+
+            DestroyWindow(hwnd);
+            UnregisterClassW(class.as_ptr(), instance);
+        }
+    }
+
     #[test]
     fn word_renderer_advances_individual_words_at_native_screen_offsets() {
         unsafe {
@@ -9799,7 +14713,10 @@ mod behavior_tests {
         };
         assert!((simulate(60) - simulate(144)).abs() < 0.01);
         assert!(simulate(60) > 980.0);
-        assert!(smooth_scroll_step(0.,0.,1000.,0.016).0<50.,"wheel motion should ease into the first frame");
+        assert!(
+            smooth_scroll_step(0., 0., 1000., 0.016).0 < 50.,
+            "wheel motion should ease into the first frame"
+        );
         assert!(smooth_scroll_step(100.0, 0.0, 0.0, 0.016).0 < 100.0);
         let mut remainder = 0.0;
         let small: i32 = (0..120)
@@ -9808,6 +14725,60 @@ mod behavior_tests {
         assert!((small - 84).abs() <= 1);
         assert_eq!(wheel_pixels(120, 3, 400, &mut 0.0), 84);
         assert_eq!(wheel_pixels(120, u32::MAX, 400, &mut 0.0), 400);
+    }
+
+    #[test]
+    fn scrollbar_presentation_keeps_fractional_motion_for_main_and_queue() {
+        unsafe {
+            let mut app=test_app();
+            app.scene.content_top=100;app.scene.content_height=10000;
+            app.scene.panels.push(ui::Panel{rect:Rect::new(950,100,9,500),kind:5});
+            let main=ui::Panel{rect:Rect::new(950,100,9,32),kind:6};
+            app.ui.smooth_scrolling=true;app.ui.scroll=100;app.scroll_position=100.25;app.scroll_target=500;
+            let first=shown_scrollbar_y(&app,&main,800).unwrap();
+            app.scroll_position=100.75;
+            let next=shown_scrollbar_y(&app,&main,800).unwrap();
+            assert!(next>first&&next-first<1.);
+            app.scene.queue_scrollbar=Some(Rect::new(970,100,8,500));app.scene.queue_scroll_max=1000;
+            let queue=ui::Panel{rect:Rect::new(970,100,8,24),kind:17};
+            app.queue_glide=Some((100.25,100.,500.,std::time::Instant::now()));
+            let first=shown_scrollbar_y(&app,&queue,800).unwrap();
+            app.queue_glide.as_mut().unwrap().0=100.75;
+            let next=shown_scrollbar_y(&app,&queue,800).unwrap();
+            assert!(next>first&&next-first<1.);
+            assert_eq!(scrollbar_thumb_y(100.,500.,32.,30000.,1000.),568.);
+        }
+    }
+
+    #[test]
+    fn animation_timer_yields_to_queued_input() {
+        unsafe {
+            let hwnd = CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                wide("timer-input-test").as_ptr(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                null_mut(),
+                GetModuleHandleW(null()),
+                null_mut(),
+            );
+            assert!(!hwnd.is_null());
+            start_animation_timer(hwnd, 2);
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            assert_ne!(PostMessageW(hwnd, WM_KEYDOWN, VK_DOWN as usize, 0), 0);
+            let mut message: MSG = zeroed();
+            assert_ne!(PeekMessageW(&mut message, hwnd, 0, 0, PM_REMOVE), 0);
+            assert_eq!(message.message, WM_KEYDOWN);
+            assert_ne!(PeekMessageW(&mut message, hwnd, 0, 0, PM_REMOVE), 0);
+            assert_eq!(message.message, WM_TIMER);
+            stop_animation_timer(hwnd, 2);
+            DestroyWindow(hwnd);
+        }
     }
     #[test]
     fn scroll_retargeting_preserves_momentum_and_settles_without_overshoot() {
@@ -9826,7 +14797,7 @@ mod behavior_tests {
 
     #[test]
     fn settings_scroll_translation_matches_layout_and_keeps_tabs_fixed() {
-        for tab in 0..6 {
+        for tab in 0..ui::TABS.len() {
             let mut ui = Ui {
                 view: View::Settings,
                 sidebar_collapsed: true,
@@ -9863,7 +14834,13 @@ mod behavior_tests {
     }
     #[test]
     fn buffered_scroll_moves_only_content_and_keeps_visible_rows_available() {
+        for provider in [crate::catalog::Provider::Deezer, crate::catalog::Provider::Spotify] {
+            check_buffered_scroll_for_provider(provider);
+        }
+    }
+    fn check_buffered_scroll_for_provider(provider: crate::catalog::Provider) {
         let mut ui = Ui {
+            provider,
             view: View::Favorites,
             page: Some(Arc::new(crate::catalog::Page {
                 rows: (0..1000)
@@ -9918,6 +14895,48 @@ mod behavior_tests {
                 == player
         );
         eprintln!("64 buffered scroll frames: {translation:?}; one full layout: {layout:?}");
+    }
+
+    #[test]
+    fn scroll_overscan_covers_rows_until_the_next_layout_in_both_directions() {
+        let mut ui = Ui {
+            view: View::Favorites,
+            page: Some(Arc::new(crate::catalog::Page {
+                rows: (0..1000)
+                    .map(|i| crate::catalog::Entry {
+                        id: format!("{i}"),
+                        title: format!("Track {i}"),
+                        kind: "track".into(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        for origin in [0, 30_000] {
+            for delta in [-(ui::SCROLL_OVERSCAN - 33), ui::SCROLL_OVERSCAN - 33] {
+                ui.scroll = origin;
+                let mut buffered = ui::build(&ui, (1200, 800), true, false, "", false, 50);
+                ui.scroll = (origin + delta).max(0);
+                shift_scroll_content(&mut buffered, origin - ui.scroll);
+                let fresh = ui::build(&ui, (1200, 800), true, false, "", false, 50);
+                for button in fresh.buttons.iter().filter(|button| {
+                    button.rect.y + button.rect.h > fresh.content_top && button.rect.y < 676
+                }) {
+                    if let Action::OpenItem(entry) = &button.action {
+                        let cached = buffered.buttons.iter().find(|button| matches!(&button.action, Action::OpenItem(other) if other.id == entry.id));
+                        assert_eq!(
+                            cached.map(|button| button.rect),
+                            Some(button.rect),
+                            "missing buffered row {} after scrolling {origin} -> {}",
+                            entry.id,
+                            ui.scroll
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -9984,7 +15003,7 @@ mod behavior_tests {
                     } else {
                         assert!(rects.iter().all(|r| r.right < 300));
                     }
-                    if !right {
+                    if !right || traffic {
                         assert!(rects[2].left < rects[0].left && rects[0].left < rects[1].left);
                     } else {
                         assert!(rects[0].left < rects[1].left && rects[1].left < rects[2].left);
@@ -10106,6 +15125,28 @@ mod behavior_tests {
                     backdrop.pixels.as_slice(),
                     "clearing text left stale pixels"
                 );
+                SendMessageW(
+                    edit,
+                    EM_SETCUEBANNER,
+                    1,
+                    wide("Search...").as_ptr() as isize,
+                );
+                paint_search_edit(edit, dc, bits.cast(), 240, &backdrop, rgb(240, 240, 240));
+                let pixels = std::slice::from_raw_parts(bits.cast::<u32>(), 7200);
+                assert!(
+                    pixels.iter().zip(&backdrop.pixels).any(|(a, b)| a != b),
+                    "cue banner was not drawn"
+                );
+                for y in 0..30 {
+                    for x in 200..240 {
+                        let i = y * 240 + x;
+                        assert_eq!(
+                            pixels[i], backdrop.pixels[i],
+                            "cue banner painted an opaque background"
+                        );
+                    }
+                }
+                SendMessageW(edit, EM_SETCUEBANNER, 1, wide("").as_ptr() as isize);
             }
             SelectObject(dc, previous);
             DeleteObject(bitmap);
@@ -10113,6 +15154,17 @@ mod behavior_tests {
             DestroyWindow(parent);
             UnregisterClassW(name.as_ptr(), instance);
         }
+    }
+
+    #[test]
+    fn backdrop_copy_supports_packed_and_padded_buffers() {
+        let source = [1, 2, 3, 4, 5, 6];
+        let mut packed = [0; 6];
+        copy_backdrop(&source, &mut packed, 3, 2, 3);
+        assert_eq!(packed, source);
+        let mut padded = [9; 10];
+        copy_backdrop(&source, &mut padded, 3, 2, 5);
+        assert_eq!(padded, [1, 2, 3, 9, 9, 4, 5, 6, 9, 9]);
     }
 
     #[test]
@@ -10155,8 +15207,11 @@ mod behavior_tests {
                             frame.fill_buffer(&mut dest, width, height, offset, full_height);
                             for y in 0..height {
                                 for x in 0..width {
-                                    assert_eq!(dest[(y * width + x) as usize], frame.pixel(x, y + offset, width, full_height),
-                                        "progress={progress}, opacity={opacity}, brightness={brightness}, x={x}, y={y}");
+                                    assert_eq!(
+                                        dest[(y * width + x) as usize],
+                                        frame.pixel(x, y + offset, width, full_height),
+                                        "progress={progress}, opacity={opacity}, brightness={brightness}, x={x}, y={y}"
+                                    );
                                 }
                             }
                             assert_eq!(dest[len], 0x12345678);
@@ -10371,6 +15426,28 @@ mod behavior_tests {
         assert_eq!(slider_value(106, 1010, 5, SEEK_STEPS), 1010);
     }
     #[test]
+    fn track_info_play_button_is_not_a_track_row() {
+        let mut ui = ui::Ui::default();
+        ui.view = View::TrackInfo;
+        ui.track_info = Some((
+            crate::catalog::Entry {
+                id: "1".into(),
+                title: "Song".into(),
+                kind: "track".into(),
+                ..Default::default()
+            },
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        ));
+        let scene = ui::build(&ui, (1200, 800), true, false, "", false, 50);
+        let button = scene
+            .buttons
+            .iter()
+            .find(|button| button.text == "Play track")
+            .unwrap();
+        assert!(!is_track_row(button));
+    }
+    #[test]
     fn library_routes_podcasts_albums_and_tracks_to_the_right_apis() {
         use serde_json::json;
         for (kind, expected) in [
@@ -10503,21 +15580,32 @@ mod behavior_tests {
             let mut app = Box::new(App {
                 queue_drag: None,
                 queue_scroll_drag: false,
+                queue_wheel_remainder: 0.0,
+                queue_glide: None,
+                middle_scroll: None,
                 caption_buttons: [null_mut(); 3],
                 collapse_button: null_mut(),
                 tray_added: false,
                 search_backdrop: Default::default(),
                 worker: Worker::start(),
+                updater: crate::updater::Worker::start(),
+                media_controls: None,
+                shortcuts: None,
                 snapshot: Snapshot::default(),
-                playback_tick: std::time::Instant::now(),
+                playback_clock: PlaybackClock::default(),
                 karaoke_preview_started: std::time::Instant::now(),
                 lyric_motion: None,
-                lyrics_mode_motion:None,
+                lyrics_mode_motion: None,
                 lyric_motion_offset: 0,
                 lyric_motion_track: String::new(),
                 ui,
                 scene: Scene::default(),
                 buttons: Vec::new(),
+                button_text: Vec::new(),
+                canvas_pressed: None,
+                canvas_hover: None,
+                canvas_focus: None,
+                canvas_keyboard: null_mut(),
                 edits: HashMap::new(),
                 fonts,
                 lyrics_fonts: None,
@@ -10528,18 +15616,24 @@ mod behavior_tests {
                 notice: String::new(),
                 volume: 70,
                 scrolling: false,
-                render_suspended:false,
-                layout_dirty:false,
-                scroll_grab_offset:0,
+                render_suspended: false,
+                layout_dirty: false,
+                scroll_grab_offset: 0,
                 catalog: crate::catalog::Worker::start(),
 
+                spotify_service: None,
+                spotify_opened: false,
+                spotify_setup: None,
+                spotify_auth: None,
+                spotify_device_request: None,
+                spotify_jam_request: None,
                 deezer_auth: None,
 
                 artwork: crate::catalog::Artwork::start(),
                 images: HashMap::new(),
                 image_order: VecDeque::new(),
                 image_pending: HashSet::new(),
-            image_retry_at: HashMap::new(),
+                image_retry_at: HashMap::new(),
                 generation: 0,
                 entity: None,
                 query: String::new(),
@@ -10563,6 +15657,8 @@ mod behavior_tests {
                 scroll_tick: std::time::Instant::now(),
                 wheel_remainder: 0.0,
                 layout_scroll: 0,
+                artwork_prefetch_scroll: 0,
+                artwork_prefetch_upward: false,
                 scroll_started: std::time::Instant::now(),
                 backdrop_cache: Default::default(),
                 palette_state: Default::default(),
@@ -10578,6 +15674,7 @@ mod behavior_tests {
                 visualizer: crate::visualizer::Visualizer::new(),
                 podcast_ids: HashSet::new(),
                 library_pending: None,
+                playlist_generation: None,
                 discord_seen: serde_json::Value::Null,
                 library_loaded: false,
                 lyrics_hover_start: std::time::Instant::now(),
@@ -10600,6 +15697,565 @@ mod behavior_tests {
                 (&mut *app as *mut App).cast::<c_void>(),
             );
             assert!(!hwnd.is_null());
+            if std::env::var_os("DEEZNATS_TEST_ARTWORK_SCROLL").is_some() {
+                let streaming = std::env::var_os("DEEZNATS_TEST_ARTWORK_ARRIVALS").is_some();
+                let grid = std::env::var_os("DEEZNATS_TEST_ARTWORK_GRID").is_some();
+                let shelves = std::env::var_os("DEEZNATS_TEST_ARTWORK_SHELVES").is_some();
+                let discovery = std::env::var_os("DEEZNATS_TEST_ARTWORK_DISCOVERY").is_some();
+                let (arrivals, updates) = std::sync::mpsc::channel();
+                let (requests, _unused_requests) = std::sync::mpsc::sync_channel(1);
+                app.artwork = crate::catalog::Artwork::fixture(requests, updates);
+                app.ui.view = View::Favorites;
+                app.ui.page = Some(Arc::new(crate::catalog::Page {
+                    title: "Artwork scrolling benchmark".into(),
+                    rows: (0..1000)
+                        .map(|i| crate::catalog::Entry {
+                            id: format!("scroll-track-{i}"),
+                            title: format!("Artwork track {i}"),
+                            subtitle: "Background benchmark".into(),
+                            artwork: format!("scroll-art-{}", i % 80),
+                            kind: "track".into(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                }));
+                if grid {
+                    app.ui.view = View::Home;
+                    app.ui.shelf_rows.insert("Catalogue".into(), 80);
+                    app.ui.page = Some(Arc::new(crate::catalog::Page {
+                        title: "Artwork catalogue benchmark".into(),
+                        sections: vec![crate::catalog::Section {
+                            title: "Catalogue".into(),
+                            entries: (0..160)
+                                .map(|i| crate::catalog::Entry {
+                                    id: format!("scroll-album-{i}"),
+                                    title: format!("Album {i}"),
+                                    artwork: format!("scroll-art-{}", i % 80),
+                                    kind: "album".into(),
+                                    ..Default::default()
+                                })
+                                .collect(),
+                            ..Default::default()
+                        }],
+                        raw: vec![("catalogue".into(), serde_json::json!(true))],
+                        ..Default::default()
+                    }));
+                }
+                if shelves || discovery {
+                    app.ui.view = if discovery { View::Explore } else { View::Home };
+                    app.ui.page = Some(Arc::new(crate::catalog::Page {
+                        title: "Home and Discovery scrolling benchmark".into(),
+                        sections: (0..20)
+                            .map(|section| crate::catalog::Section {
+                                title: format!("Recommended collection {section}"),
+                                entries: (0..12)
+                                    .map(|item| crate::catalog::Entry {
+                                        id: format!("collection-{section}-{item}"),
+                                        title: format!("Collection {section} album {item}"),
+                                        subtitle: "Recommended for you".into(),
+                                        artwork: format!(
+                                            "scroll-art-{}",
+                                            (section * 12 + item) % 80
+                                        ),
+                                        kind: if discovery { "channel" } else { "album" }.into(),
+                                        ..Default::default()
+                                    })
+                                    .collect(),
+                                ..Default::default()
+                            })
+                            .collect(),
+                        raw: if discovery {
+                            vec![("discover".into(), serde_json::json!(true))]
+                        } else {
+                            vec![]
+                        },
+                        ..Default::default()
+                    }));
+                }
+                for i in 0..80 {
+                    let key = format!("scroll-art-{i}");
+                    let pixels = (0..192 * 192)
+                        .map(|p| 0xff000000 | (((p + i * 31) as u32 * 7919) & 0xffffff))
+                        .collect();
+                    let bitmap = Arc::new(crate::catalog::Bitmap::new(192, 192, pixels));
+                    if streaming {
+                        app.image_pending.insert(key.clone());
+                        arrivals.send((key, Ok(bitmap))).unwrap();
+                    } else {
+                        app.images.insert(key.clone(), bitmap);
+                        app.image_order.push_back(key);
+                    }
+                }
+                app.ui.queue_sidebar_open = false;
+                rebuild(hwnd, &mut app);
+                if std::env::var_os("DEEZNATS_TEST_HOME_PREFETCH").is_some() {
+                    assert!(matches!(app.ui.view, View::Home | View::Explore));
+                    let (requests, queued) = std::sync::mpsc::sync_channel(48);
+                    let (_updates_sender, updates) = std::sync::mpsc::channel();
+                    app.artwork = crate::catalog::Artwork::fixture(requests, updates);
+                    app.image_pending.clear();
+                    app.images.clear();
+                    app.image_order.clear();
+                    let original_layout = app.layout_scroll;
+                    scroll_to(hwnd, &mut app, 96);
+                    assert_eq!(
+                        app.layout_scroll, original_layout,
+                        "prefetch must not force a layout rebuild"
+                    );
+                    assert_eq!(app.artwork_prefetch_scroll, 96);
+                    assert!(!app.artwork_prefetch_upward);
+                    let (_, height) = size(hwnd, &app);
+                    let mut visible: HashSet<String> = app
+                        .scene
+                        .buttons
+                        .iter()
+                        .filter(|node| {
+                            !node.artwork.is_empty()
+                                && (matches!(node.action, Action::Go(View::Account))
+                                    || (node.rect.y + node.rect.h > app.scene.content_top - 160
+                                        && node.rect.y < height + 36))
+                        })
+                        .map(|node| node.artwork.clone())
+                        .collect();
+                    visible.extend(
+                        app.scene
+                            .pictures
+                            .iter()
+                            .filter(|(rect, _)| rect.y + rect.h > 0 && rect.y < height + 36)
+                            .map(|(_, url)| url.clone()),
+                    );
+                    if !app.ui.now.artwork.is_empty() {
+                        visible.insert(app.ui.now.artwork.clone());
+                    }
+                    let records: Vec<_> = queued.try_iter().collect();
+                    assert!(
+                        !records.is_empty(),
+                        "scroll must submit missing artwork before the next layout rebuild"
+                    );
+                    let mut ahead = false;
+                    for request in records {
+                        if visible.contains(&request.key) {
+                            assert!(!ahead, "visible covers must precede speculative covers");
+                        } else {
+                            ahead = true;
+                        }
+                    }
+                    app.image_pending = (0..12)
+                        .map(|index| format!("unrelated-pending-{index}"))
+                        .collect();
+                    scroll_to(hwnd, &mut app, 0);
+                    assert!(app.artwork_prefetch_upward);
+                    assert_eq!(app.artwork_prefetch_scroll, 0);
+                    let mut visible: HashSet<String> = app
+                        .scene
+                        .buttons
+                        .iter()
+                        .filter(|node| {
+                            !node.artwork.is_empty()
+                                && (matches!(node.action, Action::Go(View::Account))
+                                    || (node.rect.y + node.rect.h > app.scene.content_top - 160
+                                        && node.rect.y < height + 36))
+                        })
+                        .map(|node| node.artwork.clone())
+                        .collect();
+                    visible.extend(
+                        app.scene
+                            .pictures
+                            .iter()
+                            .filter(|(rect, _)| rect.y + rect.h > 0 && rect.y < height + 36)
+                            .map(|(_, url)| url.clone()),
+                    );
+                    if !app.ui.now.artwork.is_empty() {
+                        visible.insert(app.ui.now.artwork.clone());
+                    }
+                    let urgent: Vec<_> = queued.try_iter().collect();
+                    assert!(
+                        !urgent.is_empty(),
+                        "visible covers must still be queued when speculative capacity is full"
+                    );
+                    assert!(
+                        urgent.iter().all(|request| visible.contains(&request.key)),
+                        "speculative work must not crowd out visible covers"
+                    );
+                    DestroyWindow(hwnd);
+                    UnregisterClassW(class.as_ptr(), instance);
+                    return;
+                }
+                if std::env::var_os("DEEZNATS_TEST_CANVAS_TRACKS").is_some() {
+                    let (w, h) = size(hwnd, &app);
+                    let index = app
+                        .scene
+                        .content_buttons
+                        .clone()
+                        .find(|&index| {
+                            let node = &app.scene.buttons[index];
+                            if !matches!(node.action, Action::ToggleCheck(_)) {
+                                return false;
+                            }
+                            let x = node.rect.x + node.rect.w / 2;
+                            let y = node.rect.y + node.rect.h / 2;
+                            canvas_track_hit(&app, x, y, w, h) == Some(index)
+                        })
+                        .expect("visible canvas checkbox");
+                    assert!(
+                        app.buttons[index].is_null()
+                            || GetWindowLongW(app.buttons[index], GWL_STYLE) as u32 & WS_VISIBLE
+                                == 0
+                    );
+                    let id = match &app.scene.buttons[index].action {
+                        Action::ToggleCheck(id) => id.clone(),
+                        _ => unreachable!(),
+                    };
+                    let rect = app.scene.buttons[index].rect;
+                    let x = app.px(rect.x + rect.w / 2);
+                    let y = app.px(rect.y + rect.h / 2) + caption_height(hwnd);
+                    let point = ((y as u32 & 0xffff) << 16 | (x as u32 & 0xffff)) as isize;
+                    app.scene.buttons[index].enabled = false;
+                    assert_ne!(
+                        canvas_track_hit(&app, rect.x + rect.w / 2, rect.y + rect.h / 2, w, h),
+                        Some(index)
+                    );
+                    app.scene.buttons[index].enabled = true;
+                    SendMessageW(hwnd, WM_LBUTTONDOWN, 0, point);
+                    SendMessageW(hwnd, WM_LBUTTONUP, 0, 0);
+                    assert!(
+                        !app.ui.checked_ids.contains(&id),
+                        "release outside must cancel the click"
+                    );
+                    SendMessageW(hwnd, WM_MOUSEMOVE, 0, point);
+                    assert_eq!(app.canvas_hover, Some(index));
+                    SendMessageW(hwnd, WM_LBUTTONDOWN, 0, point);
+                    assert_eq!(
+                        app.canvas_pressed.as_ref().map(|value| value.0),
+                        Some(index)
+                    );
+                    SendMessageW(hwnd, WM_LBUTTONUP, 0, point);
+                    assert!(app.ui.checked_ids.contains(&id));
+                    assert!(!app.canvas_keyboard.is_null());
+                    let mut message: MSG = zeroed();
+                    message.message = WM_KEYDOWN;
+                    message.wParam = 13;
+                    assert_ne!(
+                        SendMessageW(
+                            app.canvas_keyboard,
+                            WM_GETDLGCODE,
+                            0,
+                            (&message as *const MSG) as isize
+                        ) as u32
+                            & DLGC_WANTMESSAGE,
+                        0
+                    );
+                    let focused = app
+                        .canvas_focus
+                        .expect("clicked canvas item must retain keyboard focus");
+                    SendMessageW(app.canvas_keyboard, WM_KEYDOWN, VK_DOWN as usize, 0);
+                    assert_ne!(
+                        app.canvas_focus,
+                        Some(focused),
+                        "down arrow should advance to the next row"
+                    );
+                    assert!(app
+                        .canvas_focus
+                        .is_some_and(|next| canvas_track_button(&app, next)));
+                    let sort = app
+                        .scene
+                        .content_buttons
+                        .clone()
+                        .find(|&candidate| {
+                            let node = &app.scene.buttons[candidate];
+                            if !matches!(node.action, Action::Sort(1)) {
+                                return false;
+                            }
+                            canvas_track_hit(
+                                &app,
+                                node.rect.x + node.rect.w / 2,
+                                node.rect.y + node.rect.h / 2,
+                                w,
+                                h,
+                            ) == Some(candidate)
+                        })
+                        .expect("visible sort control");
+                    let sort_rect = app.scene.buttons[sort].rect;
+                    let sort_x = app.px(sort_rect.x + sort_rect.w / 2);
+                    let sort_y = app.px(sort_rect.y + sort_rect.h / 2) + caption_height(hwnd);
+                    let sort_point =
+                        ((sort_y as u32 & 0xffff) << 16 | (sort_x as u32 & 0xffff)) as isize;
+                    SendMessageW(hwnd, WM_LBUTTONDOWN, 0, sort_point);
+                    SendMessageW(hwnd, WM_LBUTTONUP, 0, sort_point);
+                    assert_eq!(app.ui.sort_column, 1);
+                    for view in [
+                        View::Home,
+                        View::Explore,
+                        View::Favorites,
+                        View::Recent,
+                        View::Offline,
+                        View::Flow,
+                        View::FlowTune,
+                        View::StyleMix,
+                        View::Podcasts,
+                        View::Albums,
+                        View::Playlists,
+                        View::PlaylistPicker,
+                        View::Queue,
+                        View::Album,
+                        View::Artist,
+                        View::Show,
+                        View::Settings,
+                    ] {
+                        app.ui.view = view;
+                        assert!(canvas_track_button(&app, index), "{view:?}");
+                    }
+                    app.ui.view = View::Favorites;
+                }
+                assert!(
+                    app.scene.content_height > 3000,
+                    "scroll benchmark must exercise a long list or catalogue"
+                );
+                assert!(
+                    !app.scene.pictures.is_empty()
+                        || app
+                            .scene
+                            .buttons
+                            .iter()
+                            .any(|button| !button.artwork.is_empty()),
+                    "scroll benchmark must include artwork"
+                );
+                let dc = GetDC(hwnd);
+                let memory = CreateCompatibleDC(dc);
+                let target = CreateCompatibleBitmap(dc, 1280, 1040);
+                let previous = SelectObject(memory, target);
+                let mut samples = Vec::new();
+                for frame in 0..240 {
+                    let started = std::time::Instant::now();
+                    if streaming {
+                        process_data(hwnd, &mut app);
+                    }
+                    crate::drawing::poll_prepared_artwork();
+                    scroll_to(hwnd, &mut app, frame * 12);
+                    let paint_rect =
+                        std::env::var_os("DEEZNATS_TEST_PARTIAL_ARTWORK_SCROLL").map(|_| {
+                            let (_, height) = size(hwnd, &app);
+                            let mut client: RECT = zeroed();
+                            GetClientRect(hwnd, &mut client);
+                            scroll_repaint_rect(&app, client.right, height, caption_height(hwnd))
+                        });
+                    render(hwnd, &app, memory, paint_rect);
+                    GdiFlush();
+                    samples.push(started.elapsed().as_secs_f64() * 1000.0);
+                }
+                samples.sort_by(f64::total_cmp);
+                eprintln!(
+                    "ARTWORK_SCROLL 80 covers / 240 frames (grid={grid}, shelves={shelves}, discovery={discovery}, streaming={streaming}): median={:.2}ms p95={:.2}ms max={:.2}ms",
+                    samples[120], samples[228], samples[239]
+                );
+                SelectObject(memory, previous);
+                DeleteObject(target);
+                DeleteDC(memory);
+                ReleaseDC(hwnd, dc);
+                DestroyWindow(hwnd);
+                UnregisterClassW(class.as_ptr(), instance);
+                return;
+            }
+
+            if std::env::var_os("DEEZNATS_TEST_ARTWORK_MEMORY").is_some() {
+                app.ui.view = View::Favorites;
+                app.scene.content_top = 100;
+                for i in 0..130 {
+                    let key = format!("fixture-{i}");
+                    app.images.insert(
+                        key.clone(),
+                        Arc::new(crate::catalog::Bitmap::new(
+                            192,
+                            192,
+                            vec![0xff001122; 192 * 192],
+                        )),
+                    );
+                    app.image_order.push_back(key.clone());
+                    if i < 20 {
+                        app.scene.artwork_ahead.push((110, key));
+                    }
+                }
+                let before: usize = app
+                    .images
+                    .values()
+                    .map(|image| image.pixels.len() * 4)
+                    .sum();
+                trim_artwork(&mut app, 800);
+                let after: usize = app
+                    .images
+                    .values()
+                    .map(|image| image.pixels.len() * 4)
+                    .sum();
+                assert!(after < before);
+                assert!((0..20).all(|i| app.images.contains_key(&format!("fixture-{i}"))));
+                eprintln!("fixture decoded artwork before {before} bytes, after {after} bytes");
+                DestroyWindow(hwnd);
+                UnregisterClassW(class.as_ptr(), instance);
+                return;
+            }
+
+            if std::env::var_os("DEEZNATS_TEST_PARTIAL_SCROLL").is_some() {
+                app.ui.view = View::Favorites;
+                app.ui.page = Some(Arc::new(crate::catalog::Page {
+                    rows: (0..120)
+                        .map(|i| crate::catalog::Entry {
+                            id: format!("track-{i}"),
+                            title: format!("Track {i}"),
+                            kind: "track".into(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                }));
+                let mut client: RECT = zeroed();
+                GetClientRect(hwnd, &mut client);
+                let (width, height) = (client.right, client.bottom);
+                let info = BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: width,
+                        biHeight: -height,
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB,
+                        ..zeroed()
+                    },
+                    ..zeroed()
+                };
+                let make_target = || {
+                    let dc = CreateCompatibleDC(null_mut());
+                    let mut bits = null_mut();
+                    let bitmap =
+                        CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+                    assert!(!dc.is_null() && !bitmap.is_null() && !bits.is_null());
+                    let previous = SelectObject(dc, bitmap);
+                    (dc, bitmap, previous, bits.cast::<u32>())
+                };
+                for mode in 0..3 {
+                    app.ui.scroll = 0;
+                    app.scroll_target = 0;
+                    app.acrylic = mode == 1;
+                    app.background_source = if mode == 2 {
+                        "test-background".into()
+                    } else {
+                        String::new()
+                    };
+                    app.background = (mode == 2).then(|| {
+                        Arc::new(crate::catalog::Bitmap::new(
+                            2,
+                            2,
+                            vec![0xff102030, 0xff405060, 0xff708090, 0xffa0b0c0],
+                        ))
+                    });
+                    app.previous_background = None;
+                    app.background_transition = BackgroundTransition::Complete;
+                    rebuild(hwnd, &mut app);
+                    // Rebuild may select the configured background; force each test mode
+                    // after layout so the image and acrylic paths are both exercised.
+                    app.acrylic = mode == 1;
+                    app.background_source = if mode == 2 {
+                        "test-background".into()
+                    } else {
+                        String::new()
+                    };
+                    app.background = (mode == 2).then(|| {
+                        Arc::new(crate::catalog::Bitmap::new(
+                            2,
+                            2,
+                            vec![0xff102030, 0xff405060, 0xff708090, 0xffa0b0c0],
+                        ))
+                    });
+                    app.previous_background = None;
+                    app.background_transition = BackgroundTransition::Complete;
+                    let _ = app.interpolated_palette_and_accent();
+                    app.palette_state.borrow_mut().started =
+                        std::time::Instant::now() - std::time::Duration::from_secs(10);
+                    let (partial_dc, partial_bitmap, partial_old, partial_bits) = make_target();
+                    let (full_dc, full_bitmap, full_old, full_bits) = make_target();
+                    render(hwnd, &app, partial_dc, None);
+                    GdiFlush();
+                    let count = (width * height) as usize;
+                    let before = std::slice::from_raw_parts(partial_bits, count).to_vec();
+                    scroll_to(hwnd, &mut app, 48);
+                    assert_eq!(app.ui.scroll, 48);
+                    let (_, logical_height) = size(hwnd, &app);
+                    let region =
+                        scroll_repaint_rect(&app, width, logical_height, caption_height(hwnd));
+                    assert!(scroll_repaint_avoids_search(
+                        &app,
+                        &region,
+                        caption_height(hwnd)
+                    ));
+                    let saved = SaveDC(partial_dc);
+                    IntersectClipRect(
+                        partial_dc,
+                        region.left,
+                        region.top,
+                        region.right,
+                        region.bottom,
+                    );
+                    render(hwnd, &app, partial_dc, Some(region));
+                    RestoreDC(partial_dc, saved);
+                    render(hwnd, &app, full_dc, None);
+                    GdiFlush();
+                    let actual = std::slice::from_raw_parts(partial_bits, count);
+                    let expected = std::slice::from_raw_parts(full_bits, count);
+                    assert!(
+                        before.iter().zip(expected).any(|(a, b)| a != b),
+                        "scroll did not change the rendered frame"
+                    );
+                    let mismatch = actual.iter().zip(expected).position(|(a, b)| a != b);
+                    if let Some(index) = mismatch {
+                        let baseline = expected.to_vec();
+                        render(hwnd, &app, full_dc, None);
+                        GdiFlush();
+                        let control = baseline.iter().zip(expected).position(|(a, b)| a != b);
+                        panic!(
+                            "partial scroll differs in mode {mode} at ({}, {}), region ({}, {}, {}, {}), pixels {:08x}/{:08x}, control {control:?}",
+                            index % width as usize,
+                            index / width as usize,
+                            region.left,
+                            region.top,
+                            region.right,
+                            region.bottom,
+                            actual[index],
+                            expected[index]
+                        );
+                    }
+                    let start = std::time::Instant::now();
+                    for _ in 0..12 {
+                        let saved = SaveDC(partial_dc);
+                        IntersectClipRect(
+                            partial_dc,
+                            region.left,
+                            region.top,
+                            region.right,
+                            region.bottom,
+                        );
+                        render(hwnd, &app, partial_dc, Some(region));
+                        RestoreDC(partial_dc, saved);
+                    }
+                    let partial_time = start.elapsed();
+                    let start = std::time::Instant::now();
+                    for _ in 0..12 {
+                        render(hwnd, &app, full_dc, None);
+                    }
+                    eprintln!(
+                        "mode {mode}: 12 partial frames {partial_time:?}, 12 full frames {:?}",
+                        start.elapsed()
+                    );
+                    SelectObject(partial_dc, partial_old);
+                    SelectObject(full_dc, full_old);
+                    DeleteObject(partial_bitmap);
+                    DeleteObject(full_bitmap);
+                    DeleteDC(partial_dc);
+                    DeleteDC(full_dc);
+                }
+                DestroyWindow(hwnd);
+                UnregisterClassW(class.as_ptr(), instance);
+                return;
+            }
 
             let capture = |hwnd: HWND, app: &mut App, filename: &str| {
                 material(hwnd, app);
@@ -10625,7 +16281,18 @@ mod behavior_tests {
                 };
                 let dib = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
                 let prev = SelectObject(dc, dib);
-                render(hwnd, app, dc);
+                render(hwnd, app, dc, None);
+                let artwork_deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while crate::drawing::artwork_preparation_pending() {
+                    assert!(
+                        std::time::Instant::now() < artwork_deadline,
+                        "screenshot artwork preparation timed out"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    crate::drawing::poll_prepared_artwork();
+                    render(hwnd, app, dc, None);
+                }
                 GdiFlush();
                 let slice = std::slice::from_raw_parts(bits.cast::<u32>(), (w * h) as usize);
                 let mut rgba = Vec::with_capacity((w * h * 4) as usize);
@@ -10640,14 +16307,215 @@ mod behavior_tests {
                 img.save(&path).unwrap();
                 if std::env::var_os("DEEZNATS_PLAYER_REVIEW").is_some() {
                     let footer = ui::player_height(&app.ui, w) as u32;
-                    let crop = image::imageops::crop_imm(&img, 0, h as u32-footer, w as u32, footer).to_image();
-                    crop.save(path.with_file_name(format!("footer-{filename}"))).unwrap();
+                    let crop =
+                        image::imageops::crop_imm(&img, 0, h as u32 - footer, w as u32, footer)
+                            .to_image();
+                    crop.save(path.with_file_name(format!("footer-{filename}")))
+                        .unwrap();
                 }
                 SelectObject(dc, prev);
                 DeleteObject(dib);
                 DeleteDC(dc);
             };
 
+            if std::env::var_os("DEEZNATS_DEVICE_SIDEBAR_REVIEW").is_some() {
+                app.ui.set_language("en");
+                app.ui.provider = crate::catalog::Provider::Spotify;
+                app.snapshot.provider = crate::catalog::Provider::Spotify;
+                app.snapshot.state = "Playing".into();
+                app.ui.view = View::Home;
+                app.ui.page = Some(Arc::new(crate::catalog::Page::default()));
+                app.ui.queue_sidebar_open = false;
+                app.ui.device_menu_open = true;
+                app.ui.jam_enabled = false;
+                app.ui.spotify_devices = vec![
+                    serde_json::json!({"id":"local","name":"DeezNats","type":"Computer","is_active":true}),
+                    serde_json::json!({"id":"web","name":"Web Player (Microsoft Edge)","type":"Computer"}),
+                ];
+                app.ui.spotify_jam = Some(crate::spotify::jam::Session {
+                    id: "fixture-session".into(),
+                    active: true,
+                    owner: true,
+                    invite_uri: Some("spotify:socialsession:fixture".into()),
+                    members: vec![
+                        crate::spotify::jam::Member {
+                            id: "host".into(),
+                            name: "You".into(),
+                            owner: true,
+                        },
+                        crate::spotify::jam::Member {
+                            id: "guest".into(),
+                            name: "Guest".into(),
+                            owner: false,
+                        },
+                    ],
+                    ..Default::default()
+                });
+                for (width, height, name) in [
+                    (1200, 900, "spotify-sidebar-host-wide.png"),
+                    (588, 1050, "spotify-sidebar-host-narrow.png"),
+                ] {
+                    SetWindowPos(
+                        hwnd,
+                        null_mut(),
+                        0,
+                        0,
+                        width,
+                        height,
+                        SWP_NOZORDER | SWP_NOMOVE,
+                    );
+                    capture(hwnd, &mut app, name);
+                }
+                SetWindowPos(hwnd, null_mut(), 0, 0, 1200, 900, SWP_NOZORDER | SWP_NOMOVE);
+                app.ui.spotify_jam.as_mut().unwrap().owner = false;
+                capture(hwnd, &mut app, "spotify-sidebar-guest.png");
+                app.ui.spotify_jam = None;
+                capture(hwnd, &mut app, "spotify-sidebar-start.png");
+                app.ui.set_language("tr");
+                capture(hwnd, &mut app, "spotify-sidebar-turkish.png");
+                DestroyWindow(hwnd);
+                UnregisterClassW(class.as_ptr(), instance);
+                return;
+            }
+            if std::env::var_os("DEEZNATS_JAM_REVIEW").is_some() {
+                app.ui.set_language("en");
+                app.ui.provider = crate::catalog::Provider::Spotify;
+                app.snapshot.provider = crate::catalog::Provider::Spotify;
+                app.ui.view = View::Settings;
+                app.ui.tab = 5;
+                app.ui.scroll = 0;
+                app.ui.queue_sidebar_open = false;
+                app.ui.jam_enabled = false;
+                app.ui.spotify_jam = Some(crate::spotify::jam::Session {
+                    id: "fixture-session".into(),
+                    active: true,
+                    owner: true,
+                    invite_uri: Some("spotify:socialsession:fixture".into()),
+                    members: vec![
+                        crate::spotify::jam::Member {
+                            id: "host".into(),
+                            name: "You (host)".into(),
+                            owner: true,
+                        },
+                        crate::spotify::jam::Member {
+                            id: "guest".into(),
+                            name: "Guest".into(),
+                            owner: false,
+                        },
+                    ],
+                    ..Default::default()
+                });
+                app.ui.spotify_jam_status = "Jam is active.".into();
+                for (width, height, name) in [
+                    (1200, 900, "spotify-jam-wide.png"),
+                    (588, 1050, "spotify-jam-narrow.png"),
+                ] {
+                    SetWindowPos(
+                        hwnd,
+                        null_mut(),
+                        0,
+                        0,
+                        width,
+                        height,
+                        SWP_NOZORDER | SWP_NOMOVE,
+                    );
+                    capture(hwnd, &mut app, name);
+                }
+                DestroyWindow(hwnd);
+                UnregisterClassW(class.as_ptr(), instance);
+                return;
+            }
+            if std::env::var_os("DEEZNATS_SPOTIFY_REVIEW").is_some() {
+                app.ui.set_language("en");
+                app.ui.provider = crate::catalog::Provider::Spotify;
+                app.snapshot.provider = crate::catalog::Provider::Spotify;
+                app.ui.view = View::Account;
+                app.ui.queue_sidebar_open = false;
+                app.ui.jam_enabled = false;
+                for (width, name) in [
+                    (1200, "spotify-signin-wide.png"),
+                    (588, "spotify-signin-narrow.png"),
+                ] {
+                    SetWindowPos(
+                        hwnd,
+                        null_mut(),
+                        0,
+                        0,
+                        width,
+                        900,
+                        SWP_NOZORDER | SWP_NOMOVE,
+                    );
+                    capture(hwnd, &mut app, name);
+                }
+                SetWindowPos(hwnd, null_mut(), 0, 0, 1200, 900, SWP_NOZORDER | SWP_NOMOVE);
+                app.ui.view = View::Favorites;
+                app.snapshot.connected = true;
+                app.ui.account = serde_json::json!({"displayName":"Spotify fixture"});
+                app.ui.page = Some(Arc::new(crate::catalog::Page {
+                    title: "Liked songs".into(),
+                    rows: (0..8)
+                        .map(|index| crate::catalog::Entry {
+                            id: format!("spotify:track:{index:022}"),
+                            title: format!("A song from your Spotify library {}", index + 1),
+                            subtitle: "Artist name".into(),
+                            album: "Album name".into(),
+                            kind: "track".into(),
+                            duration: 205000,
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                }));
+                app.ui.device_menu_open = true;
+                app.ui.spotify_devices = vec![
+                    serde_json::json!({"id":"local","name":"DeezNats","type":"Computer","is_active":true,"is_restricted":false,"volume_percent":70}),
+                    serde_json::json!({"id":"speaker","name":"Living room speaker with a longer device name","type":"Speaker","is_active":false,"is_restricted":false,"volume_percent":40}),
+                ];
+                capture(hwnd, &mut app, "spotify-library-devices.png");
+                app.ui.device_menu_open = false;
+                app.ui.view = View::TrackInfo;
+                let mut track = app.ui.page.as_ref().unwrap().rows[0].clone();
+                track.album_id = "spotify:album:2222222222222222222222".into();
+                track.artist_id = "spotify:artist:3333333333333333333333".into();
+                app.ui.track_info = Some((
+                    track,
+                    serde_json::json!({"playCount":1234567,"explicit":true}),
+                    serde_json::json!({"followers":12345,"monthlyListeners":567890}),
+                ));
+                SetWindowPos(hwnd, null_mut(), 0, 0, 588, 1050, SWP_NOZORDER | SWP_NOMOVE);
+                capture(hwnd, &mut app, "spotify-trackinfo-narrow.png");
+                DestroyWindow(hwnd);
+                UnregisterClassW(class.as_ptr(), instance);
+                return;
+            }
+            if std::env::var_os("DEEZNATS_STYLE_MIX_REVIEW").is_some() {
+                app.ui.queue_sidebar_open = false;
+                app.ui.set_language("en");
+                app.ui.page = Some(Arc::new(crate::catalog::Page {
+                    title: "Flow".into(),
+                    ..Default::default()
+                }));
+                app.ui.view = View::Flow;
+                capture(hwnd, &mut app, "flow-style-mix-button.png");
+                app.ui.view = View::StyleMix;
+                app.ui.mix_region = usize::MAX;
+                app.ui.mix_genre = usize::MAX;
+                app.ui.mix_genres = None;
+                app.ui.page = Some(Arc::new(crate::catalog::Page {
+                    title: "Style Mix".into(),
+                    ..Default::default()
+                }));
+                capture(hwnd, &mut app, "style-mix-languages.png");
+                app.ui.mix_region = 1;
+                capture(hwnd, &mut app, "style-mix-loading.png");
+                app.ui.mix_genres = Some(
+                    serde_json::json!({"region":1,"genres":[{"id":1,"title":"Rock"},{"id":24,"title":"Indie Rock"}]}),
+                );
+                capture(hwnd, &mut app, "style-mix.png");
+                DestroyWindow(hwnd);
+                UnregisterClassW(class.as_ptr(), instance);
+                return;
+            }
             if std::env::var_os("DEEZNATS_QUEUE_REVIEW").is_some() {
                 app.ui.view = View::Home;
                 app.ui.queue_sidebar_open = true;
@@ -10679,23 +16547,51 @@ mod behavior_tests {
                 app.ui.solid = true;
                 app.ui.background_mode = 2;
                 app.ui.now = crate::catalog::Entry {
-                    id:"fixture".into(), kind:"track".into(), title:"rodeo dr".into(),
-                    subtitle:"Gunna".into(), artwork:"player-cover".into(), duration:176000,
-                    raw:serde_json::json!({"explicit":true}), ..Default::default()
+                    id: "fixture".into(),
+                    kind: "track".into(),
+                    title: "rodeo dr".into(),
+                    subtitle: "Gunna".into(),
+                    artwork: "player-cover".into(),
+                    duration: 176000,
+                    raw: serde_json::json!({"explicit":true}),
+                    ..Default::default()
                 };
-                let pixels=(0..64*64).map(|i| {let x=i%64;let y=i/64;0xff000000 | ((50+x*3) as u32)<<16 | ((80+y*2) as u32)<<8 | 45}).collect();
-                app.images.insert("player-cover".into(), Arc::new(crate::catalog::Bitmap::new(64,64,pixels)));
+                let pixels = (0..64 * 64)
+                    .map(|i| {
+                        let x = i % 64;
+                        let y = i / 64;
+                        0xff000000 | ((50 + x * 3) as u32) << 16 | ((80 + y * 2) as u32) << 8 | 45
+                    })
+                    .collect();
+                app.images.insert(
+                    "player-cover".into(),
+                    Arc::new(crate::catalog::Bitmap::new(64, 64, pixels)),
+                );
                 app.snapshot.now = app.ui.now.clone();
                 app.snapshot.state = "Playing".into();
                 app.snapshot.position = 9000;
+                app.playback_clock
+                    .sample(9000, std::time::Instant::now(), false);
                 app.snapshot.duration = 176000;
                 app.ui.duration = 176000;
                 app.ui.position = 9000;
-                for (width, layout, name) in [(1491,0,"player-normal.png"),(1500,1,"player-compact.png"),(588,0,"player-narrow.png")] {
+                for (width, layout, name) in [
+                    (1491, 0, "player-normal.png"),
+                    (1500, 1, "player-compact.png"),
+                    (588, 0, "player-narrow.png"),
+                ] {
                     app.ui.player_layout = layout;
                     app.palette_state.replace(PaletteState::default());
-                    SetWindowPos(hwnd,null_mut(),0,0,width+16,500,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
-                    capture(hwnd,&mut app,name);
+                    SetWindowPos(
+                        hwnd,
+                        null_mut(),
+                        0,
+                        0,
+                        width + 16,
+                        500,
+                        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                    capture(hwnd, &mut app, name);
                 }
                 let original_volume = app.volume;
                 activate(hwnd, &mut app, Action::MuteVolume);
@@ -10703,64 +16599,214 @@ mod behavior_tests {
                 assert_eq!(SendMessageW(app.edits[&VOLUME], WM_USER, 0, 0), 0);
                 activate(hwnd, &mut app, Action::MuteVolume);
                 assert_eq!(app.volume, original_volume);
-                assert_eq!(SendMessageW(app.edits[&VOLUME], WM_USER, 0, 0), original_volume as isize);
+                assert_eq!(
+                    SendMessageW(app.edits[&VOLUME], WM_USER, 0, 0),
+                    original_volume as isize
+                );
                 DestroyWindow(hwnd);
                 UnregisterClassW(class.as_ptr(), instance);
                 return;
             }
-            if std::env::var_os("DEEZNATS_MAIN_REVIEW").is_some(){
-                app.ui.apply_solid_theme(8);app.ui.background_mode=1;app.ui.solid=false;
-                app.ui.blur=20;app.ui.light_opacity=40;app.ui.surface_opacity=40;
-                app.ui.now=crate::catalog::Entry{id:"review".into(),kind:"track".into(),title:"A complete long title that scrolls only when it reaches the lyric column".into(),subtitle:"Jessie Reyez and a deliberately long artist credit".into(),artist_id:"review-artist".into(),artwork:"fixture-cover".into(),duration:220000,..Default::default()};
-                let pixels=(0..256*256).map(|i|{let x=i%256;let y=i/256;0xff000000|((x as u32)<<16)|((y as u32)<<8)|100}).collect();
-                let cover=Arc::new(crate::catalog::Bitmap::new(256,256,pixels));
-                app.images.insert("fixture-cover".into(),cover.clone());app.images.insert("background:fixture-cover".into(),cover.clone());
-                app.background=Some(Arc::new(crate::appearance::prepare(&cover,20)));app.background_source="background:fixture-cover:20".into();app.background_requested=true;app.background_transition=BackgroundTransition::Complete;
-                app.snapshot.now=app.ui.now.clone();app.snapshot.connected=true;
-                let rows:Vec<_>=(0..5000).map(|i|{let mut row=app.ui.now.clone();row.id=i.to_string();row.title=format!("Track {i}");row}).collect();
-                app.ui.view=View::Album;app.ui.page=Some(Arc::new(crate::catalog::Page{title:"Large playlist".into(),rows,..Default::default()}));
+            if std::env::var_os("DEEZNATS_MAIN_REVIEW").is_some() {
+                app.ui.apply_solid_theme(8);
+                app.ui.background_mode = 1;
+                app.ui.solid = false;
+                app.ui.blur = 20;
+                app.ui.light_opacity = 40;
+                app.ui.surface_opacity = 40;
+                app.ui.now = crate::catalog::Entry {
+                    id: "review".into(),
+                    kind: "track".into(),
+                    title:
+                        "A complete long title that scrolls only when it reaches the lyric column"
+                            .into(),
+                    subtitle: "Jessie Reyez and a deliberately long artist credit".into(),
+                    artist_id: "review-artist".into(),
+                    artwork: "fixture-cover".into(),
+                    duration: 220000,
+                    ..Default::default()
+                };
+                let pixels = (0..256 * 256)
+                    .map(|i| {
+                        let x = i % 256;
+                        let y = i / 256;
+                        0xff000000 | ((x as u32) << 16) | ((y as u32) << 8) | 100
+                    })
+                    .collect();
+                let cover = Arc::new(crate::catalog::Bitmap::new(256, 256, pixels));
+                app.images.insert("fixture-cover".into(), cover.clone());
+                app.images
+                    .insert("background:fixture-cover".into(), cover.clone());
+                app.background = Some(Arc::new(crate::appearance::prepare(&cover, 20)));
+                app.background_source = "background:fixture-cover:20".into();
+                app.background_requested = true;
+                app.background_transition = BackgroundTransition::Complete;
+                app.snapshot.now = app.ui.now.clone();
+                app.snapshot.connected = true;
+                let rows: Vec<_> = (0..5000)
+                    .map(|i| {
+                        let mut row = app.ui.now.clone();
+                        row.id = i.to_string();
+                        row.title = format!("Track {i}");
+                        row
+                    })
+                    .collect();
+                app.ui.view = View::Album;
+                app.ui.page = Some(Arc::new(crate::catalog::Page {
+                    title: "Large playlist".into(),
+                    rows,
+                    ..Default::default()
+                }));
                 app.palette_state.replace(PaletteState::default());
-                capture(hwnd,&mut app,"main-opacity40.png");
-                settle_scroll(&mut app,56000);rebuild(hwnd,&mut app);
-                assert_eq!(app.scroll_target,56000);assert_eq!(app.scroll_position,56000.);
-                let start=std::time::Instant::now();
-                for step in 0..120{let position=56000+step*8;app.scroll_target=position;scroll_to(hwnd,&mut app,position);}
-                let scroll_elapsed=start.elapsed().as_secs_f64()*1000.;
-                capture(hwnd,&mut app,"large-list-scrolled.png");
-                app.ui.surface_opacity=0;capture(hwnd,&mut app,"main-opacity0.png");
-                app.ui.surface_opacity=100;capture(hwnd,&mut app,"main-opacity100.png");
-                app.ui.surface_opacity=40;
-                app.render_suspended=true;app.layout_dirty=false;
-                let old_buttons=app.scene.buttons.len();rebuild(hwnd,&mut app);assert!(app.layout_dirty);assert_eq!(app.scene.buttons.len(),old_buttons);
-                app.render_suspended=false;rebuild(hwnd,&mut app);assert!(!app.layout_dirty);
-                app.ui.view=View::Lyrics;settle_scroll(&mut app,0);
-                app.ui.page=Some(Arc::new(crate::catalog::Page{entity:Some(crate::catalog::Entry{kind:"artist".into(),..Default::default()}),..Default::default()}));
-                app.ui.lyrics_provider="Apple Music".into();
-                app.ui.rich_lyrics=(0..80).map(|i|crate::lyrics::LyricLine{text:format!("Entire readable lyric line {i}, without truncation."),..Default::default()}).collect();
-                app.ui.lyrics.clear();app.ui.position=0;app.ui.duration=220000;
-                app.snapshot.state="Playing".into();
-                for(style,name)in[(0,"lyrics-wave.png"),(1,"lyrics-bars.png"),(2,"lyrics-trap-nation.png")]{
-                    app.ui.visualizer_style=style;
-                    app.visualizer.fixture_levels(std::array::from_fn(|i|0.22+(i as f32*0.45).sin().abs()*0.55));
-                    capture(hwnd,&mut app,name);
+                capture(hwnd, &mut app, "main-opacity40.png");
+                settle_scroll(&mut app, 56000);
+                rebuild(hwnd, &mut app);
+                assert_eq!(app.scroll_target, 56000);
+                assert_eq!(app.scroll_position, 56000.);
+                let start = std::time::Instant::now();
+                for step in 0..120 {
+                    let position = 56000 + step * 8;
+                    app.scroll_target = position;
+                    scroll_to(hwnd, &mut app, position);
                 }
-                assert_eq!(app.ui.scroll,0);
-                assert_eq!(app.scene.labels.iter().find(|label|label.text.starts_with("Entire readable lyric line 0,")).unwrap().rect.y,40);
-                assert!(app.scene.panels.iter().any(|p|p.kind==6));
-                let dc=GetDC(hwnd);let start=std::time::Instant::now();for _ in 0..30{render(hwnd,&app,dc);}let render_elapsed=start.elapsed().as_secs_f64()*1000.;ReleaseDC(hwnd,dc);
+                let scroll_elapsed = start.elapsed().as_secs_f64() * 1000.;
+                capture(hwnd, &mut app, "large-list-scrolled.png");
+                app.ui.surface_opacity = 0;
+                capture(hwnd, &mut app, "main-opacity0.png");
+                app.ui.surface_opacity = 100;
+                capture(hwnd, &mut app, "main-opacity100.png");
+                app.ui.surface_opacity = 40;
+                app.render_suspended = true;
+                app.layout_dirty = false;
+                let old_buttons = app.scene.buttons.len();
+                rebuild(hwnd, &mut app);
+                assert!(app.layout_dirty);
+                assert_eq!(app.scene.buttons.len(), old_buttons);
+                app.render_suspended = false;
+                rebuild(hwnd, &mut app);
+                assert!(!app.layout_dirty);
+                app.ui.view = View::Lyrics;
+                settle_scroll(&mut app, 0);
+                app.ui.page = Some(Arc::new(crate::catalog::Page {
+                    entity: Some(crate::catalog::Entry {
+                        kind: "artist".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }));
+                app.ui.lyrics_provider = "Apple Music".into();
+                app.ui.rich_lyrics = (0..80)
+                    .map(|i| crate::lyrics::LyricLine {
+                        text: format!("Entire readable lyric line {i}, without truncation."),
+                        ..Default::default()
+                    })
+                    .collect();
+                app.ui.lyrics.clear();
+                app.ui.position = 0;
+                app.ui.duration = 220000;
+                app.snapshot.state = "Playing".into();
+                if std::env::var_os("DEEZNATS_LYRIC_BENCH_LARGE").is_some() {
+                    SetWindowPos(
+                        hwnd,
+                        null_mut(),
+                        0,
+                        0,
+                        2560,
+                        1440,
+                        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+                for (style, name) in [
+                    (0, "lyrics-wave.png"),
+                    (1, "lyrics-bars.png"),
+                    (2, "lyrics-trap-nation.png"),
+                ] {
+                    app.ui.visualizer_style = style;
+                    app.visualizer.fixture_levels(std::array::from_fn(|i| {
+                        0.22 + (i as f32 * 0.45).sin().abs() * 0.55
+                    }));
+                    capture(hwnd, &mut app, name);
+                }
+                if std::env::var_os("DEEZNATS_LYRIC_MEMORY_BENCH").is_some() {
+                    let dc = GetDC(hwnd);
+                    let mut times = Vec::new();
+                    let mut peaks = (0, 0, 0);
+                    for step in 0..40 {
+                        settle_scroll(&mut app, step * 32);
+                        rebuild(hwnd, &mut app);
+                        for _ in 0..4 {
+                            let start = std::time::Instant::now();
+                            render(hwnd, &app, dc, None);
+                            GdiFlush();
+                            times.push(start.elapsed().as_secs_f64() * 1000.0);
+                            let bytes = crate::drawing::lyric_raster_bytes();
+                            peaks.0 = peaks.0.max(bytes.0);
+                            peaks.1 = peaks.1.max(bytes.1);
+                            peaks.2 = peaks.2.max(bytes.2);
+                        }
+                    }
+                    ReleaseDC(hwnd, dc);
+                    times.sort_by(f64::total_cmp);
+                    std::fs::write(
+                    std::path::Path::new(&out_dir).join("lyric-memory-bench.json"),
+                    serde_json::json!({"frames":times.len(),"median_ms":times[times.len()/2],"p95_ms":times[times.len()*95/100],"max_ms":times[times.len()-1],"shadow_bytes":peaks.0,"raster_bytes":peaks.1,"blur_bytes":peaks.2}).to_string(),
+                ).unwrap();
+                    DestroyWindow(hwnd);
+                    UnregisterClassW(class.as_ptr(), instance);
+                    return;
+                }
+                assert_eq!(app.ui.scroll, 0);
+                assert_eq!(
+                    app.scene
+                        .labels
+                        .iter()
+                        .find(|label| label.text.starts_with("Entire readable lyric line 0,"))
+                        .unwrap()
+                        .rect
+                        .y,
+                    40
+                );
+                assert!(app.scene.panels.iter().any(|p| p.kind == 6));
+                let dc = GetDC(hwnd);
+                let start = std::time::Instant::now();
+                for _ in 0..30 {
+                    render(hwnd, &app, dc, None);
+                }
+                let render_elapsed = start.elapsed().as_secs_f64() * 1000.;
+                ReleaseDC(hwnd, dc);
                 std::fs::write(std::path::Path::new(&out_dir).join("performance.json"),serde_json::json!({"scroll_layout_ms_per_step":scroll_elapsed/120.,"trap_render_ms_per_frame":render_elapsed/30.,"playlist_rows":5000}).to_string()).unwrap();
-                app.ui.lyrics_cover_mode=true;app.ui.lyrics_cover_mix=None;app.ui.lyrics_volume_open=true;
-                capture(hwnd,&mut app,"lyrics-centered.png");
-                let cover=app.scene.lyrics_cover.unwrap();let (logical_width,_)=size(hwnd,&app);
-                assert!((cover.x+cover.w/2-logical_width/2).abs()<=1);
-                let volume=app.edits[&VOLUME];let mut volume_bounds:RECT=zeroed();GetClientRect(volume,&mut volume_bounds);
-                let point=|x:i32,y:i32|((x as u32&0xffff)|((y as u32&0xffff)<<16))as isize;
-                SendMessageW(volume,WM_LBUTTONDOWN,0,point(13,5));SendMessageW(volume,WM_LBUTTONUP,0,point(13,5));assert_eq!(app.volume,100);
-                SendMessageW(volume,WM_LBUTTONDOWN,0,point(13,volume_bounds.bottom-5));SendMessageW(volume,WM_LBUTTONUP,0,point(13,volume_bounds.bottom-5));assert_eq!(app.volume,0);
-                SendMessageW(volume,WM_MOUSEWHEEL,(120usize)<<16,0);assert_eq!(app.volume,2);
-                SendMessageW(volume,WM_KEYDOWN,VK_UP as usize,0);assert_eq!(app.volume,4);
-                SendMessageW(volume,WM_KEYDOWN,VK_RIGHT as usize,0);assert_eq!(app.volume,6);
-                DestroyWindow(hwnd);UnregisterClassW(class.as_ptr(),instance);return;
+                app.ui.lyrics_cover_mode = true;
+                app.ui.lyrics_cover_mix = None;
+                app.ui.lyrics_volume_open = true;
+                capture(hwnd, &mut app, "lyrics-centered.png");
+                let cover = app.scene.lyrics_cover.unwrap();
+                let (logical_width, _) = size(hwnd, &app);
+                assert!((cover.x + cover.w / 2 - logical_width / 2).abs() <= 1);
+                let volume = app.edits[&VOLUME];
+                let mut volume_bounds: RECT = zeroed();
+                GetClientRect(volume, &mut volume_bounds);
+                let point =
+                    |x: i32, y: i32| ((x as u32 & 0xffff) | ((y as u32 & 0xffff) << 16)) as isize;
+                SendMessageW(volume, WM_LBUTTONDOWN, 0, point(13, 5));
+                SendMessageW(volume, WM_LBUTTONUP, 0, point(13, 5));
+                assert_eq!(app.volume, 100);
+                SendMessageW(
+                    volume,
+                    WM_LBUTTONDOWN,
+                    0,
+                    point(13, volume_bounds.bottom - 5),
+                );
+                SendMessageW(volume, WM_LBUTTONUP, 0, point(13, volume_bounds.bottom - 5));
+                assert_eq!(app.volume, 0);
+                SendMessageW(volume, WM_MOUSEWHEEL, (120usize) << 16, 0);
+                assert_eq!(app.volume, 2);
+                SendMessageW(volume, WM_KEYDOWN, VK_UP as usize, 0);
+                assert_eq!(app.volume, 4);
+                SendMessageW(volume, WM_KEYDOWN, VK_RIGHT as usize, 0);
+                assert_eq!(app.volume, 6);
+                DestroyWindow(hwnd);
+                UnregisterClassW(class.as_ptr(), instance);
+                return;
             }
             let rel_lum = |color: u32| -> f64 {
                 [0, 8, 16]

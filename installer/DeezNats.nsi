@@ -1,6 +1,12 @@
 Unicode True
 !include "MUI2.nsh"
 !include "FileFunc.nsh"
+!ifndef APPVERSION
+!define APPVERSION "0.1.0"
+!endif
+!ifndef PRODUCTVERSION
+!define PRODUCTVERSION "${APPVERSION}.0"
+!endif
 
 Name "DeezNats"
 OutFile "${OUTPUT}\DeezNats-Setup.exe"
@@ -12,10 +18,10 @@ ShowInstDetails show
 ShowUninstDetails show
 Icon "${PROJECT}\assets\DeezNats.ico"
 UninstallIcon "${PROJECT}\assets\DeezNats.ico"
-VIProductVersion "0.1.0.0"
+VIProductVersion "${PRODUCTVERSION}"
 VIAddVersionKey "ProductName" "DeezNats"
 VIAddVersionKey "FileDescription" "DeezNats per-user installer"
-VIAddVersionKey "FileVersion" "0.1.0"
+VIAddVersionKey "FileVersion" "${APPVERSION}"
 VIAddVersionKey "LegalCopyright" "DeezNats contributors; AGPL-3.0"
 Var TestMode
 
@@ -46,13 +52,14 @@ Section "DeezNats"
   File "${PROJECT}\assets\DeezNats.ico"
   File "${PROJECT}\LICENSE"
   File "${PROJECT}\NOTICE.md"
+  File /oname=qbsdiff.LICENSE "${PROJECT}\assets\licenses\qbsdiff.txt"
   File "${PROJECT}\SOURCE-AND-DEPENDENCIES.md"
   File "${OUTPUT}\DeezNats-Source.zip"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
   StrCmp $TestMode "1" test_install
   WriteRegStr HKCU "Software\DeezNats" "InstallDir" "$INSTDIR"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\DeezNats" "DisplayName" "DeezNats"
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\DeezNats" "DisplayVersion" "0.1.0"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\DeezNats" "DisplayVersion" "${APPVERSION}"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\DeezNats" "InstallLocation" "$INSTDIR"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\DeezNats" "DisplayIcon" "$INSTDIR\DeezNats.ico"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\DeezNats" "UninstallString" '$\"$INSTDIR\Uninstall.exe$\"'
@@ -70,16 +77,29 @@ SectionEnd
 Section "Uninstall"
   SetShellVarContext current
   IfFileExists "$INSTDIR\.installer-test" skip_registration
+  ; The app owns the Soloist process and terminates it when it exits.
+  nsExec::ExecToStack 'taskkill /IM deeznats-prototype.exe /T /F'
+  Pop $0
+  Pop $1
+  InitPluginsDir
+  File /oname=$PLUGINSDIR\Remove-UserData.ps1 "${PROJECT}\installer\Remove-UserData.ps1"
+  nsExec::ExecToStack 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\Remove-UserData.ps1"'
+  Pop $0
+  Pop $1
+  StrCmp $0 "0" +3
+  MessageBox MB_ICONSTOP "Could not remove DeezNats user data. Close DeezNats, reconnect any data drive, and retry.$\r$\n$1"
+  Abort
   Delete "$SMPROGRAMS\DeezNats.lnk"
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\DeezNats"
   DeleteRegKey HKCU "Software\DeezNats"
   skip_registration:
-  ; Delete only our installed files. Preserve all user settings and unknown files.
+  ; Delete installed files while preserving unknown files in the install directory.
   Delete "$INSTDIR\deeznats-prototype.exe"
   Delete "$INSTDIR\libdeezercore.dll"
   Delete "$INSTDIR\DeezNats.ico"
   Delete "$INSTDIR\LICENSE"
   Delete "$INSTDIR\NOTICE.md"
+  Delete "$INSTDIR\qbsdiff.LICENSE"
   Delete "$INSTDIR\SOURCE-AND-DEPENDENCIES.md"
   Delete "$INSTDIR\DeezNats-Source.zip"
   Delete "$INSTDIR\.installer-test"

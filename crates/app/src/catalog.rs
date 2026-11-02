@@ -1,6 +1,50 @@
 mod cache;
-pub(crate) mod session;
+mod artwork_queue;
+mod artwork_resize;
+mod deezer_shelves;
+pub(crate) mod disk_cache;
+mod spotify;
+pub(crate) fn spotify_discovery_report() -> Result<serde_json::Value, String> {
+    spotify::discovery_report()
+}
+pub(crate) fn shelf_has_more(page: &Page, title: &str) -> bool {
+    if deezer_shelves::has_more(page, title) {
+        return true;
+    }
+    page.raw
+        .iter()
+        .find(|(key, _)| key == &format!("spotify:shelf:{title}"))
+        .is_some_and(|(_, state)| {
+            if state["directory"] == true {
+                state["complete"] != true
+            } else {
+                state["sections"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|s| s["total"].as_u64().unwrap_or(0) > s["offset"].as_u64().unwrap_or(0))
+            }
+        })
+}
+pub(crate) fn catalogue_page(page: &Page, title: &str) -> Option<Page> {
+    let section = page.sections.iter().find(|s| s.title == title)?.clone();
+    let mut related = page.clone();
+    related.title = title.into();
+    related.subtitle.clear();
+    related.entity = None;
+    related.sections = vec![section];
+    related.rows.clear();
+    related.next.clear();
+    related.error.clear();
+    related.loading = false;
+    related
+        .raw
+        .retain(|(key, _)| key != "discover" && key != "spotify:more-shelf");
+    related.raw.push(("catalogue".into(), json!(true)));
+    Some(related)
+}
 pub(crate) mod parallel;
+pub(crate) mod session;
 use crate::{engine::Engine, ui::View};
 use serde_json::{json, Value};
 use std::{
@@ -10,6 +54,50 @@ use std::{
         mpsc, Arc,
     },
 };
+/// Shared navigation capability; catalog IDs remain provider namespaced.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Provider {
+    #[default]
+    Deezer,
+    Spotify,
+}
+static ACTIVE_PROVIDER: AtomicU64 = AtomicU64::new(0);
+pub(crate) fn spotify_style_mix(selection: &str) -> Result<Value, String> {
+    spotify::style_mix(selection)
+}
+impl Provider {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Deezer => "Deezer",
+            Self::Spotify => "Spotify",
+        }
+    }
+    pub fn supports_downloads(self) -> bool {
+        self == Self::Deezer
+    }
+    pub fn active() -> Self {
+        if ACTIVE_PROVIDER.load(Ordering::Acquire) == 1 {
+            Self::Spotify
+        } else {
+            Self::Deezer
+        }
+    }
+    pub fn set_active(self) {
+        ACTIVE_PROVIDER.store(if self == Self::Spotify { 1 } else { 0 }, Ordering::Release);
+    }
+    fn invoke(self, engine: &Engine, name: &str, args: &[Value]) -> Result<Value, String> {
+        match self {
+            Self::Deezer => engine.invoke(name, args),
+            Self::Spotify => crate::spotify::catalog_invoke(name, args),
+        }
+    }
+    fn next(self, engine: &Engine, cursor: &str) -> Result<Value, String> {
+        match self {
+            Self::Deezer => public(engine, cursor),
+            Self::Spotify => self.invoke(engine, "SPCatalogNextJSON", &[json!(cursor)]),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -113,6 +201,13 @@ impl Entry {
         matches!(self.kind.as_str(), "track" | "episode")
     }
     pub fn wire(&self) -> Value {
+        let mut value = self.base_wire();
+        if let Some(selection) = self.raw.get(crate::style_mix::MARKER) {
+            value[crate::style_mix::MARKER] = selection.clone();
+        }
+        value
+    }
+    fn base_wire(&self) -> Value {
         json!({"id":self.id,"name":self.title,"artistLine":self.subtitle,"artistId":self.artist_id,"albumId":self.album_id,"albumName":self.album,"artworkUrl":self.artwork,"durationMs":self.duration,"kind":self.kind,"episodeCount":self.episode_count(),"description":self.raw.get("description").cloned().unwrap_or(Value::Null),"explicit":self.raw["explicit"].as_bool().or(self.raw["isExplicit"].as_bool()).unwrap_or(false),"artists":self.artist_entries().iter().map(|a|json!({"id":a.id,"name":a.title,"kind":"artist"})).collect::<Vec<_>>()})
     }
 }
@@ -216,6 +311,9 @@ fn picture(value: &Value) -> String {
     String::new()
 }
 pub fn entry(value: &Value, fallback: &str) -> Option<Entry> {
+    if spotify::is_item(value) {
+        return spotify::entry(value, fallback);
+    }
     let mut typename = string(value, &["__typename", "type", "kind"]).to_lowercase();
     if typename.is_empty() {
         typename = string(&value["data"], &["__TYPE__"]).to_lowercase();
@@ -408,16 +506,31 @@ pub fn entry(value: &Value, fallback: &str) -> Option<Entry> {
 }
 // Bulk collection rows already have their own Entry records. Retain all display
 // and artist metadata, but not a second copy of those entire collections.
-fn compact_entry_metadata(value:&Value)->Value{
-    let Some(object)=value.as_object()else{return value.clone()};
-    let mut result=serde_json::Map::new();
-    for (key,value) in object{
-        if matches!(key.as_str(),"tracks"|"episodes"|"albums"|"playlists"|"sections"){
-            if let Some(metadata)=value.as_object(){
-                let kept:serde_json::Map<String,Value>=metadata.iter().filter(|(key,_)|!matches!(key.as_str(),"data"|"items"|"edges"|"nodes")).map(|(key,value)|(key.clone(),value.clone())).collect();
-                if !kept.is_empty(){result.insert(key.clone(),Value::Object(kept));}
+fn compact_entry_metadata(value: &Value) -> Value {
+    let Some(object) = value.as_object() else {
+        return value.clone();
+    };
+    let mut result = serde_json::Map::new();
+    for (key, value) in object {
+        if matches!(
+            key.as_str(),
+            "tracks" | "episodes" | "albums" | "playlists" | "sections"
+        ) {
+            if let Some(metadata) = value.as_object() {
+                let kept: serde_json::Map<String, Value> = metadata
+                    .iter()
+                    .filter(|(key, _)| {
+                        !matches!(key.as_str(), "data" | "items" | "edges" | "nodes")
+                    })
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                if !kept.is_empty() {
+                    result.insert(key.clone(), Value::Object(kept));
+                }
             }
-        }else{result.insert(key.clone(),value.clone());}
+        } else {
+            result.insert(key.clone(), value.clone());
+        }
     }
     Value::Object(result)
 }
@@ -508,50 +621,100 @@ pub(crate) fn table_entries(value: &Value, kind: &str) -> Vec<Entry> {
 
 // Collection responses may wrap metadata separately from their track connection.
 fn inherit_collection_metadata(page: &mut Page, value: &Value) {
-    let Some(entity) = page.entity.as_mut() else { return };
+    let Some(entity) = page.entity.as_mut() else {
+        return;
+    };
     if !matches!(entity.kind.as_str(), "album" | "playlist") {
         return;
     }
-    let metadata = value.get(&entity.kind)
+    let metadata = value
+        .get(&entity.kind)
         .or_else(|| value.get("data").and_then(|data| data.get(&entity.kind)))
         .unwrap_or(value);
-    if let Some(description) = metadata.get("description").or_else(|| metadata.get("DESCRIPTION")).and_then(Value::as_str) {
-        if !entity.raw.is_object() { entity.raw = json!({}); }
+    if let Some(description) = metadata
+        .get("description")
+        .or_else(|| metadata.get("DESCRIPTION"))
+        .and_then(Value::as_str)
+    {
+        if !entity.raw.is_object() {
+            entity.raw = json!({});
+        }
         entity.raw["description"] = json!(description);
+    }
+    for key in [
+        "owner",
+        "creator",
+        "user",
+        "creator_id",
+        "owner_id",
+        "USER_ID",
+    ] {
+        if let Some(value) = metadata.get(key) {
+            if !entity.raw.is_object() {
+                entity.raw = json!({});
+            }
+            entity.raw[key] = value.clone();
+        }
     }
     let artwork = picture(metadata);
     if !artwork.is_empty() {
         entity.artwork = artwork;
     }
     for row in &mut page.rows {
-        if row.kind != "track" { continue; }
-        if row.artwork.is_empty() { row.artwork = entity.artwork.clone(); }
-        if row.album.is_empty() { row.album = entity.title.clone(); }
-        if row.album_id.is_empty() { row.album_id = entity.id.clone(); }
+        if row.kind != "track" {
+            continue;
+        }
+        if row.artwork.is_empty() {
+            row.artwork = entity.artwork.clone();
+        }
+        if row.album.is_empty() {
+            row.album = entity.title.clone();
+        }
+        if row.album_id.is_empty() {
+            row.album_id = entity.id.clone();
+        }
     }
 }
 
 fn curated_entries(value: &Value, fallback: &str) -> Vec<Entry> {
-    entries(value, fallback).into_iter()
-        .filter(|item| matches!(item.kind.as_str(), "playlist" | "album" | "mix"))
+    entries(value, fallback)
+        .into_iter()
+        .filter(|item| matches!(item.kind.as_str(), "playlist" | "album" | "mix" | "podcast"))
         .collect()
 }
 
 fn web_sections(value: &Value, directory: bool) -> Vec<Section> {
-    value["sections"].as_array().into_iter().flatten().filter_map(|row| {
-        let items = if directory {
-            entries(&row["items"], "channel").into_iter()
-                .filter(|item| item.kind == "channel").collect()
-        } else {
-            curated_entries(&row["items"], "playlist")
-        };
-        (!items.is_empty()).then(|| Section {
-            title: string(row, &["title"]), entries: items, ..Default::default()
+    value["sections"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            let items = if directory {
+                entries(&row["items"], "channel")
+                    .into_iter()
+                    .filter(|item| item.kind == "channel")
+                    .collect()
+            } else {
+                curated_entries(&row["items"], "playlist")
+            };
+            (!items.is_empty()).then(|| Section {
+                title: string(row, &["title"]),
+                entries: items,
+                ..Default::default()
+            })
         })
-    }).collect()
+        .collect()
 }
 
 impl Page {
+    pub fn is_catalogue(&self) -> bool {
+        self.is_discover()
+            || self
+                .entity
+                .as_ref()
+                .is_some_and(|item| item.kind == "channel")
+            || self.raw.iter().any(|(key, _)| key == "catalogue")
+    }
     pub fn is_discover(&self) -> bool {
         self.raw.iter().any(|(key, _)| key == "discover")
     }
@@ -559,7 +722,10 @@ impl Page {
 
 pub fn discover_section_matches(section: &Section, filter: usize) -> bool {
     match filter {
-        1 => section.entries.iter().any(|item| matches!(item.kind.as_str(), "playlist" | "mix")),
+        1 => section
+            .entries
+            .iter()
+            .any(|item| matches!(item.kind.as_str(), "playlist" | "mix")),
         2 => section.title == "Genres",
         3 => section.title == "Categories",
         4 => section.title == "Podcasts by category",
@@ -567,76 +733,159 @@ pub fn discover_section_matches(section: &Section, filter: usize) -> bool {
     }
 }
 
-fn discover(engine: &Engine, mut page: Page, publish: &mut dyn FnMut(&Page) -> Result<(), String>) -> Result<Page, String> {
+fn discover(
+    engine: &Engine,
+    mut page: Page,
+    publish: &mut dyn FnMut(&Page) -> Result<(), String>,
+) -> Result<Page, String> {
     page.raw.push(("discover".into(), json!(true)));
     publish(&page)?;
     let user = engine.invoke("DZUserID", &[]).unwrap_or(Value::Null);
     let logged_in = user.as_u64().is_some_and(|id| id > 0)
-        || user.as_str().is_some_and(|id| id.parse::<u64>().is_ok_and(|id| id > 0));
+        || user
+            .as_str()
+            .is_some_and(|id| id.parse::<u64>().is_ok_and(|id| id > 0));
     // Each source is independent. Slow personalized modules must not delay the
     // public genres and web categories that are already available.
     let mut jobs = Vec::new();
     if logged_in {
-        for (module,title) in [(3,"Recommended playlists"),(1,"Made for you"),(6,"100% playlists from your artists"),(9,"Recommended for offline listening")] {
+        for (module, title) in [
+            (3, "Recommended playlists"),
+            (1, "Made for you"),
+            (6, "100% playlists from your artists"),
+            (9, "Recommended for offline listening"),
+        ] {
             jobs.push((0, module, "", title, "playlist"));
         }
     }
-    for (path,title,kind) in [
-        ("chart/0/playlists?limit=24","Editorial playlists","playlist"),
-        ("editorial/0/releases?limit=24","New releases","album"),
-        ("editorial/0/selection?limit=24","Editors' album picks","album"),
-        ("editorial?limit=100","Genres","channel"),
-    ] { jobs.push((1,0,path,title,kind)); }
-    for (path,title) in [("/channels/explore","Categories"),("/channels/podcasts","Podcasts by category")] {
-        jobs.push((2,0,path,title,"channel"));
+    for (path, title, kind) in [
+        (
+            "chart/0/playlists?limit=8",
+            "Editorial playlists",
+            "playlist",
+        ),
+        ("editorial/0/releases?limit=8", "New releases", "album"),
+        (
+            "editorial/0/selection?limit=8",
+            "Editors' album picks",
+            "album",
+        ),
+        ("editorial?limit=8", "Genres", "channel"),
+    ] {
+        jobs.push((1, 0, path, title, kind));
     }
-    let personal_count = if logged_in {4} else {0};
+    for (path, title) in [
+        ("/channels/explore", "Categories"),
+        ("/channels/podcasts", "Podcasts by category"),
+    ] {
+        jobs.push((2, 0, path, title, "channel"));
+    }
+    let personal_count = if logged_in { 4 } else { 0 };
     let mut order = Vec::new();
     for index in 0..4 {
-        if index < personal_count { order.push(index); }
-        order.push(personal_count+index);
-        if index < 2 { order.push(personal_count+4+index); }
+        if index < personal_count {
+            order.push(index);
+        }
+        order.push(personal_count + index);
+        if index < 2 {
+            order.push(personal_count + 4 + index);
+        }
     }
     let mut results = vec![None; jobs.len()];
-    parallel::load(jobs.len(), |slot| {
-        let index = order[slot];
-        let (source,module,path,title,kind) = jobs[index];
-        let response = match source {
-            0 => engine.invoke("DZHomeModuleJSON", &[json!(module)]).map(|value| {
-                vec![Section {title:title.into(),entries:home_module_entries(&value,module as usize,kind).into_iter()
-                    .filter(|item| matches!(item.kind.as_str(),"playlist"|"mix")).collect(),..Default::default()}]
-            }),
-            1 => public(engine,path).map(|value| {
-                let mut rows = entries(&value,kind);
-                if kind == "channel" { for item in &mut rows {item.id=format!("editorial:{}",item.id);} }
-                vec![Section {title:title.into(),entries:rows,..Default::default()}]
-            }),
-            _ => web_catalog(engine,&format!("https://www.deezer.com/en{path}")).map(|value| {
-                web_sections(&value,true).into_iter().map(|mut section| {
-                    let genre = title=="Categories" && ["genre","t\u{fc}r","tarz"].iter().any(|word|section.title.to_lowercase().contains(word));
-                    section.title=if genre {"Genres"} else {title}.into();
-                    section
-                }).collect()
-            }),
-        };
-        (index, response.unwrap_or_else(|error|vec![Section {title:title.into(),error,..Default::default()}]))
-    }, |_, (index, sections)| {
-        results[index]=Some(sections);
-        page.sections.clear();
-        for sections in results.iter().flatten() {
-            for section in sections {
-                if let Some(existing)=page.sections.iter_mut().find(|s|s.title==section.title) {
-                    for item in &section.entries {
-                        if !existing.entries.iter().any(|e|e.id==item.id || e.title.eq_ignore_ascii_case(&item.title)) {
-                            existing.entries.push(item.clone());
+    let cursors = std::sync::Mutex::new(HashMap::new());
+    parallel::load(
+        jobs.len(),
+        |slot| {
+            let index = order[slot];
+            let (source, module, path, title, kind) = jobs[index];
+            let response = match source {
+                0 => {
+                    deezer_shelves::api(engine, "DZHomeModuleJSON", &[json!(module)]).map(|value| {
+                        vec![Section {
+                            title: title.into(),
+                            entries: home_module_entries(&value, module as usize, kind)
+                                .into_iter()
+                                .filter(|item| matches!(item.kind.as_str(), "playlist" | "mix"))
+                                .collect(),
+                            ..Default::default()
+                        }]
+                    })
+                }
+                1 => deezer_shelves::public(engine, path).map(|value| {
+                    cursors.lock().unwrap().insert(index, value.clone());
+                    let mut rows = entries(&value, kind);
+                    if kind == "channel" {
+                        rows.retain(|item| item.id != "0");
+                        for item in &mut rows {
+                            item.id = format!("editorial:{}", item.id);
                         }
                     }
-                } else {page.sections.push(section.clone());}
+                    vec![Section {
+                        title: title.into(),
+                        entries: rows,
+                        ..Default::default()
+                    }]
+                }),
+                _ => deezer_shelves::web(engine, &format!("https://www.deezer.com/en{path}")).map(
+                    |value| {
+                        web_sections(&value, true)
+                            .into_iter()
+                            .map(|mut section| {
+                                let genre = title == "Categories"
+                                    && ["genre", "t\u{fc}r", "tarz"]
+                                        .iter()
+                                        .any(|word| section.title.to_lowercase().contains(word));
+                                section.title = if genre { "Genres" } else { title }.into();
+                                section
+                            })
+                            .collect()
+                    },
+                ),
+            };
+            (
+                index,
+                response.unwrap_or_else(|error| {
+                    vec![Section {
+                        title: title.into(),
+                        error,
+                        ..Default::default()
+                    }]
+                }),
+            )
+        },
+        |_, (index, sections)| {
+            if let Some(value) = cursors.lock().unwrap().remove(&index) {
+                deezer_shelves::remember_public(&mut page, jobs[index].3, &value, jobs[index].4);
             }
-        }
-        page.raw.push((format!("discover-source:{index}"),Value::Null));
-        publish(&page)
-    })?;
+            results[index] = Some(sections);
+            page.sections.clear();
+            for sections in results.iter().flatten() {
+                for section in sections {
+                    if let Some(existing) =
+                        page.sections.iter_mut().find(|s| s.title == section.title)
+                    {
+                        for item in &section.entries {
+                            if let Some(old) = existing.entries.iter_mut().find(|e| {
+                                e.id == item.id || e.title.eq_ignore_ascii_case(&item.title)
+                            }) {
+                                if old.artwork.is_empty() {
+                                    old.artwork = item.artwork.clone();
+                                }
+                            } else {
+                                existing.entries.push(item.clone());
+                            }
+                        }
+                    } else {
+                        page.sections.push(section.clone());
+                    }
+                }
+            }
+            page.raw
+                .push((format!("discover-source:{index}"), Value::Null));
+            deezer_shelves::cover_directories(&mut page.sections, "");
+            publish(&page)
+        },
+    )?;
     Ok(page)
 }
 fn artist_section_entries(value: &Value, index: usize) -> Vec<Entry> {
@@ -693,6 +942,17 @@ pub(crate) fn home_module_entries(value: &Value, index: usize, kind: &str) -> Ve
         .into_iter()
         .filter(|entry| !is_liked_songs(entry) && (index != 1 || entry.kind != "flow"))
         .collect();
+    if kind == "album" {
+        for item in &mut items {
+            if item.kind == "track"
+                && item.duration == 0
+                && item.album_id.is_empty()
+                && string(&item.raw, &["__typename", "type", "kind"]).is_empty()
+            {
+                item.kind = "album".into();
+            }
+        }
+    }
     normalize_daily_mixes(&mut items);
     items
 }
@@ -745,25 +1005,46 @@ fn public_cache() -> &'static cache::Cache {
     static CACHE: std::sync::OnceLock<cache::Cache> = std::sync::OnceLock::new();
     CACHE.get_or_init(|| cache::Cache::new(32 * 1024 * 1024))
 }
-fn web_catalog(engine: &Engine, url: &str) -> Result<Arc<Value>, String> {
-    public_cache().refresh(url, std::time::Duration::from_secs(120), || engine.fetch(url), web_state)
+pub(crate) fn expire_public_cache() {
+    public_cache().expire();
 }
-fn public(engine: &Engine, path: &str) -> Result<Value, String> {
+fn web_catalog(engine: &Engine, url: &str) -> Result<Arc<Value>, String> {
+    public_cache().refresh(
+        url,
+        std::time::Duration::from_secs(120),
+        || engine.fetch(url),
+        web_state,
+    )
+}
+pub(crate) fn public(engine: &Engine, path: &str) -> Result<Value, String> {
     let url = if path.starts_with("https://api.deezer.com/") {
         path.to_string()
     } else {
         format!("https://api.deezer.com/{}", path.trim_start_matches('/'))
     };
-    let value = public_cache().refresh(&url,std::time::Duration::from_secs(120),||engine.fetch(&url),decode_public_json)?;
+    let value = public_cache().refresh(
+        &url,
+        std::time::Duration::from_secs(120),
+        || engine.fetch(&url),
+        decode_public_json,
+    )?;
     Ok((*value).clone())
 }
-pub(crate) fn public_json(url: &str, fetch: impl FnOnce() -> Result<Vec<u8>, String>) -> Result<Arc<Value>, String> {
-    public_cache().load(url,std::time::Duration::from_secs(120),fetch,decode_public_json)
+pub(crate) fn public_json(
+    url: &str,
+    fetch: impl FnOnce() -> Result<Vec<u8>, String>,
+) -> Result<Arc<Value>, String> {
+    public_cache().load(
+        url,
+        std::time::Duration::from_secs(120),
+        fetch,
+        decode_public_json,
+    )
 }
-fn decode_public_json(bytes:&[u8])->Result<Value,String> {
-    let value:Value=serde_json::from_slice(bytes).map_err(|e|e.to_string())?;
-    if let Some(error)=value.get("error") {
-        return Err(format!("Deezer: {}",string(error,&["message","type"])));
+fn decode_public_json(bytes: &[u8]) -> Result<Value, String> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    if let Some(error) = value.get("error") {
+        return Err(format!("Deezer: {}", string(error, &["message", "type"])));
     }
     Ok(value)
 }
@@ -779,15 +1060,24 @@ pub enum Job {
     TrackInfo(Entry),
 }
 pub struct Request {
+    #[cfg(feature = "diagnostics")]
+    pub view_tag: usize,
     pub generation: u64,
-    pub engine: Arc<Engine>,
+    pub provider: Provider,
+    pub engine: Option<Arc<Engine>>,
     pub job: Job,
 }
 pub enum Event {
-    Playlist(crate::playlist::Mutation, Result<crate::playlist::Outcome, String>),
+    Playlist(
+        u64,
+        Provider,
+        crate::playlist::Mutation,
+        Result<crate::playlist::Outcome, String>,
+    ),
     Page(u64, Arc<Page>),
-    Api(u64, String, Result<Value, String>),
+    Api(u64, Provider, String, Result<Value, String>),
     Lyrics(
+        Provider,
         String,
         u32,
         Result<(String, Vec<crate::lyrics::LyricLine>), String>,
@@ -809,7 +1099,9 @@ struct EventSender {
 impl EventSender {
     fn send(&self, event: Event) -> Result<(), mpsc::SendError<Event>> {
         let event = match event {
-            Event::Page(generation, page) => Event::Page(generation, self.session.apply(generation, page)),
+            Event::Page(generation, page) => {
+                Event::Page(generation, self.session.apply(generation, page))
+            }
             other => other,
         };
         self.tx.send(event)
@@ -824,6 +1116,24 @@ impl EventSender {
     }
 }
 impl Worker {
+    /// API browsing does not depend on a native Deezer engine or Soloist playback.
+    pub fn request_spotify(&self, generation: u64, job: Job) -> Result<(), String> {
+        #[cfg(feature = "diagnostics")]
+        let view_tag = match &job {
+            Job::Route(view, ..) => *view as usize + 1,
+            _ => 0,
+        };
+        self.requests
+            .send(Request {
+                #[cfg(feature = "diagnostics")]
+                view_tag,
+                generation,
+                provider: Provider::Spotify,
+                engine: None,
+                job,
+            })
+            .map_err(|_| "Catalog worker stopped".into())
+    }
     pub fn set_generation(&self, generation: u64) {
         self.route_generation.store(generation, Ordering::Relaxed);
     }
@@ -833,7 +1143,10 @@ impl Worker {
         let (requests, rx) = mpsc::channel::<Request>();
         let (tx, updates) = mpsc::sync_channel(4);
         let session = Arc::new(session::Store::for_session());
-        let tx = EventSender {tx, session:session.clone()};
+        let tx = EventSender {
+            tx,
+            session: session.clone(),
+        };
         let (lyrics_tx, lyrics_rx) = mpsc::sync_channel::<Request>(16);
         let lyrics_events = tx.clone();
         std::thread::spawn(move || {
@@ -846,6 +1159,12 @@ impl Worker {
                 while let Ok(newer) = lyrics_rx.try_recv() {
                     request = newer;
                 }
+                #[cfg(feature = "diagnostics")]
+                let _page_scope = crate::memory_profile::page_scope(if request.view_tag == 0 {
+                    0
+                } else {
+                    request.view_tag + 64
+                });
                 let (track, id, sources, neighbors) = match request.job {
                     Job::Lyrics(track, id, sources) => (track, id, sources, Vec::new()),
                     Job::LyricsWindow(track, neighbors, sources) => {
@@ -854,10 +1173,18 @@ impl Worker {
                     }
                     _ => continue,
                 };
-                let result =
-                    crate::lyrics::fetch_best_lyrics(&request.engine, &track, &id, sources);
+                let result = match request.provider {
+                    Provider::Spotify => crate::lyrics::fetch_spotify_lyrics(&track, &id, sources),
+                    Provider::Deezer => request
+                        .engine
+                        .as_deref()
+                        .ok_or_else(|| "Deezer engine unavailable".to_string())
+                        .and_then(|engine| {
+                            crate::lyrics::fetch_best_lyrics(engine, &track, &id, sources)
+                        }),
+                };
                 if lyrics_events
-                    .send(Event::Lyrics(id, sources, result))
+                    .send(Event::Lyrics(request.provider, id, sources, result))
                     .is_err()
                 {
                     break;
@@ -872,12 +1199,20 @@ impl Worker {
                         && !neighbor.id.is_empty()
                         && neighbor.id != track.id
                     {
-                        let _ = crate::lyrics::fetch_best_lyrics(
-                            &request.engine,
-                            &neighbor,
-                            &neighbor.id,
-                            sources,
-                        );
+                        if request.provider == Provider::Spotify {
+                            let _ = crate::lyrics::fetch_spotify_lyrics(
+                                &neighbor,
+                                &neighbor.id,
+                                sources,
+                            );
+                        } else if let Some(engine) = request.engine.as_deref() {
+                            let _ = crate::lyrics::fetch_best_lyrics(
+                                engine,
+                                &neighbor,
+                                &neighbor.id,
+                                sources,
+                            );
+                        }
                     }
                 }
             }
@@ -886,7 +1221,7 @@ impl Worker {
         let route_generation = Arc::new(AtomicU64::new(0));
         let history_generation = route_generation.clone();
         let worker_generation = route_generation.clone();
-        let (history_tx, history_rx) = mpsc::sync_channel::<(u64, Arc<Engine>, Page)>(1);
+        let (history_tx, history_rx) = mpsc::sync_channel::<(u64, Arc<Engine>, Page, usize)>(1);
         let history_events = tx.clone();
         std::thread::spawn(move || {
             let mut recent_metadata = HashMap::<(String, String), Entry>::new();
@@ -894,7 +1229,9 @@ impl Worker {
                 while let Ok(newer) = history_rx.try_recv() {
                     request = newer;
                 }
-                let (generation, engine, mut page) = request;
+                let (generation, engine, mut page, _view_tag) = request;
+                #[cfg(feature = "diagnostics")]
+                let _page_scope = crate::memory_profile::page_scope(_view_tag + 64);
                 if history_generation.load(Ordering::Relaxed) != generation {
                     continue;
                 }
@@ -956,10 +1293,18 @@ impl Worker {
         let (action_tx, action_rx) = mpsc::channel();
         std::thread::spawn(move || {
             while let Ok(request) = rx.recv() {
-                let target = if matches!(request.job, Job::Route(..) | Job::More(..) | Job::TrackInfo(..)) {
+                let target = if matches!(
+                    request.job,
+                    Job::Route(..) | Job::More(..) | Job::TrackInfo(..)
+                ) || matches!(&request.job, Job::Api(name,_) if name == "DeezerStyleMixGenres" || name == "SpotifyStyleMixGenres")
+                {
                     &navigation_tx
-                } else { &action_tx };
-                if target.send(request).is_err() { break; }
+                } else {
+                    &action_tx
+                };
+                if target.send(request).is_err() {
+                    break;
+                }
             }
         });
         let navigation_rx = Arc::new(std::sync::Mutex::new(navigation_rx));
@@ -970,185 +1315,399 @@ impl Worker {
             let history_tx = history_tx.clone();
             let lyrics_forward = lyrics_forward.clone();
             std::thread::spawn(move || {
-            loop {
-                // Drop the receiver lock before doing network work.
-                let request = { rx.lock().unwrap().recv() };
-                let Ok(request) = request else { break; };
+                loop {
+                    // Drop the receiver lock before doing network work.
+                    let request = { rx.lock().unwrap().recv() };
+                    let Ok(request) = request else {
+                        break;
+                    };
 
-                let Request {
-                    generation,
-                    engine,
-                    job,
-                } = request;
-                if matches!(job, Job::Route(..) | Job::More(..) | Job::TrackInfo(..))
-                    && worker_generation.load(Ordering::Relaxed) != generation
-                {
-                    continue;
-                }
-                let cached = if matches!(job, Job::Route(..)) {tx.resume(generation)} else {None};
-                match job {
-                    Job::Route(View::Home, _, _) => {
-                        let shelves = [
-                            ("Recently played", "DZHomeModuleJSON", 0, "playlist"),
-                            ("Made for you", "DZHomeModuleJSON", 1, "playlist"),
-                            ("Playlists you love", "DZHomeModuleJSON", 2, "playlist"),
-                            ("Recommended playlists", "DZHomeModuleJSON", 3, "playlist"),
-                            ("Recommended artists", "DZHomeModuleJSON", 4, "artist"),
-                            ("Recommended tracks", "DZHomeModuleJSON", 5, "track"),
-                            ("100% playlists from your artists", "DZHomeModuleJSON", 6, "playlist"),
-                            ("New releases for you", "DZHomeModuleJSON", 7, "album"),
-                            ("Rediscover your favorites", "DZFavoriteAlbumsJSON", -1, "album"),
-                            ("More albums for you", "DZHomeModuleJSON", 8, "album"),
-                            ("More for you", "DZHomeModuleJSON", 9, "playlist"),
-                        ];
-                        let mut page = Page {
-                            title: "For you".into(),
-                            subtitle: "Personalized recommendations from Deezer".into(),
-                            loading: true,
-                            sections: shelves.iter().map(|(title,_,_,_)| Section {title:(*title).into(),..Default::default()}).collect(),
-                            ..Default::default()
-                        };
-                        let mut completed = 0;
-                        let _ = parallel::load(shelves.len(), |index| {
-                            let (title, name, module, kind) = shelves[index];
-                            let mut section = Section {title:title.into(),..Default::default()};
-                            if worker_generation.load(Ordering::Relaxed) != generation { return section; }
-                            let args = if module < 0 {vec![]} else {vec![json!(module)]};
-                            match engine.invoke(name, &args) {
-                                Ok(value) => {
-                                    section.entries = if module >= 0 {
-                                        home_module_entries(&value, module as usize, kind)
-                                    } else {
-                                        let mut rows = entries(&value,kind);
-                                        normalize_daily_mixes(&mut rows);
-                                        rows
-                                    };
-                                }
-                                Err(error) => section.error = error,
-                            }
-                            section
-                        }, |index, section| {
-                            if worker_generation.load(Ordering::Relaxed) != generation { return Err("Superseded load".into()); }
-                            page.sections[index] = section;
-                            page.raw.push((format!("home:{index}"), Value::Null));
-                            completed += 1;
-                            page.loading = completed < shelves.len();
-                            tx.send(Event::Page(generation, Arc::new(page.clone()))).map_err(|_|"Window closed".into())
-                        });
+                    let Request {
+                        #[cfg(feature = "diagnostics")]
+                        view_tag,
+                        generation,
+                        engine,
+                        provider,
+                        job,
+                    } = request;
+                    #[cfg(feature = "diagnostics")]
+                    let _page_scope = crate::memory_profile::page_scope(if view_tag == 0 {
+                        0
+                    } else {
+                        view_tag + 64
+                    });
+                    if matches!(job, Job::Route(..) | Job::More(..) | Job::TrackInfo(..))
+                        && worker_generation.load(Ordering::Relaxed) != generation
+                    {
+                        continue;
                     }
-                    Job::Playlist(mut mutation) => {
-                        let result = crate::playlist::execute(&engine, &mut mutation);
-                        if tx.send(Event::Playlist(mutation, result)).is_err() { return; }
-                    }
-                    Job::Api(name, args) => {
-                        let result = if name == "RustPodcastLibraryJSON" {
-                            podcast_library(&engine, &args)
-                        } else {
-                            engine.invoke(&name, &args)
-                        };
-                        if tx.send(Event::Api(generation, name, result)).is_err() {
-                            return;
-                        }
-                    }
-                    job @ (Job::Lyrics(..) | Job::LyricsWindow(..)) => {
+                    if matches!(job, Job::Lyrics(..) | Job::LyricsWindow(..)) {
                         let _ = lyrics_forward.try_send(Request {
+                            #[cfg(feature = "diagnostics")]
+                            view_tag,
                             generation,
+                            provider,
                             engine,
                             job,
                         });
+                        continue;
                     }
-                    Job::TrackInfo(track) => {
-                        let meta = engine
-                            .invoke("DZTrackMetadataJSON", &[json!(track.id)])
-                            .or_else(|_| public(&engine, &format!("track/{}", track.id)))
-                            .unwrap_or_else(|_| track.raw.clone());
-                        let artist_id = if !track.artist_id.is_empty() {
-                            track.artist_id.clone()
-                        } else {
-                            string(&meta["artist"], &["id"])
-                        };
-                        let artist_meta = if !artist_id.is_empty() {
-                            public(&engine, &format!("artist/{artist_id}")).unwrap_or(Value::Null)
-                        } else {
-                            Value::Null
-                        };
-                        if tx
-                            .send(Event::TrackInfo(
-                                generation,
-                                Box::new(track),
-                                meta,
-                                artist_meta,
-                            ))
-                            .is_err()
-                        {
-                            return;
-                        }
+                    if provider == Provider::Spotify {
+                        spotify::process(generation, job, &tx, &worker_generation);
+                        continue;
                     }
-                    Job::More(mut page) => {
-                        let cursor = page.next.clone();
-                        let result = if cursor.is_empty() {
-                            Err("No more results are available".into())
-                        } else {
-                            public(&engine, &cursor)
-                        };
-                        match result {
-                            Ok(value) => {
-                                append_page(&mut page, &cursor, value);
-                            }
-                            Err(error) => page.error = error,
-                        }
-                        page.loading = false;
-                        let _ = tx.send(Event::Page(generation, Arc::new(page)));
-                    }
-                    Job::Route(view, entity, query) => {
-                        let result = load(&engine, view, entity, query, &mut |page| {
-                            if worker_generation.load(Ordering::Relaxed) != generation {
-                                return Err("Superseded load".into());
-                            }
-                            let mut partial = page.clone();
-                            partial.loading = true;
-                            tx.send(Event::Page(generation, Arc::new(partial)))
-                                .map_err(|_| "Window closed".to_string())
-                        });
-                        if worker_generation.load(Ordering::Relaxed) != generation {
-                            continue;
-                        }
-                        let page = match result {
-                            Ok(mut page) => {
-                                let depth = cached.as_deref().map(session::pagination_depth).unwrap_or(0);
-                                for _ in 0..depth {
-                                    if page.next.is_empty() || worker_generation.load(Ordering::Relaxed) != generation {break;}
-                                    let cursor = page.next.clone();
-                                    match public(&engine,&cursor) {
-                                        Ok(value) => append_page(&mut page,&cursor,value),
-                                        Err(error) => {page.error=error;break;}
-                                    }
-                                    let mut partial=page.clone();
-                                    partial.loading=true;
-                                    let _=tx.send(Event::Page(generation,Arc::new(partial)));
-                                }
-                                page
-                            },
-                            Err(error) => Page {
-                                title: view.title().into(),
-                                error,
+                    let Some(engine) = engine else {
+                        continue;
+                    };
+                    let cached = if matches!(job, Job::Route(..)) {
+                        tx.resume(generation)
+                    } else {
+                        None
+                    };
+                    match job {
+                        Job::Route(View::Home, _, _) => {
+                            let shelves = [
+                                ("Recently played", "DZHomeModuleJSON", 0, "playlist"),
+                                ("Made for you", "DZHomeModuleJSON", 1, "playlist"),
+                                ("Playlists you love", "DZHomeModuleJSON", 2, "playlist"),
+                                ("Recommended playlists", "DZHomeModuleJSON", 3, "playlist"),
+                                ("Recommended artists", "DZHomeModuleJSON", 4, "artist"),
+                                ("Recommended tracks", "DZHomeModuleJSON", 5, "track"),
+                                (
+                                    "100% playlists from your artists",
+                                    "DZHomeModuleJSON",
+                                    6,
+                                    "playlist",
+                                ),
+                                ("New releases for you", "DZHomeModuleJSON", 7, "album"),
+                                (
+                                    "Rediscover your favorites",
+                                    "DZFavoriteAlbumsJSON",
+                                    -1,
+                                    "album",
+                                ),
+                                ("More albums for you", "DZHomeModuleJSON", 8, "album"),
+                                ("More for you", "DZHomeModuleJSON", 9, "playlist"),
+                            ];
+                            let mut page = Page {
+                                title: "For you".into(),
+                                subtitle: format!(
+                                    "Personalized recommendations from {}",
+                                    provider.label()
+                                ),
+                                loading: true,
+                                sections: shelves
+                                    .iter()
+                                    .map(|(title, _, _, _)| Section {
+                                        title: (*title).into(),
+                                        ..Default::default()
+                                    })
+                                    .collect(),
                                 ..Default::default()
-                            },
-                        };
-                        if tx
-                            .send(Event::Page(generation, Arc::new(page.clone())))
-                            .is_err()
-                        {
-                            return;
+                            };
+                            let mut completed = 0;
+                            let _ = parallel::load(
+                                shelves.len(),
+                                |index| {
+                                    let (title, name, module, kind) = shelves[index];
+                                    let mut section = Section {
+                                        title: title.into(),
+                                        ..Default::default()
+                                    };
+                                    if worker_generation.load(Ordering::Relaxed) != generation {
+                                        return section;
+                                    }
+                                    let args = if module < 0 {
+                                        vec![]
+                                    } else {
+                                        vec![json!(module)]
+                                    };
+                                    match provider.invoke(&engine, name, &args) {
+                                        Ok(value) => {
+                                            section.entries = if module >= 0
+                                                && provider == Provider::Deezer
+                                            {
+                                                home_module_entries(&value, module as usize, kind)
+                                            } else {
+                                                let mut rows = entries(&value, kind);
+                                                normalize_daily_mixes(&mut rows);
+                                                rows
+                                            };
+                                        }
+                                        Err(error) => section.error = error,
+                                    }
+                                    section
+                                },
+                                |index, section| {
+                                    if worker_generation.load(Ordering::Relaxed) != generation {
+                                        return Err("Superseded load".into());
+                                    }
+                                    page.sections[index] = section;
+                                    page.raw.push((format!("home:{index}"), Value::Null));
+                                    completed += 1;
+                                    page.loading = completed < shelves.len();
+                                    tx.send(Event::Page(generation, Arc::new(page.clone())))
+                                        .map_err(|_| "Window closed".into())
+                                },
+                            );
                         }
-                        if view == View::Recent {
-                            // Cover metadata must never occupy the page/API worker.
-                            let _ = history_tx.try_send((generation, engine, page));
+                        Job::Playlist(mut mutation) => {
+                            let result = if provider == Provider::Spotify {
+                                crate::playlist::execute_spotify(&mut mutation)
+                            } else {
+                                crate::playlist::execute(&engine, &mut mutation)
+                            };
+                            if tx
+                                .send(Event::Playlist(generation, provider, mutation, result))
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Job::Api(name, args) => {
+                            let result = if matches!(
+                                name.as_str(),
+                                "DeezerStyleMixGenres" | "SpotifyStyleMixGenres"
+                            ) {
+                                args.first()
+                                    .and_then(Value::as_u64)
+                                    .ok_or_else(|| "Choose a valid language".to_string())
+                                    .and_then(|region| {
+                                        if provider == Provider::Spotify {
+                                            provider.invoke(&engine, "StyleMixGenres", &args)
+                                        } else {
+                                            crate::style_mix::available_genres_while(
+                                                &engine,
+                                                region as usize,
+                                                || {
+                                                    worker_generation.load(Ordering::Relaxed)
+                                                        == generation
+                                                },
+                                            )
+                                        }
+                                    })
+                            } else if provider == Provider::Spotify {
+                                provider.invoke(&engine, &name, &args)
+                            } else if name == "RustPodcastLibraryJSON" {
+                                podcast_library(&engine, &args)
+                            } else if name == "StyleMixGenres" {
+                                args.first()
+                                    .and_then(Value::as_u64)
+                                    .ok_or_else(|| "Choose a valid language".to_string())
+                                    .and_then(|region| {
+                                        crate::style_mix::available_genres_while(
+                                            &engine,
+                                            region as usize,
+                                            || {
+                                                worker_generation.load(Ordering::Relaxed)
+                                                    == generation
+                                            },
+                                        )
+                                    })
+                            } else {
+                                engine.invoke(&name, &args)
+                            };
+                            if tx
+                                .send(Event::Api(generation, provider, name, result))
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        job @ (Job::Lyrics(..) | Job::LyricsWindow(..)) => {
+                            let _ = lyrics_forward.try_send(Request {
+                                #[cfg(feature = "diagnostics")]
+                                view_tag,
+                                generation,
+                                provider,
+                                engine: Some(engine),
+                                job,
+                            });
+                        }
+                        Job::TrackInfo(track) => {
+                            let meta = provider
+                                .invoke(&engine, "DZTrackMetadataJSON", &[json!(track.id)])
+                                .or_else(|error| {
+                                    if provider == Provider::Deezer {
+                                        public(&engine, &format!("track/{}", track.id))
+                                    } else {
+                                        Err(error)
+                                    }
+                                })
+                                .unwrap_or_else(|_| track.raw.clone());
+                            let artist_id = if !track.artist_id.is_empty() {
+                                track.artist_id.clone()
+                            } else {
+                                string(&meta["artist"], &["id"])
+                            };
+                            let artist_meta = if !artist_id.is_empty() {
+                                if provider == Provider::Spotify {
+                                    provider
+                                        .invoke(
+                                            &engine,
+                                            "SPCatalogItemJSON",
+                                            &[json!("artist"), json!(artist_id)],
+                                        )
+                                        .unwrap_or(Value::Null)
+                                } else {
+                                    public(&engine, &format!("artist/{artist_id}"))
+                                        .unwrap_or(Value::Null)
+                                }
+                            } else {
+                                Value::Null
+                            };
+                            if tx
+                                .send(Event::TrackInfo(
+                                    generation,
+                                    Box::new(track),
+                                    meta,
+                                    artist_meta,
+                                ))
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Job::More(mut page) if page.next.starts_with("flow:") => {
+                            let config = page.next.trim_start_matches("flow:").to_string();
+                            let result = if config.is_empty() || config == "default" {
+                                provider.invoke(&engine, "DZFlowJSON", &[])
+                            } else {
+                                provider.invoke(&engine, "DZFlowForConfigJSON", &[json!(config)])
+                            };
+                            match result {
+                                Ok(value) => {
+                                    append_flow_rows(&mut page, table_entries(&value, "track"));
+                                    page.error.clear();
+                                }
+                                Err(error) => page.error = error,
+                            }
+                            page.loading = false;
+                            let _ = tx.send(Event::Page(generation, Arc::new(page)));
+                        }
+                        Job::More(mut page) => {
+                            if let Some(index) = page
+                                .raw
+                                .iter()
+                                .position(|(key, _)| key == "spotify:more-shelf")
+                            {
+                                let (_, request) = page.raw.remove(index);
+                                let title = request["title"].as_str().unwrap_or("");
+                                let target = request["target"].as_u64().unwrap_or(0) as usize;
+                                if let Err(error) =
+                                    deezer_shelves::more(&engine, &mut page, title, target)
+                                {
+                                    page.error = error;
+                                }
+                                page.loading = false;
+                                let _ = tx.send(Event::Page(generation, Arc::new(page)));
+                                continue;
+                            }
+                            let cursor = page.next.clone();
+                            let result = if cursor.is_empty() {
+                                Err("No more results are available".into())
+                            } else {
+                                provider.next(&engine, &cursor)
+                            };
+                            match result {
+                                Ok(value) => {
+                                    append_page(&mut page, &cursor, value);
+                                }
+                                Err(error) => page.error = error,
+                            }
+                            page.loading = false;
+                            let _ = tx.send(Event::Page(generation, Arc::new(page)));
+                        }
+                        Job::Route(view, entity, query) => {
+                            if (view == View::Album || view == View::Artist || view == View::Show)
+                                && entity.is_none()
+                            {
+                                if let Some(page) = cached.clone() {
+                                    let mut page = (*page).clone();
+                                    page.loading = false;
+                                    let _ = tx.send(Event::Page(generation, Arc::new(page)));
+                                    continue;
+                                }
+                            }
+                            if view == View::Flow {
+                                if let Some(page) =
+                                    cached.clone().filter(|page| !page.rows.is_empty())
+                                {
+                                    let mut page = (*page).clone();
+                                    page.loading = false;
+                                    let _ = tx.send(Event::Page(generation, Arc::new(page)));
+                                    continue;
+                                }
+                            }
+                            let mut publish = |page: &Page| {
+                                if worker_generation.load(Ordering::Relaxed) != generation {
+                                    return Err("Superseded load".into());
+                                }
+                                let mut partial = page.clone();
+                                partial.loading = true;
+                                tx.send(Event::Page(generation, Arc::new(partial)))
+                                    .map_err(|_| "Window closed".to_string())
+                            };
+                            let result = if provider == Provider::Spotify {
+                                spotify::load(&engine, view, entity, query, &mut publish)
+                            } else {
+                                load(&engine, view, entity, query, &mut publish)
+                            };
+                            if worker_generation.load(Ordering::Relaxed) != generation {
+                                continue;
+                            }
+                            let page = match result {
+                                Ok(mut page) => {
+                                    let depth = cached
+                                        .as_deref()
+                                        .map(session::pagination_depth)
+                                        .unwrap_or(0);
+                                    for _ in 0..depth {
+                                        if page.next.is_empty()
+                                            || worker_generation.load(Ordering::Relaxed)
+                                                != generation
+                                        {
+                                            break;
+                                        }
+                                        let cursor = page.next.clone();
+                                        match provider.next(&engine, &cursor) {
+                                            Ok(value) => append_page(&mut page, &cursor, value),
+                                            Err(error) => {
+                                                page.error = error;
+                                                break;
+                                            }
+                                        }
+                                        let mut partial = page.clone();
+                                        partial.loading = true;
+                                        let _ = tx.send(Event::Page(generation, Arc::new(partial)));
+                                    }
+                                    page
+                                }
+                                Err(error) => Page {
+                                    title: view.title().into(),
+                                    error,
+                                    ..Default::default()
+                                },
+                            };
+                            if tx
+                                .send(Event::Page(generation, Arc::new(page.clone())))
+                                .is_err()
+                            {
+                                return;
+                            }
+                            if view == View::Recent && provider == Provider::Deezer {
+                                // Cover metadata must never occupy the page/API worker.
+                                let _ = history_tx.try_send((
+                                    generation,
+                                    engine,
+                                    page,
+                                    view as usize + 1,
+                                ));
+                            }
                         }
                     }
                 }
-            }
-        });
+            });
         }
         Self {
             requests,
@@ -1215,45 +1774,87 @@ fn append_page(page: &mut Page, cursor: &str, value: Value) {
     };
     page.error.clear();
     page.raw.push((format!("next:{cursor}"), Value::Null));
-    page.raw.push(("cache:chunk".into(),json!({"cursor":cursor,"start":start,"end":page.rows.len()})));
-    if let Some((_,value))=page.raw.iter_mut().find(|(key,_)|key=="cache:pagination-depth") {*value=json!(depth+1);}
+    page.raw.push((
+        "cache:chunk".into(),
+        json!({"cursor":cursor,"start":start,"end":page.rows.len()}),
+    ));
+    if let Some((_, value)) = page
+        .raw
+        .iter_mut()
+        .find(|(key, _)| key == "cache:pagination-depth")
+    {
+        *value = json!(depth + 1);
+    }
 }
-fn dynamic_sections(engine: &Engine, uri: &str, page: &mut Page, publish: &mut dyn FnMut(&Page) -> Result<(), String>) -> Result<(), String> {
+fn dynamic_sections(
+    engine: &Engine,
+    uri: &str,
+    page: &mut Page,
+    publish: &mut dyn FnMut(&Page) -> Result<(), String>,
+) -> Result<(), String> {
     publish(page)?;
-    let value = engine.invoke("DZDiscoveryPageJSON", &[json!(uri), json!("")])?;
+    let value = deezer_shelves::api(engine, "DZDiscoveryPageJSON", &[json!(uri), json!("")])?;
     let sections = value
         .pointer("/data/dynamicPage/sections/edges")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    for batch in sections.iter().take(24).collect::<Vec<_>>().chunks(4) {
+    for batch in sections.iter().take(24).collect::<Vec<_>>().chunks(3) {
         let results = std::thread::scope(|scope| {
-            let jobs: Vec<_> = batch.iter().map(|edge| {
-                let node = &edge["node"];
-                let id = string(node, &["id"]);
-                let kind = string(node, &["__typename"]);
-                let title = string(node, &["title"]);
-                scope.spawn(move || {
-                    let result = if id.is_empty() { Ok(Value::Null) } else {
-                        engine.invoke("DZDiscoverySectionJSON", &[json!(id), json!(kind), json!("")])
-                    };
-                    (id, title, result)
+            let jobs: Vec<_> = batch
+                .iter()
+                .map(|edge| {
+                    let node = &edge["node"];
+                    let id = string(node, &["id"]);
+                    let kind = string(node, &["__typename"]);
+                    let title = string(node, &["title"]);
+                    scope.spawn(move || {
+                        let result = if id.is_empty() {
+                            Ok(Value::Null)
+                        } else {
+                            deezer_shelves::api(
+                                engine,
+                                "DZDiscoverySectionJSON",
+                                &[json!(id), json!(kind), json!("")],
+                            )
+                        };
+                        (id, title, kind, result)
+                    })
                 })
-            }).collect();
-            jobs.into_iter().filter_map(|job| job.join().ok()).collect::<Vec<_>>()
+                .collect();
+            jobs.into_iter()
+                .filter_map(|job| job.join().ok())
+                .collect::<Vec<_>>()
         });
-        for (id, title, result) in results {
-            if id.is_empty() { continue; }
+        for (id, title, kind, result) in results {
+            if id.is_empty() {
+                continue;
+            }
             match result {
                 Ok(content) => {
-                    page.sections.push(Section { title, entries: entries(&content, "playlist"), ..Default::default() });
+                    deezer_shelves::remember_dynamic(page, &title, &content, &id, &kind);
+                    page.sections.push(Section {
+                        title,
+                        entries: entries(&content, "playlist"),
+                        ..Default::default()
+                    });
                     page.raw.push((format!("section:{id}"), Value::Null));
                 }
-                Err(error) => page.sections.push(Section { title, error, ..Default::default() }),
+                Err(error) => page.sections.push(Section {
+                    title,
+                    error,
+                    ..Default::default()
+                }),
             }
             publish(page)?;
         }
     }
+    let cover = page
+        .entity
+        .as_ref()
+        .map(|item| item.artwork.as_str())
+        .unwrap_or("");
+    deezer_shelves::cover_directories(&mut page.sections, cover);
     page.raw.push((uri.into(), Value::Null));
     Ok(())
 }
@@ -1420,6 +2021,14 @@ fn load(
         page.raw = raw;
         return Ok(page);
     }
+    if view == View::StyleMix {
+        if !query.is_empty() {
+            let selection = crate::style_mix::Selection::parse(&query)?;
+            page.subtitle = format!("{} · From matching Deezer playlists", selection.title());
+            page.rows = crate::style_mix::tracks(engine, selection)?;
+        }
+        return Ok(page);
+    }
     let (name, args, kind, table) = match view {
         View::Favorites => ("DZFavoritesJSON", vec![], "track", true),
         View::Albums => ("DZFavoriteAlbumsJSON", vec![], "album", false),
@@ -1429,7 +2038,12 @@ fn load(
             if query.is_empty() || query == "default" {
                 ("DZFlowJSON", vec![], "track", true)
             } else {
-                ("DZFlowForConfigJSON", vec![json!(query)], "track", true)
+                (
+                    "DZFlowForConfigJSON",
+                    vec![json!(query.clone())],
+                    "track",
+                    true,
+                )
             }
         }
         View::Queue => ("DZQueueJSON", vec![], "track", true),
@@ -1453,36 +2067,58 @@ fn load(
                     if item.id.starts_with("deezer://") {
                         dynamic_sections(engine, &item.id, &mut page, publish)?;
                         for section in &mut page.sections {
-                            section.entries.retain(|item| matches!(item.kind.as_str(), "playlist" | "album" | "mix"));
+                            section.entries.retain(|item| {
+                                matches!(
+                                    item.kind.as_str(),
+                                    "playlist" | "album" | "mix" | "podcast"
+                                )
+                            });
                         }
                         return Ok(page);
                     }
                     if item.id.starts_with("editorial:") {
-                    publish(&page)?;
+                        publish(&page)?;
                         let id = item.id.trim_start_matches("editorial:");
                         for (part, label, kind) in [
                             ("charts", "Top playlists", "playlist"),
                             ("releases", "New releases", "album"),
                             ("selection", "Editors' album picks", "album"),
                         ] {
-                            match public(engine, &format!("editorial/{id}/{part}?limit=24")) {
+                            match deezer_shelves::public(
+                                engine,
+                                &format!("editorial/{id}/{part}?limit=8"),
+                            ) {
                                 Ok(value) => {
-                                    let data = if part == "charts" { &value["playlists"] } else { &value };
+                                    let data = if part == "charts" {
+                                        &value["playlists"]
+                                    } else {
+                                        &value
+                                    };
+                                    deezer_shelves::remember_public(&mut page, label, data, kind);
                                     page.sections.push(Section {
-                                        title: label.into(), entries: curated_entries(data, kind), ..Default::default()
+                                        title: label.into(),
+                                        entries: curated_entries(data, kind),
+                                        ..Default::default()
                                     });
                                     page.raw.push((part.into(), Value::Null));
                                 }
-                                Err(error) => page.sections.push(Section { title: label.into(), error, ..Default::default() }),
+                                Err(error) => page.sections.push(Section {
+                                    title: label.into(),
+                                    error,
+                                    ..Default::default()
+                                }),
                             }
                             publish(&page)?;
                         }
                         return Ok(page);
                     }
-                    let value = web_catalog(engine, &format!(
-                        "https://www.deezer.com/en{}",
-                        item.id.trim_start_matches("web:")
-                    ))?;
+                    let value = deezer_shelves::web(
+                        engine,
+                        &format!(
+                            "https://www.deezer.com/en{}",
+                            item.id.trim_start_matches("web:")
+                        ),
+                    )?;
                     page.sections = web_sections(&value, false);
                     page.raw.push(("web".into(), Value::Null));
                     return Ok(page);
@@ -1501,12 +2137,18 @@ fn load(
                 let preview = playlist.artwork.clone();
                 inherit_collection_metadata(&mut page, &metadata);
                 if preview.starts_with("playlist-cover:") {
-                    if let Some(entity) = page.entity.as_mut() { entity.artwork = preview; }
+                    if let Some(entity) = page.entity.as_mut() {
+                        entity.artwork = preview;
+                    }
                 }
             }
         }
         // The native album API often returns only tracks, without a header.
-        if let Some(album) = page.entity.as_ref().filter(|item| item.kind == "album" && item.artwork.is_empty()) {
+        if let Some(album) = page
+            .entity
+            .as_ref()
+            .filter(|item| item.kind == "album" && item.artwork.is_empty())
+        {
             if let Ok(metadata) = public(engine, &format!("album/{}", album.id)) {
                 inherit_collection_metadata(&mut page, &metadata);
                 page.raw.push(("album-metadata".into(), Value::Null));
@@ -1664,13 +2306,12 @@ fn load(
             page.rows.clear();
         }
     }
-    page.next = string(&value, &["next"]);
+    page.next = if view == View::Flow {
+        format!("flow:{query}")
+    } else {
+        string(&value, &["next"])
+    };
     page.raw.push((name.into(), Value::Null));
-    page.subtitle = format!(
-        "{} tracks / {} collections",
-        page.rows.len(),
-        page.sections.iter().map(|s| s.entries.len()).sum::<usize>()
-    );
     Ok(page)
 }
 #[derive(Clone)]
@@ -1678,7 +2319,7 @@ pub struct Bitmap {
     pub id: u64,
     pub width: u32,
     pub height: u32,
-    pub pixels: Vec<u32>,
+    pub pixels: Arc<Vec<u32>>,
 }
 impl Bitmap {
     pub fn new(width: u32, height: u32, pixels: Vec<u32>) -> Self {
@@ -1687,7 +2328,7 @@ impl Bitmap {
             id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             width,
             height,
-            pixels,
+            pixels: Arc::new(pixels),
         }
     }
 }
@@ -1708,7 +2349,7 @@ fn decode_image(bytes: &[u8], size: u32, cover: bool) -> Result<Bitmap, String> 
     reader.limits(limits);
     let image = reader.decode().map_err(|e| e.to_string())?;
     let image = if cover {
-        image.resize_to_fill(size, size, image::imageops::FilterType::Triangle)
+        artwork_resize::cover(image,size)
     } else {
         image.resize(size, size, image::imageops::FilterType::Triangle)
     }
@@ -1720,6 +2361,8 @@ fn decode_image(bytes: &[u8], size: u32, cover: bool) -> Result<Bitmap, String> 
     Ok(Bitmap::new(image.width(), image.height(), pixels))
 }
 pub struct ArtRequest {
+    #[cfg(feature = "diagnostics")]
+    pub view_tag: usize,
     pub engine: Option<Arc<Engine>>,
     pub url: String,
     pub key: String,
@@ -1731,8 +2374,37 @@ pub struct ArtRequest {
 // retaining a full 256px decoded copy for every thumbnail in a large queue.
 pub const CARD_ART_EDGE: u32 = 192;
 
+pub(crate) fn is_default_cover(url: &str) -> bool {
+    url.contains("/images/cover/d41d8cd98f00b204e9800998ecf8427e/")
+}
+
+pub(crate) fn cover_artwork_key(url: &str) -> String {
+    format!("cover:{}", display_artwork_url(url, 1024, true))
+}
+
+/// Spotify image arrays are not guaranteed to be ordered by resolution.
+pub(crate) fn largest_artwork<'a>(images: impl Iterator<Item = &'a Value>) -> Option<&'a str> {
+    images
+        .filter_map(|image| {
+            let url = image["url"]
+                .as_str()
+                .filter(|url| url.starts_with("https://"))?;
+            let edge = image["width"]
+                .as_u64()
+                .unwrap_or(0)
+                .max(image["height"].as_u64().unwrap_or(0));
+            Some((edge, url))
+        })
+        .max_by_key(|(edge, _)| *edge)
+        .map(|(_, url)| url)
+}
+
 pub struct Artwork {
-    pub requests: mpsc::SyncSender<ArtRequest>,
+    cache:Arc<std::sync::Mutex<ArtworkCache>>,
+    queue:Arc<artwork_queue::ArtworkQueue>,
+    cancelled_tx:mpsc::Sender<String>,
+    pub cancelled:mpsc::Receiver<String>,
+    #[cfg(test)] fixture_requests:Option<mpsc::SyncSender<ArtRequest>>,
     pub updates: mpsc::Receiver<(String, Result<Arc<Bitmap>, String>)>,
 }
 
@@ -1772,22 +2444,25 @@ pub fn display_artwork_url(url: &str, size: u32, upscale: bool) -> String {
 
 #[derive(Default)]
 struct ArtworkCache {
-    items: std::collections::VecDeque<(String, bool, Arc<Bitmap>)>,
+    // One owning cache shares allocations with resident UI images. Recent
+    // offscreen covers survive navigation instead of immediately expiring.
+    items: std::collections::VecDeque<(String, bool, Arc<Bitmap>, usize,std::time::Instant)>,
     bytes: usize,
+    pins:std::collections::HashSet<u64>,
 }
 impl ArtworkCache {
     fn get(&mut self, url: &str, background: bool) -> Option<Arc<Bitmap>> {
         let index = self
             .items
             .iter()
-            .position(|(key, bg, _)| key == url && *bg == background)?;
-        let item = self.items.remove(index)?;
-        let image = item.2.clone();
+            .position(|(key, bg, ..)| key == url && *bg == background)?;
+        let mut item = self.items.remove(index)?;
+        let image=item.2.clone();item.4=std::time::Instant::now();
         self.items.push_back(item);
         Some(image)
     }
     fn insert(&mut self, url: String, background: bool, image: Arc<Bitmap>) {
-        const LIMIT: usize = 40 * 1024 * 1024;
+        const LIMIT: usize = 64 * 1024 * 1024;
         let bytes = image.pixels.len() * 4;
         if bytes > LIMIT {
             return;
@@ -1795,38 +2470,94 @@ impl ArtworkCache {
         if let Some(index) = self
             .items
             .iter()
-            .position(|(key, bg, _)| key == &url && *bg == background)
+            .position(|(key, bg, ..)| key == &url && *bg == background)
         {
-            if let Some((_, _, old)) = self.items.remove(index) {
-                self.bytes -= old.pixels.len() * 4;
-            }
-        }
-        while self.bytes + bytes > LIMIT || self.items.len() >= 1024 {
-            if let Some((_, _, old)) = self.items.pop_front() {
-                self.bytes -= old.pixels.len() * 4;
-            } else {
-                break;
+            if let Some((_, _, _, bytes,_)) = self.items.remove(index) {
+                self.bytes -= bytes;
             }
         }
         self.bytes += bytes;
-        self.items.push_back((url, background, image));
+        self.items
+            .push_back((url, background, image, bytes,std::time::Instant::now()));
+        self.trim_to(LIMIT);
+    }
+    fn trim_to(&mut self,limit:usize){
+        while self.bytes>limit||self.items.len()>1024 {
+            let Some(index)=self.items.iter().position(|entry|!self.pins.contains(&entry.2.id))else{break;};
+            let entry=self.items.remove(index).unwrap();self.bytes=self.bytes.saturating_sub(entry.3);
+        }
     }
 }
+fn artwork_identity(image:&Bitmap,key:&str,background:bool)->u64 {
+    use sha2::{Digest,Sha256};
+    let mut hash=Sha256::new();hash.update(key.as_bytes());hash.update([background as u8]);
+    hash.update(image.width.to_le_bytes());hash.update(image.height.to_le_bytes());
+    // Bitmap pixels are an initialized contiguous u32 buffer, read only here.
+    hash.update(unsafe{std::slice::from_raw_parts(image.pixels.as_ptr().cast::<u8>(),image.pixels.len()*4)});
+    let digest=hash.finalize();(1u64<<62)|(u64::from_le_bytes(digest[..8].try_into().unwrap())&((1u64<<62)-1))
+}
 impl Artwork {
+    pub fn recent_ids(&self)->std::collections::HashSet<u64>{self.cache.lock().unwrap().items.iter().filter(|e|e.4.elapsed()<std::time::Duration::from_secs(5)).map(|e|e.2.id).collect()}
+    pub fn residency(&self,pins:std::collections::HashSet<u64>,visible:&std::collections::HashSet<u64>){
+        let mut cache=self.cache.lock().unwrap();cache.pins=pins;
+        for entry in &mut cache.items {if visible.contains(&entry.2.id){entry.4=std::time::Instant::now();}}
+        cache.trim_to(64*1024*1024);
+    }
+    pub fn shrink(&self,pins:std::collections::HashSet<u64>){let mut cache=self.cache.lock().unwrap();cache.pins=pins;cache.trim_to(2*1024*1024);}
+    pub fn request(&self,request:ArtRequest,visible:bool)->Result<(),ArtRequest>{
+        #[cfg(test)] if let Some(sender)=&self.fixture_requests{return sender.try_send(request).map_err(|e|match e{mpsc::TrySendError::Full(r)|mpsc::TrySendError::Disconnected(r)=>r});}
+        self.queue.push(request,visible)
+    }
+    #[cfg(test)] pub(crate) fn fixture(requests:mpsc::SyncSender<ArtRequest>,updates:mpsc::Receiver<(String,Result<Arc<Bitmap>,String>)>)->Self {
+        let (cancelled_tx,cancelled)=mpsc::channel();Self{cache:Arc::new(std::sync::Mutex::new(ArtworkCache::default())),queue:Arc::new(artwork_queue::ArtworkQueue::default()),cancelled_tx,cancelled,updates,fixture_requests:Some(requests)}
+    }
+    pub fn set_wanted(&self,keys:std::collections::HashSet<String>,visible:std::collections::HashSet<String>){for key in self.queue.update(keys,visible){let _=self.cancelled_tx.send(key);}}
     pub fn start() -> Self {
-        let (requests, rx) = mpsc::sync_channel::<ArtRequest>(48);
+        let queue=Arc::new(artwork_queue::ArtworkQueue::default());
+        let (cancelled_tx,cancelled)=mpsc::channel();
         let (tx, updates) = mpsc::sync_channel(16);
-        let rx = Arc::new(std::sync::Mutex::new(rx));
         let cache = Arc::new(std::sync::Mutex::new(ArtworkCache::default()));
-        for _ in 0..4 {
-            let rx = rx.clone();
+        let cpus=std::thread::available_parallelism().map_or(4,usize::from);
+        let (decode_tx,decode_rx)=mpsc::sync_channel::<(ArtRequest,Vec<u8>,String,u32)>(4);
+        let decode_rx=Arc::new(std::sync::Mutex::new(decode_rx));
+        // More network overlap without letting simultaneous decoders consume
+        // every core when the foreground UI is CPU constrained.
+        for index in 0..(cpus/4).clamp(1,2) {
+            let work=decode_rx.clone();let tx=tx.clone();let cache=cache.clone();let queue=queue.clone();let cancelled=cancelled_tx.clone();
+            std::thread::Builder::new().name(format!("artwork-decode-{index}")).spawn(move || {
+                artwork_background_priority();
+                loop {
+                    let job=work.lock().unwrap().recv();
+                    let Ok((request,bytes,cache_key,edge))=job else{return;};
+                    if !queue.wanted(&request){let _=cancelled.send(request.key);continue;}
+                    #[cfg(feature="diagnostics")]
+                    let _page_scope=crate::memory_profile::page_scope(if request.view_tag==0 {0}else{request.view_tag+128});
+                    let result=(if request.background {decode_background(&bytes,edge)}else{decode(&bytes,edge)}).map(|mut image|{image.id=artwork_identity(&image,&cache_key,request.background);Arc::new(image)});
+                    if !queue.wanted(&request){let _=cancelled.send(request.key);continue;}
+                    if let Ok(image)=&result {cache.lock().unwrap().insert(cache_key,request.background,image.clone());}
+                    let hover=if edge>256&&!request.background {result.as_ref().ok().map(|image|(format!("blur:cover:{}",request.key),image.clone()))}else{None};
+                    if tx.send((request.key,result)).is_err(){return;}
+                    if let Some((key,image))=hover {
+                        let blurred=Arc::new(crate::appearance::prepare(&image,24));
+                        if tx.send((key,Ok(blurred))).is_err(){return;}
+                    }
+                }
+            }).expect("start artwork decoder");
+        }
+        for index in 0..cpus.clamp(4,8) {
+            let queue = queue.clone();let cancelled=cancelled_tx.clone();
             let tx = tx.clone();
             let cache = cache.clone();
-            std::thread::spawn(move || loop {
-                let request = match rx.lock().unwrap().recv() {
-                    Ok(r) => r,
-                    Err(_) => return,
-                };
+            let decode_tx=decode_tx.clone();
+            std::thread::Builder::new().name(format!("artwork-fetch-{index}")).spawn(move || {artwork_background_priority();loop {
+                let Some(request)=queue.pop()else{return;};
+                if !queue.wanted(&request){let _=cancelled.send(request.key);continue;}
+                #[cfg(feature = "diagnostics")]
+                let _page_scope = crate::memory_profile::page_scope(if request.view_tag == 0 {
+                    0
+                } else {
+                    request.view_tag + 128
+                });
                 let edge = request.max_edge.clamp(64, 1024);
                 let cache_key = format!("{}@{edge}", request.url);
                 let cached = cache.lock().unwrap().get(&cache_key, request.background);
@@ -1837,7 +2568,10 @@ impl Artwork {
                     continue;
                 }
                 let url = display_artwork_url(&request.url, edge, edge > 256);
-                let public_cdn=url.strip_prefix("https://").and_then(|rest|rest.split('/').next()).is_some_and(|host|host=="dzcdn.net"||host.ends_with(".dzcdn.net"));
+                let public_cdn = url
+                    .strip_prefix("https://")
+                    .and_then(|rest| rest.split('/').next())
+                    .is_some_and(|host| host == "dzcdn.net" || host.ends_with(".dzcdn.net"));
                 let bytes = if public_cdn {
                     crate::lyrics::http::artwork(&url)
                 } else if let Some(engine) = &request.engine {
@@ -1845,74 +2579,90 @@ impl Artwork {
                 } else {
                     crate::lyrics::http::request("GET", &url, &[], &[])
                 };
-                let result = bytes
-                    .and_then(|bytes| {
-                        if request.background {
-                            decode_background(&bytes, edge)
-                        } else {
-                            decode(&bytes, edge)
-                        }
-                    })
-                    .map(Arc::new);
-                if let Ok(image) = &result {
-                    cache
-                        .lock()
-                        .unwrap()
-                        .insert(cache_key, request.background, image.clone());
+                match bytes {
+                    Ok(bytes)=>{if !queue.wanted(&request){let _=cancelled.send(request.key);continue;}
+                        if decode_tx.send((request,bytes,cache_key,edge)).is_err(){return;}},
+                    Err(error)=>if tx.send((request.key,Err(error))).is_err(){return;},
                 }
-                let hover=if edge>256 && !request.background{result.as_ref().ok().map(|image|(format!("blur:cover:{}",request.key),image.clone()))}else{None};
-                if tx.send((request.key, result)).is_err() {return;}
-                if let Some((key,image))=hover{let blurred=Arc::new(crate::appearance::prepare(&image,24));if tx.send((key,Ok(blurred))).is_err(){return;}}
-            });
+            }}).expect("start artwork fetcher");
         }
-        Self { requests, updates }
+        Self { cache,queue,cancelled_tx,cancelled,updates,#[cfg(test)] fixture_requests:None }
+    }
+}
+impl Drop for Artwork {fn drop(&mut self){self.queue.close();}}
+pub(crate) fn artwork_background_priority() {
+    unsafe {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread,SetThreadPriority,THREAD_MODE_BACKGROUND_BEGIN};
+        SetThreadPriority(GetCurrentThread(),THREAD_MODE_BACKGROUND_BEGIN);
     }
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn collection_metadata_keeps_credits_and_counts_without_duplicate_track_arrays(){
-        let input=serde_json::json!({"id":"1","title":"Collection","description":"Keep this","artists":[{"id":"2","name":"Artist"}],"tracks":{"data":vec![serde_json::json!({"id":"3","title":"Track"});5000],"total":5000},"episodes":{"data":[],"totalCount":42}});
-        let compact=compact_entry_metadata(&input);
-        assert_eq!(compact["description"],input["description"]);
-        assert_eq!(compact["artists"],input["artists"]);
-        assert_eq!(compact["tracks"]["total"],5000);
-        assert_eq!(compact["episodes"]["totalCount"],42);
+    fn collection_metadata_keeps_credits_and_counts_without_duplicate_track_arrays() {
+        let input = serde_json::json!({"id":"1","title":"Collection","description":"Keep this","artists":[{"id":"2","name":"Artist"}],"tracks":{"data":vec![serde_json::json!({"id":"3","title":"Track"});5000],"total":5000},"episodes":{"data":[],"totalCount":42}});
+        let compact = compact_entry_metadata(&input);
+        assert_eq!(compact["description"], input["description"]);
+        assert_eq!(compact["artists"], input["artists"]);
+        assert_eq!(compact["tracks"]["total"], 5000);
+        assert_eq!(compact["episodes"]["totalCount"], 42);
         assert!(compact["tracks"].get("data").is_none());
-        assert!(compact.to_string().len()*100<input.to_string().len());
+        assert!(compact.to_string().len() * 100 < input.to_string().len());
     }
     use super::*;
+    #[test]
+    fn spotify_artwork_selects_largest_valid_image_in_any_order() {
+        let images = json!([
+            {"url":"https://example.test/small","width":64},
+            {"url":"https://example.test/large","width":640},
+            {"url":"http://example.test/invalid","width":2000},
+            {"url":"https://example.test/medium","width":300}
+        ]);
+        assert_eq!(
+            largest_artwork(images.as_array().unwrap().iter()),
+            Some("https://example.test/large")
+        );
+        assert_ne!(
+            cover_artwork_key("https://example.test/large"),
+            "https://example.test/large"
+        );
+    }
     #[test]
     #[ignore = "requires the playback DLL and internet; writes only public timing results"]
     fn profile_public_web_cache() {
         let engine = Engine::load().unwrap();
         let mut report = Vec::new();
-        for (name,url) in [
-            ("explore","https://www.deezer.com/en/channels/explore"),
-            ("podcasts","https://www.deezer.com/en/channels/podcasts"),
+        for (name, url) in [
+            ("explore", "https://www.deezer.com/en/channels/explore"),
+            ("podcasts", "https://www.deezer.com/en/channels/podcasts"),
         ] {
             let cold_started = std::time::Instant::now();
-            let cold = web_catalog(&engine,url);
-            let cold_ms = cold_started.elapsed().as_secs_f64()*1000.;
+            let cold = web_catalog(&engine, url);
+            let cold_ms = cold_started.elapsed().as_secs_f64() * 1000.;
             match cold {
                 Ok(first) => {
-                    let store=session::Store::for_session();
-                    let page=Arc::new(Page{title:name.into(),sections:web_sections(&first,false),..Default::default()});
-                    store.begin(1,name.into(),None);
-                    store.apply(1,page.clone());
-                    store.begin(2,name.into(),None);
-                    let warm_started=std::time::Instant::now();
-                    let second=store.resume(2).unwrap();
-                    let warm_ms=warm_started.elapsed().as_secs_f64()*1000.;
-                    assert_eq!(page.sections,second.sections);
+                    let store = session::Store::for_session();
+                    let page = Arc::new(Page {
+                        title: name.into(),
+                        sections: web_sections(&first, false),
+                        ..Default::default()
+                    });
+                    store.begin(1, name.into(), None);
+                    store.apply(1, page.clone());
+                    store.begin(2, name.into(), None);
+                    let warm_started = std::time::Instant::now();
+                    let second = store.resume(2).unwrap();
+                    let warm_ms = warm_started.elapsed().as_secs_f64() * 1000.;
+                    assert_eq!(page.sections, second.sections);
                     report.push(json!({"page":name,"cold_ms":cold_ms,"disk_ms":warm_ms}));
                 }
                 Err(error) => report.push(json!({"page":name,"cold_ms":cold_ms,"error":error})),
             }
         }
-        let path = std::env::var("DEEZNATS_FETCH_PROFILE").expect("Set DEEZNATS_FETCH_PROFILE to an output JSON path");
-        std::fs::write(path,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        let path = std::env::var("DEEZNATS_FETCH_PROFILE")
+            .expect("Set DEEZNATS_FETCH_PROFILE to an output JSON path");
+        std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
     }
 
     #[test]
@@ -1924,13 +2674,20 @@ mod tests {
         ]}}});
         let mut page = Page {
             entity: entry(&json!({"id":"42","title":"Album"}), "album"),
-            rows: table_entries(&value, "track"), ..Default::default()
+            rows: table_entries(&value, "track"),
+            ..Default::default()
         };
         inherit_collection_metadata(&mut page, &value);
         assert_eq!(page.rows.len(), 3);
-        assert_eq!(page.entity.as_ref().unwrap().artwork, "https://example.test/album.jpg");
+        assert_eq!(
+            page.entity.as_ref().unwrap().artwork,
+            "https://example.test/album.jpg"
+        );
         assert_eq!(page.rows[0].artwork, page.rows[1].artwork);
-        assert_eq!(page.rows[0].wire()["artworkUrl"], "https://example.test/album.jpg");
+        assert_eq!(
+            page.rows[0].wire()["artworkUrl"],
+            "https://example.test/album.jpg"
+        );
         assert_eq!(page.rows[0].album, "Album");
         assert_eq!(page.rows[1].album, "Known title");
         assert_eq!(page.rows[1].album_id, "42");
@@ -1941,11 +2698,18 @@ mod tests {
     #[test]
     fn playlist_tracks_inherit_missing_metadata_without_changing_episodes() {
         let mut page = Page {
-            entity: entry(&json!({"id":"42","title":"Playlist","cover":"https://example.test/list.jpg"}), "playlist"),
-            rows: entries(&json!([
-                {"id":"1","title":"Track","kind":"track"},
-                {"id":"2","title":"Episode","kind":"episode"}
-            ]), "track"), ..Default::default()
+            entity: entry(
+                &json!({"id":"42","title":"Playlist","cover":"https://example.test/list.jpg"}),
+                "playlist",
+            ),
+            rows: entries(
+                &json!([
+                    {"id":"1","title":"Track","kind":"track"},
+                    {"id":"2","title":"Episode","kind":"episode"}
+                ]),
+                "track",
+            ),
+            ..Default::default()
         };
         inherit_collection_metadata(&mut page, &json!({}));
         assert_eq!(page.rows[0].artwork, "https://example.test/list.jpg");
@@ -1965,19 +2729,38 @@ mod tests {
             {"id":"1","title":"Artist","data":{"__TYPE__":"artist"}},
             {"id":"2","title":"100% artist","type":"playlist"},
             {"id":"3","title":"Timeless","type":"album"},
-            {"id":"4","title":"Mix","type":"mix"}
+            {"id":"4","title":"Mix","type":"mix"},
+            {"id":"6","title":"Show","type":"show","target":"/show/6"}
         ]},{"title":"Artists", "items":[{"id":"5","title":"Raw artist","type":"artist"}]}]});
         let shelves = web_sections(&state, false);
         assert_eq!(shelves.len(), 1);
-        assert_eq!(shelves[0].entries.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(), ["playlist", "album", "mix"]);
+        assert_eq!(
+            shelves[0]
+                .entries
+                .iter()
+                .map(|e| e.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["playlist", "album", "mix", "podcast"]
+        );
     }
 
     #[test]
     fn discover_filters_distinguish_channel_directories() {
-        for (title, filter) in [("Genres", 2), ("Categories", 3), ("Podcasts by category", 4)] {
-            let section = Section { title: title.into(), entries: entries(&json!([
-                {"type":"channel", "title":"Tile", "target":"/channels/chill"}
-            ]), "channel"), ..Default::default() };
+        for (title, filter) in [
+            ("Genres", 2),
+            ("Categories", 3),
+            ("Podcasts by category", 4),
+        ] {
+            let section = Section {
+                title: title.into(),
+                entries: entries(
+                    &json!([
+                        {"type":"channel", "title":"Tile", "target":"/channels/chill"}
+                    ]),
+                    "channel",
+                ),
+                ..Default::default()
+            };
             assert_eq!(section.entries[0].id, "web:/channels/chill");
             for index in 1..=4 {
                 assert_eq!(discover_section_matches(&section, index), index == filter);
@@ -2161,6 +2944,17 @@ mod tests {
             .any(|e| e.kind == "flow"));
     }
     #[test]
+    fn home_album_shelf_keeps_album_identity_under_tracks_wrapper() {
+        let value = json!({"tracks": [
+            {"id":"764165091", "displayTitle":"Metalicious", "cover":{"urls":["cover"]}},
+            {"__typename":"Track", "id":"123", "title":"A track", "duration":180}
+        ]});
+        let items = home_module_entries(&value, 8, "album");
+        assert_eq!(items[0].kind, "album");
+        assert_eq!(items[0].id, "764165091");
+        assert_eq!(items[1].kind, "track");
+    }
+    #[test]
     fn fallback_home_mix_dtos_get_numbered_without_marketing_credits() {
         let value = json!([{"id":"flow","kind":"flow","name":"Flow"},
             {"id":"m1","kind":"mix","name":"daily","subtitle":"?n planda Artist"},
@@ -2283,6 +3077,36 @@ mod tests {
     }
 
     #[test]
+    fn artwork_cache_retains_pixels_until_explicit_eviction() {
+        let mut cache = ArtworkCache::default();
+        let image = Arc::new(Bitmap::new(1, 1, vec![0]));
+        let allocation = Arc::downgrade(&image);
+        cache.insert("cover".into(), false, image.clone());
+        let consumer = cache.get("cover", false).unwrap();
+        drop(image);
+        assert!(allocation.upgrade().is_some());
+        drop(consumer);
+        assert!(allocation.upgrade().is_some());
+        assert!(cache.get("cover", false).is_some());
+        cache.trim_to(0);
+        assert!(allocation.upgrade().is_none());
+        assert_eq!(cache.bytes, 0);
+        assert!(cache.items.is_empty());
+    }
+
+    #[test]
+    fn artwork_resource_identity_survives_redecode_but_changes_with_pixels(){
+        let a=Bitmap::new(1,1,vec![0xff123456]);let b=Bitmap::new(1,1,vec![0xff123456]);
+        assert_ne!(a.id,b.id);
+        assert_eq!(artwork_identity(&a,"cover@192",false),artwork_identity(&b,"cover@192",false));
+        assert_ne!(artwork_identity(&a,"cover@192",false),artwork_identity(&b,"other@192",false));
+        assert_ne!(artwork_identity(&a,"cover@192",false),artwork_identity(&Bitmap::new(1,1,vec![0xff000000]),"cover@192",false));
+        let mut cache=ArtworkCache::default();cache.insert("pinned".into(),false,Arc::new(a));
+        let id=cache.get("pinned",false).unwrap().id;cache.pins.insert(id);cache.trim_to(0);assert_eq!(cache.bytes,4);
+        cache.pins.clear();cache.trim_to(0);assert_eq!(cache.bytes,0);
+    }
+
+    #[test]
     fn large_cover_requests_upgrade_cdn_resolution_without_affecting_other_hosts() {
         let small = "https://cdn-images.dzcdn.net/images/cover/id/250x250-000000-80-0-0.jpg";
         assert!(display_artwork_url(small, 1024, true).contains("/1024x1024-"));
@@ -2375,5 +3199,44 @@ mod tests {
         assert_eq!(entries(&state, "track")[0].title, "A; B");
         assert!(web_state(b"<html>No catalog</html>").is_err());
         assert!(web_state(b"window.__DZR_APP_STATE__ = broken;").is_err());
+    }
+}
+
+fn append_flow_rows(page: &mut Page, rows: Vec<Entry>) {
+    let mut seen: HashSet<_> = page
+        .rows
+        .iter()
+        .map(|e| (e.kind.clone(), e.id.clone()))
+        .collect();
+    page.rows.extend(
+        rows.into_iter()
+            .filter(|e| seen.insert((e.kind.clone(), e.id.clone()))),
+    );
+}
+
+#[cfg(test)]
+mod flow_batch_tests {
+    use super::*;
+    #[test]
+    fn additional_batches_keep_order_and_skip_duplicates() {
+        let track = |id: &str| Entry {
+            id: id.into(),
+            kind: "track".into(),
+            ..Default::default()
+        };
+        let mut page = Page {
+            rows: vec![track("1"), track("2")],
+            next: "flow:default".into(),
+            ..Default::default()
+        };
+        append_flow_rows(
+            &mut page,
+            vec![track("2"), track("3"), track("3"), track("4")],
+        );
+        assert_eq!(
+            page.rows.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            ["1", "2", "3", "4"]
+        );
+        assert_eq!(page.next, "flow:default");
     }
 }

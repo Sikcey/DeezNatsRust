@@ -34,8 +34,82 @@ struct Document {
     key: String,
     page: Page,
 }
+// Serialize the persistent view without cloning every entry and its raw JSON.
+#[derive(Serialize)]
+struct StoredDocument<'a> {
+    version: u32,
+    key: &'a str,
+    page: StoredPage<'a>,
+}
+#[derive(Serialize)]
+struct StoredPage<'a> {
+    title: &'a str,
+    subtitle: &'a str,
+    sections: Vec<StoredSection<'a>>,
+    rows: &'a [Entry],
+    entity: &'a Option<Entry>,
+    raw: Vec<&'a (String, serde_json::Value)>,
+    next: &'a str,
+    loading: bool,
+    error: &'static str,
+}
+#[derive(Serialize)]
+struct StoredSection<'a> {
+    title: &'a str,
+    entries: &'a [Entry],
+    error: &'static str,
+}
+impl<'a> StoredDocument<'a> {
+    fn new(key: &'a str, page: &'a Page) -> Self {
+        Self {
+            version: 1,
+            key,
+            page: StoredPage {
+                title: &page.title,
+                subtitle: &page.subtitle,
+                sections: page
+                    .sections
+                    .iter()
+                    .map(|section| StoredSection {
+                        title: &section.title,
+                        entries: &section.entries,
+                        error: "",
+                    })
+                    .collect(),
+                rows: &page.rows,
+                entity: &page.entity,
+                raw: page
+                    .raw
+                    .iter()
+                    .filter(|(key, _)| {
+                        !key.starts_with("home:") && !key.starts_with("discover-source:")
+                    })
+                    .collect(),
+                next: &page.next,
+                loading: false,
+                error: "",
+            },
+        }
+    }
+}
+
+fn is_flow_key(key: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(key)
+        .ok()
+        .and_then(|value| value.get(1).and_then(|v| v.as_str()).map(|v| v == "Flow"))
+        .unwrap_or(false)
+}
 
 impl Store {
+    pub(crate) fn refresh_flow(&self, key: &str) {
+        if is_flow_key(key) {
+            let _ = fs::remove_file(self.filename(key));
+            let mut state = self.state.lock().unwrap();
+            state.routes.retain(|_, route| route.key != key);
+            state.saved.remove(key);
+        }
+    }
+
     pub(crate) fn for_session() -> Self {
         #[cfg(test)]
         let base =
@@ -72,12 +146,24 @@ impl Store {
     }
     pub(crate) fn begin(&self, generation: u64, key: String, seed: Option<Arc<Page>>) {
         let mut state = self.state.lock().unwrap();
-        let key = format!("{}:{key}", state.epoch);
+        let key = if is_flow_key(&key) {
+            key
+        } else {
+            format!("{}:{key}", state.epoch)
+        };
         state.newest.insert(key.clone(), generation);
         state
             .routes
             .retain(|old, _| generation.saturating_sub(*old) < 16);
         state.routes.insert(generation, Route { key, page: seed });
+    }
+    pub(crate) fn release_inactive_pages(&self, current_generation: u64) {
+        let mut state = self.state.lock().unwrap();
+        for (&generation, route) in &mut state.routes {
+            if generation != current_generation {
+                route.page = None;
+            }
+        }
     }
     pub(crate) fn resume(&self, generation: u64) -> Option<Arc<Page>> {
         let key = {
@@ -102,8 +188,13 @@ impl Store {
         let mut b = std::collections::hash_map::DefaultHasher::new();
         key.hash(&mut a);
         ("page-snapshot", key).hash(&mut b);
-        self.root
-            .join(format!("{:016x}{:016x}.json", a.finish(), b.finish()))
+        let directory = if is_flow_key(key) {
+            self.root.parent().unwrap_or(&self.root).join("flow")
+        } else {
+            self.root.clone()
+        };
+        let _ = fs::create_dir_all(&directory);
+        directory.join(format!("{:016x}{:016x}.json", a.finish(), b.finish()))
     }
     fn read(&self, key: &str) -> Option<Arc<Page>> {
         let path = self.filename(key);
@@ -123,24 +214,14 @@ impl Store {
             if state.newest.get(&key) != Some(&generation) {
                 return incoming;
             }
-            let merged = Arc::new(merge(route.page.as_deref(), &incoming));
+            let merged = match route.page.as_deref() {
+                Some(previous) => Arc::new(merge(Some(previous), &incoming)),
+                None => incoming,
+            };
             state.routes.get_mut(&generation).unwrap().page = Some(merged.clone());
             (key, merged)
         };
-        let mut snapshot = (*merged).clone();
-        snapshot.loading = false;
-        snapshot.error.clear();
-        snapshot
-            .raw
-            .retain(|(key, _)| !key.starts_with("home:") && !key.starts_with("discover-source:"));
-        for section in &mut snapshot.sections {
-            section.error.clear();
-        }
-        let Ok(bytes) = serde_json::to_vec(&Document {
-            version: 1,
-            key: key.clone(),
-            page: snapshot,
-        }) else {
+        let Ok(bytes) = serde_json::to_vec(&StoredDocument::new(&key, &merged)) else {
             return merged;
         };
         let mut hash = std::collections::hash_map::DefaultHasher::new();
@@ -342,6 +423,12 @@ pub(super) fn merge(cached: Option<&Page>, incoming: &Page) -> Page {
         }
         let mut ordered = Vec::new();
         for previous in &old.sections {
+            if ordered
+                .iter()
+                .any(|section: &super::Section| section.title == previous.title)
+            {
+                continue;
+            }
             ordered.push(
                 page.sections
                     .iter()
@@ -404,6 +491,43 @@ pub(crate) fn same_render(a: &Page, b: &Page) -> bool {
 mod tests {
     use super::super::Section;
     use super::*;
+    #[test]
+    fn stored_document_matches_sanitized_page_format() {
+        let page = Page {
+            title: "Library".into(),
+            subtitle: "Saved music".into(),
+            sections: vec![Section {
+                title: "Section".into(),
+                entries: vec![item("section-track")],
+                error: "temporary".into(),
+            }],
+            rows: vec![item("track")],
+            entity: Some(item("entity")),
+            raw: vec![
+                ("home:0".into(), serde_json::json!({"pending": true})),
+                ("discover-source:one".into(), serde_json::json!([1, 2])),
+                ("metadata".into(), serde_json::json!({"count": 42})),
+            ],
+            next: "cursor".into(),
+            loading: true,
+            error: "temporary".into(),
+        };
+        let mut expected = page.clone();
+        expected.loading = false;
+        expected.error.clear();
+        expected.sections[0].error.clear();
+        expected
+            .raw
+            .retain(|(key, _)| !key.starts_with("home:") && !key.starts_with("discover-source:"));
+        let old = serde_json::to_vec(&Document {
+            version: 1,
+            key: "key".into(),
+            page: expected,
+        })
+        .unwrap();
+        let new = serde_json::to_vec(&StoredDocument::new("key", &page)).unwrap();
+        assert_eq!(new, old);
+    }
     fn fixture() -> (PathBuf, Store) {
         let base = std::env::temp_dir().join(format!(
             "deeznats-session-test-{}-{:?}",
@@ -431,6 +555,23 @@ mod tests {
             raw: vec![("metadata".into(), serde_json::json!({"count":42}))],
             ..Default::default()
         })
+    }
+    #[test]
+    fn inactive_routes_release_pages_and_reload_from_disk() {
+        let (root, store) = fixture();
+        store.begin(1, "old".into(), None);
+        let old = store.apply(1, page("old"));
+        let weak = Arc::downgrade(&old);
+        drop(old);
+        store.begin(2, "current".into(), None);
+        let current = store.apply(2, page("current"));
+        store.release_inactive_pages(2);
+        assert!(weak.upgrade().is_none());
+        assert!(Arc::ptr_eq(&store.resume(2).unwrap(), &current));
+        assert_eq!(store.resume(1).unwrap().rows[0].id, "old");
+        drop(current);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn snapshots_survive_memory_eviction_for_the_whole_session_and_keep_metadata() {
@@ -621,6 +762,52 @@ mod tests {
         assert!(other.resume(1).is_none());
         drop(store);
         assert!(!root.exists());
+        fs::remove_dir_all(base).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod flow_persistence_tests {
+    use super::*;
+
+    #[test]
+    fn flow_survives_store_restart_and_refresh_is_scoped() {
+        let base = std::env::temp_dir().join(format!("deeznats-flow-test-{}", std::process::id()));
+        let make_store = |name: &str| {
+            let root = base.join(name);
+            fs::create_dir_all(&root).unwrap();
+            Store {
+                root,
+                state: Mutex::new(State::default()),
+                writer: Mutex::new(()),
+                lease: None,
+            }
+        };
+        let key = r#"["user-a","Flow","","","","default"]"#;
+        let other = r#"["user-b","Flow","","","","default"]"#;
+        let first = make_store("first");
+        first.begin(1, key.into(), None);
+        first.apply(
+            1,
+            Arc::new(Page {
+                rows: vec![Entry {
+                    id: "one".into(),
+                    kind: "track".into(),
+                    ..Default::default()
+                }],
+                next: "flow:default".into(),
+                ..Default::default()
+            }),
+        );
+        let second = make_store("second");
+        second.begin(2, key.into(), None);
+        assert_eq!(second.resume(2).unwrap().rows[0].id, "one");
+        second.begin(3, other.into(), None);
+        assert!(second.resume(3).is_none());
+        second.refresh_flow(key);
+        let third = make_store("third");
+        third.begin(4, key.into(), None);
+        assert!(third.resume(4).is_none());
         fs::remove_dir_all(base).unwrap();
     }
 }

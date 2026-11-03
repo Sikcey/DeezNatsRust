@@ -24,6 +24,8 @@ pub const EXPORTS: &[&str] = &[
     "DZAlbumLibraryJSON",
     "DZPlaylistsJSON",
     "DZPlaylistTracksJSON",
+    "DZPlaylistTracksStrictJSON",
+    "DZCopyPlaylistTracksJSON",
     "DZAlbumTracksJSON",
     "DZSearchJSON",
     "DZPlay",
@@ -376,7 +378,25 @@ impl Engine {
                         .map_err(|e| e.to_string())?;
                     self.take(function())
                 }
-                "DZPlaylistTracksJSON" => {
+                "DZCopyPlaylistTracksJSON" => {
+                    if args.len() != 2 {
+                        return Err("DZCopyPlaylistTracksJSON: wrong argument count".into());
+                    }
+                    let playlist =
+                        CString::new(args[0].as_str().ok_or("Playlist ID must be text")?)
+                            .map_err(|_| "Text contains NUL")?;
+                    let tracks =
+                        CString::new(args[1].as_str().ok_or("Track list must be JSON text")?)
+                            .map_err(|_| "Text contains NUL")?;
+                    let function = self
+                        .library
+                        .get::<unsafe extern "C" fn(*const c_char, *const c_char) -> *mut c_char>(
+                            b"DZCopyPlaylistTracksJSON\0",
+                        )
+                        .map_err(|e| e.to_string())?;
+                    self.take(function(playlist.as_ptr(), tracks.as_ptr()))
+                }
+                "DZPlaylistTracksJSON" | "DZPlaylistTracksStrictJSON" => {
                     if args.len() != 1 {
                         return Err("DZPlaylistTracksJSON: wrong argument count".into());
                     }
@@ -389,7 +409,11 @@ impl Engine {
                     let function = self
                         .library
                         .get::<unsafe extern "C" fn(*const c_char) -> *mut c_char>(
-                            b"DZPlaylistTracksJSON\0",
+                            if name == "DZPlaylistTracksStrictJSON" {
+                                b"DZPlaylistTracksStrictJSON\0"
+                            } else {
+                                b"DZPlaylistTracksJSON\0"
+                            },
                         )
                         .map_err(|e| e.to_string())?;
                     self.take(function(a0.as_ptr()))

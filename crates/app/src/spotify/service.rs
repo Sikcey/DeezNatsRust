@@ -322,8 +322,10 @@ impl Service {
 }
 impl Drop for Service {
     fn drop(&mut self) {
-        // Startup may still be waiting for the daemon. Never stall the UI/shutdown by joining it.
-        self.worker.take();
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 fn connection_status(snapshot: &Snapshot) -> Status {
@@ -605,8 +607,11 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(20));
         }
-        service.stop.store(true, Ordering::Relaxed);
-        service.worker.take().unwrap().join().unwrap();
+        let handle = service.handle();
+        let target = handle.audio_target.lock().unwrap().clone().unwrap();
+        drop(service);
+        assert!(!target.is_alive());
+        assert_eq!(handle.status().phase, Phase::Stopped);
         let lock = std::fs::OpenOptions::new()
             .write(true)
             .share_mode(0)

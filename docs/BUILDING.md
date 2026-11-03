@@ -30,6 +30,12 @@ The build helper uses the checkout's local Go SDK if present, otherwise `go.exe`
 on PATH. Its default engine location is `E:\DeezerNative`; pass `-EngineRoot`
 and `-EnginePath` explicitly on other machines.
 
+Playlist copying requires the engine's `DZPlaylistTracksStrictJSON` and
+`DZCopyPlaylistTracksJSON` exports.
+For engine checkouts without it, apply `patches/deezer-playlist-copy.patch`
+inside their `vendor/opendeezer` directory before building the engine. This
+adds complete pagination and batched writes verified against the destination.
+
 ## Tests
 
 ```powershell

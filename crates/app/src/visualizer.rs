@@ -236,31 +236,24 @@ impl Visualizer {
     ) -> Vec<(f32, f32)> {
         let bands = self.spectrum();
         let max_h = (height * 0.28).clamp(60., 220.);
-        (0..96)
-            .map(|i| {
-                let norm = i as f32 / 95.;
-                let at = norm * 31.;
-                let low = at.floor() as usize;
-                let high = (low + 1).min(31);
-                let magnitude = if playing {
-                    let smooth = |index: usize| {
-                        let mut sum = 0.;
-                        let mut weight_sum = 0.;
-                        for offset in -3i32..=3 {
-                            let weight = (4 - offset.abs()) as f32;
-                            let band = (index as i32 + offset).clamp(0, 31) as usize;
-                            sum += bands[band] * weight;
-                            weight_sum += weight;
-                        }
-                        sum / weight_sum
-                    };
-                    smooth(low) * (1. - at.fract()) + smooth(high) * at.fract()
+        let crest = |level: f32| {
+            baseline_y
+                - if playing {
+                    level.clamp(0.03, 1.0) * max_h
                 } else {
-                    0.
-                };
-                (norm * width, baseline_y - magnitude * max_h)
-            })
-            .collect()
+                    0.0
+                }
+        };
+        let mut points = Vec::with_capacity(bands.len() + 2);
+        points.push((0.0, crest(bands[0])));
+        points.extend(bands.iter().enumerate().map(|(index, &level)| {
+            (
+                width * (index as f32 + 0.5) / bands.len() as f32,
+                crest(level),
+            )
+        }));
+        points.push((width, crest(bands[bands.len() - 1])));
+        points
     }
     pub fn compute_bars(&self, count: usize, _max_h: f32) -> Vec<f32> {
         let bands = self.spectrum();
@@ -706,8 +699,7 @@ unsafe fn capture_session(
         if got_audio && mono_ring.len() >= N {
             let window_start = mono_ring.len() - N;
             let window = &mono_ring[window_start..];
-            let gain =
-                analysis_gain(f32::from_bits(output_volume.load(Ordering::Relaxed)));
+            let gain = analysis_gain(f32::from_bits(output_volume.load(Ordering::Relaxed)));
             for b in 0..64 {
                 let (cosine, sine) = &coefficients[b];
                 let mut re = 0.;
@@ -868,7 +860,7 @@ mod tests {
     fn test_visualizer_creation_and_wave_generation() {
         let v = Visualizer::new();
         let fg = v.compute_wave(1200.0, 800.0, 784.0, true, 45000, &[0; 11]);
-        assert_eq!(fg.len(), 96);
+        assert_eq!(fg.len(), 34);
         for p in &fg {
             assert!(p.1 <= 784.0);
         }

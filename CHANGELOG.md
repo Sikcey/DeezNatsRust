@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.4
+
+- Add staggered lyric scrolling, fading viewport edges and clear lyrics during manual scrolling.
+- Keep lyric motion continuous across fast verses and prevent playback-clock freezes between sparse updates.
+- Improve playlist editing and copying, track information, catalog updates and artwork handling.
+- Improve YouTube Music session persistence and playback, Spotify integration and Connect handling.
+- Include the modified YouTube Music dependency and playlist engine patch in source distributions.
+
 ## 0.1.3
 
 - Fix the queue drag handle displaying a question mark instead of the grip icon.

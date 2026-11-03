@@ -538,7 +538,7 @@ hashes:s.hashes,browse:s.browse,userAgent:navigator.userAgent,sender:s.connect.s
         if(!hash) throw Error('Spotify Web Player operation is unavailable in the current deployment: '+cmd.operation);
         url='https://api-partner.spotify.com/pathfinder/v2/query'; method='POST';
         body=JSON.stringify({operationName:cmd.operation,variables:cmd.variables,extensions:{persistedQuery:{version:1,sha256Hash:hash}}});
-        mutation=/^(add|remove|create|update|delete|change|set|follow|unfollow)/i.test(cmd.operation);
+        mutation=cmd.mutation===true || /^(add|remove|create|update|edit|delete|change|set|follow|unfollow)/i.test(cmd.operation);
       } else body=cmd.kind==='upload' ? cmd.body : cmd.body==null ? undefined : JSON.stringify(cmd.body);
       const u=new URL(url); if(!authHost(u)||u.username||u.password||u.hash)throw Error('Spotify web URL rejected');
 if(s.cooldowns[u.origin]>Date.now())throw Error('Spotify web rate limited; retry after '+Math.ceil((s.cooldowns[u.origin]-Date.now())/1000)+' seconds');

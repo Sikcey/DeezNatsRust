@@ -96,6 +96,7 @@ fn public_invoke(name: &str, args: &[Value]) -> Result<Value, String> {
         "DZPodcastShelfJSON" => if args.first().and_then(Value::as_u64)==Some(3) {raw(client,"me/episodes?limit=50").map(|v|unwrapped(v,"episode"))} else {raw(client,"me/shows?limit=50").map(|v|unwrapped(v,"show"))},
         "DZTrackMetadataJSON" => raw(client,&format!("tracks/{}",id(args,0,"track")?)),
         "DZArtistProfileJSON" => raw(client,&format!("artists/{}",id(args,0,"artist")?)),
+        "DZArtistTopJSON" => raw(client,&format!("artists/{}/top-tracks",id(args,0,"artist")?)),
         "DZArtistSectionJSON" if args.get(1).and_then(Value::as_u64)==Some(0) => raw(client,&format!("artists/{}/albums?limit=50",id(args,0,"artist")?)),
         "DZAlbumTracksJSON" => raw(client,&format!("albums/{}/tracks?limit=50",id(args,0,"album")?)),
         "DZPlaylistTracksJSON" => raw(client,&format!("playlists/{}/items?limit=50",id(args,0,"playlist")?)).map(|v|unwrapped(v,"item")),

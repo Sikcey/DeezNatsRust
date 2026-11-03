@@ -208,7 +208,10 @@ mod queue_update_tests {
     #[test]
     fn unchanged_queue_keeps_identity_and_changed_queue_is_published() {
         let mut snapshot = Snapshot::default();
-        let entry = Entry { id: "spotify:track:first".into(), ..Entry::default() };
+        let entry = Entry {
+            id: "spotify:track:first".into(),
+            ..Entry::default()
+        };
         replace_queue_if_changed(&mut snapshot, vec![entry.clone()]);
         let original = snapshot.queue.clone();
         replace_queue_if_changed(&mut snapshot, vec![entry]);

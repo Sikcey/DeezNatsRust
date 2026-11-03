@@ -22,7 +22,7 @@ winresource = "0.1"
 libloading = "0.8"
 anyhow = "1"
 async-trait = "0.1"
-ytmusic = { git = "https://github.com/sonorahq/ytmusic-rs", rev = "a8fb6f5" }
+ytmusic = { path = "../../vendor/ytmusic" }
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 rodio = { version = "0.21", default-features = false, features = ["playback", "symphonia-aac", "symphonia-isomp4", "symphonia-mkv", "symphonia-vorbis"] }
 mp3lame-encoder = "0.2.5"

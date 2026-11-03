@@ -1,0 +1,305 @@
+diff --git a/internal/deezer/playlist_copy.go b/internal/deezer/playlist_copy.go
+new file mode 100644
+--- /dev/null
++++ b/internal/deezer/playlist_copy.go
+@@ -0,0 +1,121 @@
++package deezer
++
++import (
++	"encoding/json"
++	"fmt"
++	"strings"
++)
++
++// CopyPlaylistTracks skips existing tracks, batches writes, and confirms every
++// batch with an authenticated read. A rejected write cannot look successful.
++func (c *Client) CopyPlaylistTracks(id string, tracks []string) ([]string, error) {
++	return copyPlaylistTracks(tracks, func(batch []string) error {
++		body, err := c.gw("playlist.addSongs", fmt.Sprintf(`{"playlist_id":%s,"songs":%s}`, jsonEsc(id), songsArray(batch)))
++		if err != nil {
++			return err
++		}
++		var response struct {
++			Results json.RawMessage `json:"results"`
++		}
++		if err := json.Unmarshal(body, &response); err != nil {
++			return fmt.Errorf("invalid Deezer playlist write response")
++		}
++		result := strings.TrimSpace(string(response.Results))
++		if result == "" || result == "null" || result == "false" || result == "0" {
++			return fmt.Errorf("Deezer rejected the playlist write")
++		}
++		return nil
++	}, func() ([]Track, error) { return c.PlaylistTracksForCopy(id) })
++}
++
++func copyPlaylistTracks(source []string, write func([]string) error, read func() ([]Track, error)) ([]string, error) {
++	destination, err := read()
++	if err != nil {
++		return nil, fmt.Errorf("could not read destination: %w", err)
++	}
++	present := make(map[string]bool)
++	for _, track := range destination {
++		present[track.ID] = true
++	}
++	confirmed := func() []string {
++		var result []string
++		seen := make(map[string]bool)
++		for _, id := range source {
++			if present[id] && !seen[id] {
++				result = append(result, id)
++				seen[id] = true
++			}
++		}
++		return result
++	}
++	var missing []string
++	seen := make(map[string]bool)
++	for _, id := range source {
++		if !present[id] && !seen[id] {
++			missing = append(missing, id)
++			seen[id] = true
++		}
++	}
++	for start := 0; start < len(missing); start += 50 {
++		end := start + 50
++		if end > len(missing) {
++			end = len(missing)
++		}
++		batch := missing[start:end]
++		writeErr := write(batch)
++		destination, readErr := read()
++		if readErr == nil {
++			for _, track := range destination {
++				present[track.ID] = true
++			}
++		}
++		if writeErr != nil {
++			return confirmed(), writeErr
++		}
++		if readErr != nil {
++			return confirmed(), fmt.Errorf("could not verify destination: %w", readErr)
++		}
++		for _, id := range batch {
++			if !present[id] {
++				return confirmed(), fmt.Errorf("Deezer did not retain all tracks in the last batch; retry to continue copying")
++			}
++		}
++	}
++	return confirmed(), nil
++}
++
++// PlaylistTracksForCopy must never mistake a server-capped page for the end
++// of the source, or return a partial list after a transport failure.
++func (c *Client) PlaylistTracksForCopy(id string) ([]Track, error) {
++	extra := fmt.Sprintf(`"playlist_id":%s`, jsonEsc(id))
++	return collectPlaylistCopyPages(func(start, count int) ([]Track, error) {
++		return c.gwTrackPage("playlist.getSongs", extra, start, count)
++	})
++}
++
++func collectPlaylistCopyPages(fetch func(int, int) ([]Track, error)) ([]Track, error) {
++	var tracks []Track
++	seen := make(map[string]bool)
++	for {
++		page, err := fetch(len(tracks), pageSize)
++		if err != nil {
++			return nil, err
++		}
++		if len(page) == 0 {
++			return tracks, nil
++		}
++		var signature strings.Builder
++		for _, track := range page {
++			signature.WriteString(track.ID)
++			signature.WriteByte(0)
++		}
++		if seen[signature.String()] {
++			return nil, fmt.Errorf("Deezer repeated a playlist page; copying was cancelled")
++		}
++		seen[signature.String()] = true
++		if len(tracks)+len(page) > maxTracks {
++			return nil, fmt.Errorf("source playlist exceeds the %d-track copy limit", maxTracks)
++		}
++		tracks = append(tracks, page...)
++	}
++}
+diff --git a/internal/deezer/playlist_copy_test.go b/internal/deezer/playlist_copy_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/deezer/playlist_copy_test.go
+@@ -0,0 +1,132 @@
++package deezer
++
++import (
++	"errors"
++	"strconv"
++	"testing"
++)
++
++func copyFixtureIDs(count int) []string {
++	var ids []string
++	for i := 0; i < count; i++ {
++		ids = append(ids, strconv.Itoa(i))
++	}
++	return ids
++}
++
++func TestPlaylistCopyBatchesBeyondSixtyWritesAndVerifiesDestination(t *testing.T) {
++	source := copyFixtureIDs(138)
++	var destination []Track
++	writes := 0
++	confirmed, err := copyPlaylistTracks(source, func(batch []string) error {
++		writes++
++		if len(batch) > 50 {
++			t.Fatalf("oversized batch: %d", len(batch))
++		}
++		if writes > 60 {
++			return errors.New("request limit")
++		}
++		for _, id := range batch {
++			destination = append(destination, Track{ID: id})
++		}
++		return nil
++	}, func() ([]Track, error) { return destination, nil })
++	if err != nil || len(confirmed) != 138 || writes != 3 {
++		t.Fatalf("confirmed=%d writes=%d err=%v", len(confirmed), writes, err)
++	}
++	for i, track := range destination {
++		if track.ID != source[i] {
++			t.Fatalf("order changed at %d", i)
++		}
++	}
++}
++
++func TestPlaylistCopyContinuesExistingSixtyWithoutDuplicatingThem(t *testing.T) {
++	source := copyFixtureIDs(104)
++	var destination []Track
++	for _, id := range source[:60] {
++		destination = append(destination, Track{ID: id})
++	}
++	writes := 0
++	confirmed, err := copyPlaylistTracks(source, func(batch []string) error {
++		writes++
++		for _, id := range batch {
++			destination = append(destination, Track{ID: id})
++		}
++		return nil
++	}, func() ([]Track, error) { return destination, nil })
++	if err != nil || len(confirmed) != 104 || len(destination) != 104 || writes != 1 {
++		t.Fatalf("confirmed=%d destination=%d writes=%d err=%v", len(confirmed), len(destination), writes, err)
++	}
++}
++
++func TestPlaylistCopyRejectsSilentWriteFailureAndReportsOnlyVerifiedTracks(t *testing.T) {
++	var destination []Track
++	writes := 0
++	confirmed, err := copyPlaylistTracks(copyFixtureIDs(138), func(batch []string) error {
++		writes++
++		if writes == 1 {
++			for _, id := range batch {
++				destination = append(destination, Track{ID: id})
++			}
++		}
++		return nil // Later write falsely claims success.
++	}, func() ([]Track, error) { return destination, nil })
++	if err == nil || len(confirmed) != 50 || writes != 2 {
++		t.Fatalf("confirmed=%d writes=%d err=%v", len(confirmed), writes, err)
++	}
++}
++
++func TestPlaylistCopyPagesContinueAfterSixtyTrackResponses(t *testing.T) {
++	var offsets []int
++	tracks, err := collectPlaylistCopyPages(func(start, count int) ([]Track, error) {
++		offsets = append(offsets, start)
++		end := start + 60
++		if end > 127 {
++			end = 127
++		}
++		var page []Track
++		for id := start; id < end; id++ {
++			page = append(page, Track{ID: strconv.Itoa(id)})
++		}
++		return page, nil
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(tracks) != 127 {
++		t.Fatalf("copied %d tracks, want 127", len(tracks))
++	}
++	want := []int{0, 60, 120, 127}
++	if len(offsets) != len(want) {
++		t.Fatalf("offsets: %v", offsets)
++	}
++	for i, offset := range want {
++		if offsets[i] != offset {
++			t.Fatalf("offsets: %v", offsets)
++		}
++	}
++	for i, track := range tracks {
++		if track.ID != strconv.Itoa(i) {
++			t.Fatalf("track %d: %s", i, track.ID)
++		}
++	}
++}
++
++func TestPlaylistCopyPagesRejectPartialAndRepeatedResponses(t *testing.T) {
++	page := []Track{{ID: "1"}, {ID: "2"}}
++	boom := errors.New("next page failed")
++	tracks, err := collectPlaylistCopyPages(func(start, count int) ([]Track, error) {
++		if start == 0 {
++			return page, nil
++		}
++		return nil, boom
++	})
++	if !errors.Is(err, boom) || tracks != nil {
++		t.Fatalf("partial result: %v, %v", tracks, err)
++	}
++	tracks, err = collectPlaylistCopyPages(func(int, int) ([]Track, error) { return page, nil })
++	if err == nil || tracks != nil {
++		t.Fatalf("repeated result: %v, %v", tracks, err)
++	}
++}
+diff --git a/corelib/playlist_copy.go b/corelib/playlist_copy.go
+new file mode 100644
+--- /dev/null
++++ b/corelib/playlist_copy.go
+@@ -0,0 +1,37 @@
++package main
++
++import "C"
++
++import (
++	"encoding/json"
++	"fmt"
++	"github.com/Cycl0o0/OpenDeezer/v3/internal/bridge"
++)
++
++//export DZCopyPlaylistTracksJSON
++func DZCopyPlaylistTracksJSON(id, trackIDs *C.char) *C.char {
++	client := curClient()
++	if client == nil {
++		return jsonStr(nil, fmt.Errorf("not logged in"))
++	}
++	var tracks []string
++	if err := json.Unmarshal([]byte(C.GoString(trackIDs)), &tracks); err != nil {
++		return jsonStr(nil, fmt.Errorf("invalid playlist track list"))
++	}
++	confirmed, err := client.CopyPlaylistTracks(C.GoString(id), tracks)
++	failure := ""
++	if err != nil {
++		failure = err.Error()
++	}
++	return jsonStr(map[string]any{"confirmed": confirmed, "failure": failure}, nil)
++}
++
++//export DZPlaylistTracksStrictJSON
++func DZPlaylistTracksStrictJSON(id *C.char) *C.char {
++	client := curClient()
++	if client == nil {
++		return jsonStr(nil, fmt.Errorf("not logged in"))
++	}
++	tracks, err := client.PlaylistTracksForCopy(C.GoString(id))
++	return jsonStr(map[string]any{"tracks": bridge.FromTracks(tracks)}, err)
++}

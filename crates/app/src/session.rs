@@ -142,7 +142,12 @@ fn read(path: PathBuf) -> Result<String, String> {
 fn provider_path(name: &str) -> Result<PathBuf, String> {
     if !matches!(
         name,
-        "musixmatch" | "spotify" | "spotify-soloist" | "spotify-web" | "spotify-web-api" | "youtube"
+        "musixmatch"
+            | "spotify"
+            | "spotify-soloist"
+            | "spotify-web"
+            | "spotify-web-api"
+            | "youtube"
     ) {
         return Err("Unknown credential provider".into());
     }
@@ -154,8 +159,10 @@ fn provider_path(name: &str) -> Result<PathBuf, String> {
     Ok(directory.join(format!("{name}-lyrics.dat")))
 }
 fn youtube_session_dir() -> Result<PathBuf, String> {
-    Ok(PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("User data directory unavailable")?)
-        .join("DeezNatsRust"))
+    Ok(
+        PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("User data directory unavailable")?)
+            .join("DeezNatsRust"),
+    )
 }
 pub(crate) fn provider_exists(name: &str) -> bool {
     provider_path(name).is_ok_and(|path| path.is_file())

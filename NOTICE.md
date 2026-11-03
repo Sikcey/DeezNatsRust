@@ -69,6 +69,18 @@ Dependency licenses are not replaced by this project's license.
 ## YouTube Music
 
 The YouTube Music adapter and its `ytmusic-rs` dependency are GPL-3.0-or-later.
+The locally modified dependency is retained in `vendor/ytmusic`, including its
+license and upstream revision in `README.local.md`.
 The license text is retained in
 [assets/licenses/sonora-GPL-3.0.txt](assets/licenses/sonora-GPL-3.0.txt).
 The private login window is adapted from this application's Deezer login window.
+
+## Sonora lyric effects
+
+The native lyric renderer adapts the distance-based verse haze curve, blur
+quantization, spring scrolling and row lag, viewport pinning and fading, and
+past/upcoming opacity values from
+[Sonora](https://github.com/sonorahq/sonora),
+`crates/views/src/chrome/aside.rs` (GPL-3.0-or-later).
+The license is retained in
+[assets/licenses/sonora-GPL-3.0.txt](assets/licenses/sonora-GPL-3.0.txt).

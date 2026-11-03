@@ -234,10 +234,6 @@ mod audio;
 #[cfg(windows)]
 mod catalog;
 #[cfg(windows)]
-mod youtube;
-#[cfg(windows)]
-mod youtube_webview;
-#[cfg(windows)]
 pub(crate) mod connect;
 #[cfg(windows)]
 mod downloads;
@@ -255,6 +251,10 @@ mod shortcuts;
 mod style_mix;
 #[cfg(windows)]
 mod updater;
+#[cfg(windows)]
+mod youtube;
+#[cfg(windows)]
+mod youtube_webview;
 
 #[cfg(windows)]
 mod deezer_webview;
@@ -270,6 +270,8 @@ mod spotify_webview;
 #[cfg(windows)]
 mod storage;
 
+#[cfg(windows)]
+mod instance;
 #[cfg(windows)]
 mod playlist;
 #[cfg(windows)]

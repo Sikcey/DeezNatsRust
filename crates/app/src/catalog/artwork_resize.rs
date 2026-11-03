@@ -15,7 +15,8 @@ pub(super) fn cover(image: DynamicImage, edge: u32) -> DynamicImage {
         }
         // Borrow the source crop: copying it first can allocate tens of MiB
         // just to produce a small thumbnail. Only allocate the resized output.
-        let square = imageops::crop_imm(&image, (width - side) / 2, (height - side) / 2, side, side);
+        let square =
+            imageops::crop_imm(&image, (width - side) / 2, (height - side) / 2, side, side);
         return DynamicImage::ImageRgba8(if side > edge.saturating_mul(2) {
             imageops::thumbnail(&*square, edge, edge)
         } else {
@@ -43,8 +44,11 @@ mod tests {
     #[test]
     fn downscaled_cover_keeps_the_center_crop() {
         let image = image::RgbImage::from_fn(80, 40, |x, _| {
-            if (20..60).contains(&x) { image::Rgb([20, 100, 200]) }
-            else { image::Rgb([255, 0, 0]) }
+            if (20..60).contains(&x) {
+                image::Rgb([20, 100, 200])
+            } else {
+                image::Rgb([255, 0, 0])
+            }
         });
         for edge in [8, 32] {
             let result = cover(DynamicImage::ImageRgb8(image.clone()), edge).into_rgba8();

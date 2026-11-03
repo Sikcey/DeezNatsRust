@@ -10,6 +10,32 @@ use std::{
     time::{Duration, Instant},
 };
 
+// Broad global listening preferences, informed by IFPI's 2023 music engagement survey.
+// Unlisted genres retain their catalog order; this is not live streaming data.
+pub(crate) fn popularity_rank(name: &str) -> usize {
+    const POPULAR: &[&[&str]] = &[
+        &["pop"],
+        &["rock"],
+        &["hip hop", "hip-hop", "rap"],
+        &["dance", "electronic", "edm"],
+        &["classical"],
+        &["r&b", "rnb", "soul"],
+        &["indie", "alternative"],
+        &["country"],
+        &["latin"],
+        &["reggae"],
+        &["metal"],
+        &["jazz"],
+        &["folk"],
+        &["blues"],
+        &["k-pop"],
+    ];
+    POPULAR
+        .iter()
+        .position(|aliases| aliases.iter().any(|alias| name.eq_ignore_ascii_case(alias)))
+        .unwrap_or(POPULAR.len())
+}
+
 pub const REGIONS: &[(&str, &[&str])] = &[
     ("Turkish", &["turkish", "turkce", "turk"]),
     (

@@ -22,7 +22,23 @@ pub fn can_edit(entry: &Entry, account: &Value) -> bool {
             crate::catalog::string(&entry.raw, &["creator_id", "owner_id", "USER_ID"])
         });
     let normalize = |id: String| id.strip_prefix("spotify:user:").unwrap_or(&id).to_owned();
-    !account_id.is_empty() && !owner.is_empty() && normalize(account_id) == normalize(owner)
+    if !owner.is_empty() {
+        return !account_id.is_empty() && normalize(account_id) == normalize(owner);
+    }
+    // Deezer's native playlist bridge returns the owner's display name as a
+    // string, without an ID. Compare it with the signed-in Deezer account name.
+    let owner_name = entry.raw["owner"].as_str().unwrap_or("").trim();
+    let account_name = crate::catalog::string(account, &["userName", "name"]);
+    !account_id.is_empty()
+        && account.get("userId").is_some()
+        && !owner_name.is_empty()
+        && owner_name == account_name.trim()
+}
+
+pub fn supports_privacy(provider: crate::catalog::Provider) -> bool {
+    // Spotify's public flag controls profile publication, not private access.
+    // The current Deezer bridge exposes no privacy mutation.
+    provider == crate::catalog::Provider::YouTube
 }
 
 #[derive(Clone, Default)]
@@ -37,6 +53,9 @@ pub struct Draft {
     pub y: f32,
     pub zoom: f32,
     pub seed: Option<Entry>,
+    pub public: Option<bool>,
+    pub privacy_changed: bool,
+    pub delete_requested: bool,
 }
 impl Draft {
     pub fn from_entry(entry: Option<&Entry>) -> Self {
@@ -47,6 +66,7 @@ impl Draft {
                 .map(|e| crate::catalog::string(&e.raw, &["description", "DESCRIPTION"]))
                 .unwrap_or_default(),
             preview: entry.map(|e| e.artwork.clone()).unwrap_or_default(),
+            public: entry.and_then(|entry| entry.raw["public"].as_bool()),
             x: 0.5,
             y: 0.5,
             zoom: 1.0,
@@ -102,6 +122,7 @@ pub enum Mutation {
         description: Option<String>,
         cover: Option<Vec<u8>>,
         seed: Option<String>,
+        public: Option<bool>,
     },
     Add(String, String),
     Remove(String, String),
@@ -136,7 +157,11 @@ fn execute_with(
             description,
             cover,
             seed,
+            public,
         } => {
+            if public.is_some() {
+                return Err("This provider does not support changing playlist privacy".into());
+            }
             if title.trim().is_empty() {
                 return Err("Enter a playlist name".into());
             }
@@ -214,6 +239,37 @@ fn execute_with(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn privacy_capabilities_and_unknown_state_are_explicit() {
+        use crate::catalog::{Entry, Provider};
+        assert!(super::supports_privacy(Provider::YouTube));
+        assert!(!super::supports_privacy(Provider::Spotify));
+        assert!(!super::supports_privacy(Provider::Deezer));
+        let entry = Entry {
+            raw: serde_json::json!({"public":false}),
+            ..Default::default()
+        };
+        assert_eq!(super::Draft::from_entry(Some(&entry)).public, Some(false));
+        assert_eq!(super::Draft::default().public, None);
+    }
+
+    #[test]
+    fn unsupported_provider_does_not_attempt_a_privacy_write() {
+        let mut mutation = super::Mutation::Save {
+            id: "42".into(),
+            title: "Playlist".into(),
+            description: None,
+            cover: None,
+            seed: None,
+            public: Some(false),
+        };
+        assert!(super::execute_with(&mut mutation, |_, _| panic!(
+            "Unsupported privacy must fail before sending any request"
+        ))
+        .err()
+        .unwrap()
+        .contains("privacy"));
+    }
+    #[test]
     fn edit_requires_matching_playlist_owner() {
         let mut entry = super::Entry {
             kind: "playlist".into(),
@@ -230,6 +286,19 @@ mod tests {
         assert!(!super::can_edit(&entry, &serde_json::json!({})));
         entry.raw = serde_json::json!({});
         assert!(!super::can_edit(&entry, &serde_json::json!({"id":"alice"})));
+        entry.raw = serde_json::json!({"owner":"Alice"});
+        assert!(super::can_edit(
+            &entry,
+            &serde_json::json!({"userId":"42", "name":"Alice"})
+        ));
+        assert!(!super::can_edit(
+            &entry,
+            &serde_json::json!({"userId":"42", "name":"Bob"})
+        ));
+        assert!(!super::can_edit(
+            &entry,
+            &serde_json::json!({"id":"42", "name":"Alice"})
+        ));
     }
     use super::*;
 
@@ -241,6 +310,7 @@ mod tests {
             description: None,
             cover: None,
             seed: None,
+            public: None,
         };
         let mut calls = Vec::new();
         execute_with(&mut change, |name, args| {
@@ -265,6 +335,7 @@ mod tests {
             description: Some("Description".into()),
             cover: None,
             seed: None,
+            public: None,
         };
         let mut calls = Vec::new();
         let result = execute_with(&mut change, |name, args| {
@@ -290,6 +361,7 @@ mod tests {
             description: Some(String::new()),
             cover: Some(vec![1, 2]),
             seed: Some("song".into()),
+            public: None,
         };
         let error = execute_with(&mut change, |name, args| {
             if name == "DZCreatePlaylist" {

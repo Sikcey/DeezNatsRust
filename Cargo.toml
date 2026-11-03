@@ -1,9 +1,10 @@
 [workspace]
 members = ["crates/app", "crates/core", "crates/updater"]
 resolver = "2"
+exclude = ["vendor/ytmusic"]
 
 [workspace.package]
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 publish = false
 

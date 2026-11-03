@@ -26,7 +26,9 @@ pub(super) fn track(mut t: ytmusic::Track) -> Entry {
     // treats the adjacent view count as an artist name.
     t.artists.retain(|artist| {
         let name = artist.name.trim().to_lowercase();
-        !(artist.id.is_none() && name.ends_with("views") && name.chars().any(|c| c.is_ascii_digit()))
+        !(artist.id.is_none()
+            && name.ends_with("views")
+            && name.chars().any(|c| c.is_ascii_digit()))
     });
     let artists: Vec<Value> = t.artists.iter().map(|a| json!({"id":a.id.as_deref().map(|v| id("artist",v)).unwrap_or_default(),"name":a.name,"kind":"artist"})).collect();
     let artist_id = t
@@ -80,15 +82,22 @@ fn playlist(p: ytmusic::Playlist) -> Entry {
     // owner. The upstream parser otherwise mistakes that text for an author.
     let youtube_curated = p.id.starts_with("RD")
         || p.author.as_deref().is_some_and(|author| {
-            matches!(author.trim().to_ascii_lowercase().as_str(), "youtube" | "youtube music")
+            matches!(
+                author.trim().to_ascii_lowercase().as_str(),
+                "youtube" | "youtube music"
+            )
         });
     Entry {
         id: id("playlist", &p.id),
         title: p.title,
-        subtitle: if youtube_curated { String::new() } else { p.author.unwrap_or_default() },
+        subtitle: if youtube_curated {
+            String::new()
+        } else {
+            p.author.unwrap_or_default()
+        },
         artwork: cover(&p.thumbnails),
         kind: "playlist".into(),
-        raw: json!({"provider":"youtube","owned":p.owned}),
+        raw: json!({"provider":"youtube","owned":p.owned,"public":p.public}),
         ..Default::default()
     }
 }
@@ -99,9 +108,14 @@ fn playable(t: &ytmusic::Track) -> bool {
 fn mix_song(t: &ytmusic::Track) -> bool {
     playable(t)
         && !t.is_video()
-        && t.album.as_ref().is_some_and(|album| !album.name.trim().is_empty())
-        && t.duration.is_some_and(|duration| (30..=900).contains(&duration.as_secs()))
-        && t.artists.iter().any(|artist| !artist.name.trim().is_empty())
+        && t.album
+            .as_ref()
+            .is_some_and(|album| !album.name.trim().is_empty())
+        && t.duration
+            .is_some_and(|duration| (30..=900).contains(&duration.as_secs()))
+        && t.artists
+            .iter()
+            .any(|artist| !artist.name.trim().is_empty())
 }
 fn artist_item(v: &Value) -> Option<Entry> {
     let r = v
@@ -159,12 +173,22 @@ fn item(v: &Value) -> Option<Entry> {
             artists,
             thumbnails: parse::thumbnails(browse),
             available: true,
+            kind: if browse["navigationEndpoint"]["watchEndpoint"]
+                ["watchEndpointMusicSupportedConfigs"]["watchEndpointMusicConfig"]["musicVideoType"]
+                .as_str()
+                .is_some_and(|kind| kind != "MUSIC_VIDEO_TYPE_ATV")
+            {
+                ytmusic::TrackKind::Video
+            } else {
+                ytmusic::TrackKind::Song
+            },
             ..Default::default()
         });
         let is_radio = [
             &browse["navigationEndpoint"]["watchEndpoint"]["playlistId"],
             &browse["thumbnailOverlay"]["musicItemThumbnailOverlayRenderer"]["content"]
-                ["musicPlayButtonRenderer"]["playNavigationEndpoint"]["watchEndpoint"]["playlistId"],
+                ["musicPlayButtonRenderer"]["playNavigationEndpoint"]["watchEndpoint"]
+                ["playlistId"],
         ]
         .iter()
         .any(|id| id.as_str().is_some_and(|id| id.starts_with("RD")));
@@ -235,30 +259,52 @@ fn feed(value: &Value, page: &mut Page) {
 }
 // Artist browse responses include more shelves than the typed artist endpoint exposes.
 fn artist_page(value: &Value, page: &mut Page) {
-    let header = ["musicImmersiveHeaderRenderer", "musicVisualHeaderRenderer", "musicResponsiveHeaderRenderer", "musicHeaderRenderer"]
-        .iter().find_map(|name| parse::find_renderer(value, name));
+    let header = [
+        "musicImmersiveHeaderRenderer",
+        "musicVisualHeaderRenderer",
+        "musicResponsiveHeaderRenderer",
+        "musicHeaderRenderer",
+    ]
+    .iter()
+    .find_map(|name| parse::find_renderer(value, name));
     if let Some(header) = header {
         let text = |key: &str| parse::runs_text(&header[key]).filter(|s| !s.trim().is_empty());
-        page.subtitle = text("description").or_else(|| {
-            parse::find_renderer(value, "musicDescriptionShelfRenderer")
-                .and_then(|shelf| parse::runs_text(&shelf["description"]))
-        }).unwrap_or_default();
+        page.subtitle = text("description")
+            .or_else(|| {
+                parse::find_renderer(value, "musicDescriptionShelfRenderer")
+                    .and_then(|shelf| parse::runs_text(&shelf["description"]))
+            })
+            .unwrap_or_default();
         if let Some(entity) = page.entity.as_mut() {
             if let Some(audience) = text("straplineTextOne").or_else(|| text("subtitle")) {
                 entity.subtitle = audience;
             }
             let thumbnails = parse::thumbnails(header);
-            if !thumbnails.is_empty() { entity.artwork = cover(&thumbnails); }
+            if !thumbnails.is_empty() {
+                entity.artwork = cover(&thumbnails);
+            }
         }
     }
     if let Some(shelf) = parse::find_renderer(value, "musicShelfRenderer") {
-        page.rows = shelf["contents"].as_array().into_iter().flatten()
-            .filter_map(parse::list_item_track).filter(playable).map(track).collect();
+        page.rows = shelf["contents"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(parse::list_item_track)
+            .filter(playable)
+            .map(track)
+            .collect();
     }
     feed(value, page);
     if !page.rows.is_empty() {
-        let ids: std::collections::HashSet<_> = page.rows.iter().map(|entry| entry.id.as_str()).collect();
-        page.sections.retain(|section| !section.entries.iter().all(|entry| ids.contains(entry.id.as_str())));
+        let ids: std::collections::HashSet<_> =
+            page.rows.iter().map(|entry| entry.id.as_str()).collect();
+        page.sections.retain(|section| {
+            !section
+                .entries
+                .iter()
+                .all(|entry| ids.contains(entry.id.as_str()))
+        });
     }
 }
 pub(super) async fn station(
@@ -389,7 +435,11 @@ async fn load(
                     }).collect::<Vec<_>>();
                     if !entries.is_empty() {
                         page.sections.push(Section {
-                        title: if category_shelf == 0 { "Categories".into() } else { parse::runs_text(&shelf["title"]).unwrap_or_else(|| "Genres".into()) },
+                            title: if category_shelf == 0 {
+                                "Categories".into()
+                            } else {
+                                parse::runs_text(&shelf["title"]).unwrap_or_else(|| "Genres".into())
+                            },
                             entries,
                             ..Default::default()
                         });
@@ -398,7 +448,9 @@ async fn load(
                 }
                 // Explore itself often contains only albums and navigation tiles. The mood
                 // and genre pages contain YouTube Music's curated playlist shelves.
-                let category_entries: Vec<_> = page.sections.iter()
+                let category_entries: Vec<_> = page
+                    .sections
+                    .iter()
                     .filter(|section| section.title == "Categories" || section.title == "Genres")
                     .flat_map(|section| section.entries.iter())
                     .take(4)
@@ -417,7 +469,11 @@ async fn load(
                     }
                 }
                 if !editorial.is_empty() {
-                    page.sections.push(Section { title: "Editorial playlists".into(), entries: editorial, ..Default::default() });
+                    page.sections.push(Section {
+                        title: "Editorial playlists".into(),
+                        entries: editorial,
+                        ..Default::default()
+                    });
                 }
             }
         }
@@ -459,7 +515,9 @@ async fn load(
                         .collect()
                 }
                 "artist" => {
-                    let response = api.execute("browse", Client::Music, json!({"browseId": bare(&e.id)})).await?;
+                    let response = api
+                        .execute("browse", Client::Music, json!({"browseId": bare(&e.id)}))
+                        .await?;
                     artist_page(&response, &mut page);
                 }
                 "channel" => {
@@ -500,7 +558,16 @@ async fn load(
                 for t in &mut page.rows {
                     t.raw["_youtube_radio"] = json!(true);
                 }
-                page.subtitle = "YouTube Music radio".into();
+                page.subtitle = if page
+                    .entity
+                    .as_ref()
+                    .is_some_and(|entry| entry.kind == "track")
+                {
+                    "Song radio"
+                } else {
+                    "YouTube Music radio"
+                }
+                .into();
             } else {
                 (page.rows, page.next) = tuned_flow(api, &query, 0).await?;
                 page.subtitle = "YouTube Music playlists for your mood and genres".into();
@@ -520,8 +587,8 @@ async fn load(
                                 .tracks
                                 .into_iter()
                                 .filter(|t| {
-                                            mix_song(t)
-                                                && t.video_id
+                                    mix_song(t)
+                                        && t.video_id
                                             .as_ref()
                                             .is_some_and(|id| seen.insert(id.clone()))
                                 })
@@ -613,7 +680,7 @@ async fn tuned_flow_batch(
                             rows = page
                                 .tracks
                                 .into_iter()
-                                    .filter(mix_song)
+                                .filter(mix_song)
                                 .map(track)
                                 .take(20)
                                 .collect();
@@ -632,7 +699,7 @@ async fn tuned_flow_batch(
                 Ok(tracks) => {
                     rows = tracks
                         .into_iter()
-                            .filter(mix_song)
+                        .filter(mix_song)
                         .map(track)
                         .take(20)
                         .collect()
@@ -829,8 +896,14 @@ mod tests {
     fn track_view_count_is_not_an_artist() {
         let entry = super::track(ytmusic::Track {
             artists: vec![
-                ytmusic::ArtistRef { name: "Aykut Aks?z".into(), id: None },
-                ytmusic::ArtistRef { name: "12M views".into(), id: None },
+                ytmusic::ArtistRef {
+                    name: "Aykut Aks?z".into(),
+                    id: None,
+                },
+                ytmusic::ArtistRef {
+                    name: "12M views".into(),
+                    id: None,
+                },
             ],
             ..Default::default()
         });
@@ -859,7 +932,13 @@ mod tests {
                 }}]
             }}]
         });
-        let mut page = crate::catalog::Page { entity: Some(crate::catalog::Entry { kind: "artist".into(), ..Default::default() }), ..Default::default() };
+        let mut page = crate::catalog::Page {
+            entity: Some(crate::catalog::Entry {
+                kind: "artist".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
         super::artist_page(&response, &mut page);
         assert_eq!(page.subtitle, "Artist biography");
         assert_eq!(page.entity.unwrap().subtitle, "608K monthly audience");
@@ -870,14 +949,19 @@ mod tests {
 
     #[test]
     fn radio_home_cards_hide_featured_artists() {
-        let card = |playlist_id: &str| serde_json::json!({
-            "musicTwoRowItemRenderer": {
-                "title": {"runs": [{"text": "Replay Mix"}]},
-                "subtitle": {"runs": [{"text": "Featured artist"}]},
-                "navigationEndpoint": {"watchEndpoint": {"videoId": "video", "playlistId": playlist_id}}
-            }
-        });
-        assert!(super::item(&card("RDTMAK5uy_example")).unwrap().subtitle.is_empty());
+        let card = |playlist_id: &str| {
+            serde_json::json!({
+                "musicTwoRowItemRenderer": {
+                    "title": {"runs": [{"text": "Replay Mix"}]},
+                    "subtitle": {"runs": [{"text": "Featured artist"}]},
+                    "navigationEndpoint": {"watchEndpoint": {"videoId": "video", "playlistId": playlist_id}}
+                }
+            })
+        };
+        assert!(super::item(&card("RDTMAK5uy_example"))
+            .unwrap()
+            .subtitle
+            .is_empty());
     }
 
     #[test]
@@ -886,12 +970,20 @@ mod tests {
         let api = super::super::api().expect("Sign in to YouTube Music first");
         super::super::runtime().block_on(async {
             let songs = api.search_songs("Daft Punk Get Lucky").await.unwrap();
-            let url = songs.iter().map(|song| super::cover(&song.thumbnails))
-                .find(|url| !url.is_empty()).expect("no song artwork");
+            let url = songs
+                .iter()
+                .map(|song| super::cover(&song.thumbnails))
+                .find(|url| !url.is_empty())
+                .expect("no song artwork");
             let large = crate::catalog::display_artwork_url(&url, 1024, true);
             let bytes = crate::lyrics::http::artwork(&large).unwrap();
             let image = image::load_from_memory(&bytes).unwrap();
-            assert!(image.width() >= 500 && image.height() >= 500, "artwork was {}x{}", image.width(), image.height());
+            assert!(
+                image.width() >= 500 && image.height() >= 500,
+                "artwork was {}x{}",
+                image.width(),
+                image.height()
+            );
         });
     }
     #[test]
@@ -900,8 +992,14 @@ mod tests {
             video_id: Some("song".into()),
             available: true,
             duration: Some(std::time::Duration::from_secs(210)),
-            album: Some(ytmusic::AlbumRef { name: "Album".into(), id: None }),
-            artists: vec![ytmusic::ArtistRef { name: "Artist".into(), id: None }],
+            album: Some(ytmusic::AlbumRef {
+                name: "Album".into(),
+                id: None,
+            }),
+            artists: vec![ytmusic::ArtistRef {
+                name: "Artist".into(),
+                id: None,
+            }],
             ..Default::default()
         };
         assert!(super::mix_song(&song));
@@ -923,11 +1021,20 @@ mod tests {
     }
     #[test]
     fn playlist_subtitle_excludes_youtube_curators_and_featured_artists() {
-        let make = |id: &str, author: &str| super::playlist(ytmusic::Playlist {
-            id: id.into(), title: "Playlist".into(), author: Some(author.into()),
-            owned: false, public: None, track_count: None, thumbnails: vec![],
-        });
-        assert!(make("RDCLAK5uy_example", "Lewis Capaldi").subtitle.is_empty());
+        let make = |id: &str, author: &str| {
+            super::playlist(ytmusic::Playlist {
+                id: id.into(),
+                title: "Playlist".into(),
+                author: Some(author.into()),
+                owned: false,
+                public: None,
+                track_count: None,
+                thumbnails: vec![],
+            })
+        };
+        assert!(make("RDCLAK5uy_example", "Lewis Capaldi")
+            .subtitle
+            .is_empty());
         assert!(make("PLexample", "YouTube Music").subtitle.is_empty());
         assert_eq!(make("PLexample", "A listener").subtitle, "A listener");
     }
@@ -1023,7 +1130,7 @@ mod tests {
     #[test]
     #[ignore = "requires access to YouTube Music"]
     fn live_authenticated_catalog_and_audio() {
-            let api = super::super::api().expect("Sign in to YouTube Music first");
+        let api = super::super::api().expect("Sign in to YouTube Music first");
         super::super::runtime().block_on(async {
             let home = load(&api, View::Home, None, String::new()).await.unwrap();
             assert!(!home.sections.is_empty());
@@ -1108,7 +1215,76 @@ mod tests {
     }
 }
 
-fn edit(mutation: &mut crate::playlist::Mutation) -> Result<crate::playlist::Outcome, String> {
+pub(crate) fn menu_playlists() -> Result<Vec<Entry>, String> {
+    let api = super::api()?;
+    super::runtime()
+        .block_on(async {
+            // library_playlists follows every library-grid continuation internally.
+            api.library_playlists().await.map(|items| {
+                items
+                    .into_iter()
+                    .filter(|p| p.owned)
+                    .map(playlist)
+                    .collect()
+            })
+        })
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn playlist_privacy(id: &str) -> Result<Option<bool>, String> {
+    let api = super::api()?;
+    super::runtime()
+        .block_on(async {
+            api.playlist_page(bare(id))
+                .await
+                .map(|page| page.playlist.public)
+        })
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn saved_library_entries() -> Result<Vec<Entry>, String> {
+    let api = super::api()?;
+    super::runtime()
+        .block_on(async {
+            let mut entries: Vec<_> = api
+                .library_playlists()
+                .await?
+                .into_iter()
+                .map(playlist)
+                .collect();
+            entries.extend(api.library_albums().await?.into_iter().map(album));
+            entries.extend(
+                api.liked_songs()
+                    .await?
+                    .into_iter()
+                    .filter(playable)
+                    .map(track),
+            );
+            Ok(entries)
+        })
+        .map_err(|error: anyhow::Error| error.to_string())
+}
+
+pub(crate) fn collection_tracks(entry: &Entry) -> Result<Vec<Entry>, String> {
+    let api = super::api()?;
+    super::runtime()
+        .block_on(async {
+            let mut page = load(&api, View::Album, Some(entry.clone()), String::new()).await?;
+            let mut cursors = std::collections::HashSet::new();
+            while !page.next.is_empty() && cursors.insert(page.next.clone()) {
+                more(&api, &mut page).await?;
+            }
+            if page.rows.is_empty() {
+                anyhow::bail!("This collection has no playable tracks");
+            }
+            Ok(page.rows)
+        })
+        .map_err(|error: anyhow::Error| error.to_string())
+}
+
+pub(crate) fn edit(
+    mutation: &mut crate::playlist::Mutation,
+) -> Result<crate::playlist::Outcome, String> {
     use crate::playlist::{Mutation, Outcome};
     let api = super::api()?;
     super::runtime()
@@ -1120,6 +1296,7 @@ fn edit(mutation: &mut crate::playlist::Mutation) -> Result<crate::playlist::Out
                     description,
                     cover,
                     seed,
+                public,
                 } => {
                     if title.trim().is_empty() {
                         anyhow::bail!("Enter a playlist name");
@@ -1140,6 +1317,7 @@ fn edit(mutation: &mut crate::playlist::Mutation) -> Result<crate::playlist::Out
                         })).await?;
                         *description = None;
                     }
+                if let Some(target) = *public { api.set_playlist_privacy(bare(playlist_id),target).await?; *public=None; }
                 if let Some(track) = seed {
                         api.add_playlist_track(bare(playlist_id), bare(track))
                             .await?;

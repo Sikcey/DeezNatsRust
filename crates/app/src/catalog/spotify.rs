@@ -360,69 +360,33 @@ fn sections(value: &Value) -> Vec<Section> {
         .collect()
 }
 fn home_sections(value: &Value) -> Vec<Section> {
-    let mut personal = sections(value);
-    let mut featured = [
-        Section {
-            title: "Radios for you".into(),
-            ..Default::default()
-        },
-        Section {
-            title: "This Is…".into(),
-            ..Default::default()
-        },
-        Section {
-            title: "Recommended artists".into(),
-            ..Default::default()
-        },
-        Section {
-            title: "Made for you".into(),
-            ..Default::default()
-        },
-        Section {
-            title: "Recommended playlists".into(),
-            ..Default::default()
-        },
-    ];
-    let mut seen = HashSet::new();
-    for section in &mut personal {
-        section.entries.retain(|item| {
-            let name = item.title.to_lowercase();
-            let target = if item.kind == "artist" {
-                Some(2)
-            } else if item.kind == "playlist" && name.starts_with("daily mix ") {
-                Some(3)
-            } else if item.kind == "playlist" && name.starts_with("this is ") {
-                Some(1)
-            } else if item.kind == "playlist"
-                && (name.contains("radio")
-                    || section.title.to_lowercase().contains("radio")
-                    || section.title.to_lowercase().contains("station"))
-            {
-                Some(0)
-            } else if item.kind == "playlist"
-                && (name.contains("mix") || section.title.to_lowercase().contains("made for"))
-            {
-                Some(3)
-            } else if item.kind == "playlist" {
-                Some(4)
-            } else {
-                None
-            };
-            if let Some(index) = target {
-                if seen.insert((item.kind.clone(), item.id.clone())) {
-                    featured[index].entries.push(item.clone());
+    let mut grouped: Vec<Section> = Vec::new();
+    for mut section in sections(value) {
+        if section.entries.is_empty() && section.error.is_empty() {
+            continue;
+        }
+        if !section.title.is_empty() {
+            if let Some(existing) = grouped.iter_mut().find(|s| s.title == section.title) {
+                for entry in section.entries.drain(..) {
+                    if entry.id.is_empty()
+                        || !existing.entries.iter().any(|item| item.id == entry.id)
+                    {
+                        existing.entries.push(entry);
+                    }
                 }
-                false
-            } else {
-                true
+                if existing.error.is_empty() {
+                    existing.error = section.error;
+                }
+                continue;
             }
-        });
+        }
+        grouped.push(section);
     }
-    featured
-        .into_iter()
-        .chain(personal)
-        .filter(|section| !section.entries.is_empty() || !section.error.is_empty())
-        .collect()
+    grouped
+}
+
+fn presentable_home_shelf(section: &Section) -> bool {
+    section.entries.len() >= 2 && !section.title.trim().is_empty() && !section.title.contains("{0}")
 }
 fn discovery_sections(value: &Value) -> Vec<Section> {
     let mut result: Vec<Section> = Vec::new();
@@ -1185,7 +1149,8 @@ fn load_page(
             |index, result| {
                 let section = match result {
                     Ok(section) => section,
-                    Err(personal) => {
+                    Err(mut personal) => {
+                        personal.retain(presentable_home_shelf);
                         personal_count = personal.len();
                         page.sections.splice(2..2, personal);
                         return publish_curated(&page, publish);
@@ -1280,10 +1245,11 @@ fn load_page(
             |index, (section, value)| {
                 remember_shelf(&mut page, &section.title, &value, sources[index].2);
                 page.sections[index] = section;
-                publish_curated(&page, publish)
+                publish(&page)
             },
         )?;
-        curate_shelves(&mut page.sections);
+        page.sections
+            .retain(|section| !section.entries.is_empty() || !section.error.is_empty());
         page.loading = false;
     } else if view == View::Explore {
         let value = invoke("DZSearchJSON", &[json!(query)])?;
@@ -1410,8 +1376,10 @@ fn load_page(
             View::Recent => ("DZHistoryRecentJSON", vec![json!(200)], "track"),
             View::Podcasts => ("DZPodcastShelfJSON", vec![json!(1)], "podcast"),
             View::Queue => ("DZQueueJSON", vec![], "track"),
-            View::Flow if query.is_empty() || query == "default" => ("DZFlowJSON", vec![], "track"),
-            View::Flow => ("DZFlowForConfigJSON", vec![json!(query)], "track"),
+            View::Flow => {
+                let (name, args) = super::flow_request(entity.as_ref(), &query);
+                (name, args, "track")
+            }
             View::StyleMix => ("SPStyleMixJSON", vec![json!(query)], "track"),
             _ => return Err("This page is unavailable for Spotify".into()),
         };
@@ -1458,6 +1426,9 @@ fn load_page(
         }
         page.next = string(&value, &["next"]);
     }
+    if view == View::Flow && entity.as_ref().is_some_and(|entry| entry.kind == "track") {
+        page.subtitle = "Song radio".into();
+    }
     page.raw.push(("provider".into(), json!("spotify")));
     page.loading = false;
     Ok(page)
@@ -1474,6 +1445,9 @@ pub(super) fn discovery_report() -> Result<Value, String> {
 pub(super) fn process(generation: u64, job: Job, tx: &EventSender, current: &AtomicU64) {
     let active = || current.load(Ordering::Relaxed) == generation;
     match job {
+        Job::LibraryState | Job::Collection(..) => {
+            unreachable!("library operations are handled before provider dispatch")
+        }
         Job::Route(view, entity, query) => {
             let cached = tx.resume(generation);
             if view == View::Flow {
@@ -1935,14 +1909,49 @@ mod tests {
     }
 
     #[test]
-    fn shelf_duplicates_keep_library_priority_and_independent_recent_history() {
+    fn home_keeps_repeated_cards_in_their_original_shelves() {
         let shelves = home_sections(&json!({
             "sections": [
                 {"title": "Your playlists", "items": [{"type": "playlist", "uri": "spotify:playlist:m1", "name": "Daily Mix 1"}]},
                 {"title": "Daily Mix 1", "items": [{"type": "playlist", "uri": "spotify:playlist:m1", "name": "Daily Mix 1"}]}
             ]
         }));
-        assert_eq!(shelves.len(), 1);
+        assert_eq!(shelves.len(), 2);
+    }
+
+    #[test]
+    fn personalized_home_hides_sparse_and_unresolved_shelves() {
+        let shelf = |title: &str, count: usize| Section {
+            title: title.into(),
+            entries: vec![Entry::default(); count],
+            ..Default::default()
+        };
+        assert!(!presentable_home_shelf(&shelf(
+            "Based on your recent listening",
+            1
+        )));
+        assert!(!presentable_home_shelf(&shelf("New episode from {0}", 2)));
+        assert!(!presentable_home_shelf(&shelf(" ", 2)));
+        assert!(presentable_home_shelf(&shelf("Made for you", 2)));
+    }
+
+    #[test]
+    fn home_combines_matching_context_shelves() {
+        let shelves = home_sections(&json!({"sections": [
+            {"title":"Made for you","items":[{"type":"playlist","uri":"spotify:playlist:a","name":"A"}]},
+            {"title":"Other","items":[{"type":"playlist","uri":"spotify:playlist:a","name":"A"}]},
+            {"title":"Made for you","items":[{"type":"playlist","uri":"spotify:playlist:b","name":"B"},{"type":"playlist","uri":"spotify:playlist:a","name":"A"}]}
+        ]}));
+        assert_eq!(shelves.len(), 2);
+        assert_eq!(
+            shelves[0]
+                .entries
+                .iter()
+                .map(|e| e.title.as_str())
+                .collect::<Vec<_>>(),
+            ["A", "B"]
+        );
+        assert_eq!(shelves[1].entries.len(), 1);
     }
 
     #[test]

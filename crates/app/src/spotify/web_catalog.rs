@@ -16,6 +16,18 @@ fn arg(args: &[Value], n: usize) -> Result<&str, String> {
         .and_then(Value::as_str)
         .ok_or_else(|| "Missing Spotify request argument".into())
 }
+fn playlist_details_request(name: &str, args: &[Value]) -> Result<(String, Value), String> {
+    let playlist = uri(args, 0, &["playlist"])?;
+    let title = arg(args, 1)?.trim();
+    if title.is_empty() || title.len() > 300 {
+        return Err("Enter a playlist name".into());
+    }
+    let mut body = json!({"playlistUri": playlist, "newName": title});
+    if name == "DZUpdatePlaylistJSON" {
+        body["newDescription"] = json!(arg(args, 2)?);
+    }
+    Ok(("editPlaylistAttributes".into(), body))
+}
 fn uri(args: &[Value], n: usize, kinds: &[&str]) -> Result<String, String> {
     let value = arg(args, n)?;
     if value.len() == 22 && value.bytes().all(|b| b.is_ascii_alphanumeric()) && kinds.len() == 1 {
@@ -345,7 +357,83 @@ fn at(value: &Value, pointer: &str) -> ResultValue {
         .cloned()
         .ok_or_else(|| "Spotify web response is missing the requested content".into())
 }
+fn append_home_shelves(home: &mut Vec<Value>, extra: Vec<Value>) {
+    let mut titles: HashSet<String> = home
+        .iter()
+        .filter_map(|s| s["title"].as_str().map(str::to_owned))
+        .collect();
+    let mut shown: HashSet<String> = home
+        .iter()
+        .flat_map(|s| s["items"].as_array().into_iter().flatten())
+        .filter_map(|item| item["uri"].as_str().map(str::to_owned))
+        .collect();
+    for mut shelf in extra {
+        let title = shelf["title"].as_str().unwrap_or("").to_owned();
+        if titles.contains(&title) {
+            continue;
+        }
+        if let Some(items) = shelf["items"].as_array_mut() {
+            items.retain(|item| {
+                item["uri"]
+                    .as_str()
+                    .is_none_or(|uri| shown.insert(uri.to_owned()))
+            });
+            if !items.is_empty() {
+                titles.insert(title);
+                home.push(shelf);
+            }
+        }
+    }
+}
 fn home() -> ResultValue {
+    let primary = home_feed();
+    // Sonora supplements the personalized feed with Made For You's missing shelves.
+    let made = browse(Some("spotify:page:0JQ5DAt0tbjZptfcdMSKl3"));
+    match (primary, made) {
+        (Ok(mut feed), extra) => {
+            if let Ok(extra) = extra {
+                let mut shelves = feed["sections"].as_array().cloned().unwrap_or_default();
+                append_home_shelves(
+                    &mut shelves,
+                    extra["sections"].as_array().cloned().unwrap_or_default(),
+                );
+                feed["sections"] = json!(shelves);
+            }
+            Ok(feed)
+        }
+        (Err(_), Ok(extra)) if extra["sections"].as_array().is_some_and(|s| !s.is_empty()) => {
+            Ok(extra)
+        }
+        (Err(error), _) => Err(error),
+    }
+}
+fn discovery_feed(personal: ResultValue, directory: ResultValue) -> ResultValue {
+    match (personal, directory) {
+        (Ok(mut feed), Ok(directory)) => {
+            let mut shelves = feed["sections"].as_array().cloned().unwrap_or_default();
+            let mut titles: HashSet<String> = shelves
+                .iter()
+                .filter_map(|s| s["title"].as_str().map(str::to_owned))
+                .collect();
+            for shelf in directory["sections"].as_array().into_iter().flatten() {
+                if titles.insert(shelf["title"].as_str().unwrap_or("").to_owned()) {
+                    shelves.push(shelf.clone());
+                }
+            }
+            feed["sections"] = json!(shelves);
+            Ok(feed)
+        }
+        (Ok(feed), Err(_)) | (Err(_), Ok(feed)) => Ok(feed),
+        (Err(error), Err(_)) => Err(error),
+    }
+}
+fn discovery() -> ResultValue {
+    discovery_feed(
+        browse(Some("spotify:page:0JQ5DAt0tbjZptfcdMSKl3")),
+        browse(None),
+    )
+}
+fn home_feed() -> ResultValue {
     let value = web::query(
         "home",
         json!({"homeEndUserIntegration":"INTEGRATION_WEB_PLAYER","timeZone":"UTC","sp_t":"","facet":"","sectionItemsLimit":20,"includeEpisodeContentRatingsV2":false}),
@@ -415,7 +503,9 @@ fn browse_section(uri: &str, offset: u64, limit: u64) -> ResultValue {
 }
 
 fn recent() -> ResultValue {
-    if let Ok(value) = web::rest_get("https://api.spotify.com/v1/me/player/recently-played?limit=50") {
+    if let Ok(value) =
+        web::rest_get("https://api.spotify.com/v1/me/player/recently-played?limit=50")
+    {
         if let Some(items) = recent_tracks(&value) {
             return Ok(json!({"items": items, "next": null}));
         }
@@ -462,13 +552,20 @@ fn recent() -> ResultValue {
 }
 
 fn recent_tracks(value: &Value) -> Option<Vec<Value>> {
-    Some(value.get("items")?.as_array()?.iter().filter_map(|play| {
-        let mut track = play.get("track")?.as_object()?.clone();
-        if let Some(played_at) = play.get("played_at") {
-            track.insert("played_at".into(), played_at.clone());
-        }
-        Some(Value::Object(track))
-    }).collect())
+    Some(
+        value
+            .get("items")?
+            .as_array()?
+            .iter()
+            .filter_map(|play| {
+                let mut track = play.get("track")?.as_object()?.clone();
+                if let Some(played_at) = play.get("played_at") {
+                    track.insert("played_at".into(), played_at.clone());
+                }
+                Some(Value::Object(track))
+            })
+            .collect(),
+    )
 }
 fn page(op: &str, vars: Value, pointer: &str) -> ResultValue {
     let value = web::query(op, vars.clone())?;
@@ -539,7 +636,9 @@ fn mark(mut value: Value, name: &str, args: &[Value]) -> Value {
     value
 }
 fn radio(uri: &str) -> ResultValue {
-    let value=web::rest_get(&format!("https://spclient.wg.spotify.com/inspiredby-mix/v2/seed_to_playlist/{uri}?response-format=json"))?;
+    let value = web::rest_get(&format!(
+        "https://spclient.wg.spotify.com/inspiredby-mix/v2/seed_to_playlist/{uri}?response-format=json"
+    ))?;
     let playlist_uri = [
         value.get("uri"),
         value.get("playlist_uri"),
@@ -665,12 +764,19 @@ fn style_mix(key: &str) -> ResultValue {
     Ok(json!({"items":items}))
 }
 fn mutate_library(uri: &str, save: bool) -> ResultValue {
+    mutate_library_with(uri, save, web::mutation)
+}
+fn mutate_library_with(
+    uri: &str,
+    save: bool,
+    mut call: impl FnMut(&str, Value) -> ResultValue,
+) -> ResultValue {
     let op = if save {
         "addToLibrary"
     } else {
         "removeFromLibrary"
     };
-    let result = web::mutation(op, json!({"uris":[uri]}))?;
+    let result = call(op, json!({"libraryItemUris":[uri]}))?;
     confirmed(&result)?;
     Ok(json!(1))
 }
@@ -792,7 +898,7 @@ pub(super) fn invoke(name: &str, args: &[Value]) -> Option<ResultValue> {
             Some(9) => library("Episodes"),
             _ => return Err("This Spotify shelf is not available through the web library".into()),
         },
-        "SPCatalogDiscoveryJSON" => browse(None),
+        "SPCatalogDiscoveryJSON" => discovery(),
         "SPCatalogDirectoryCachedJSON" => Ok(super::directory_cache::peek(&format!(
             "browse-v3:{}",
             arg(args, 0)?
@@ -914,7 +1020,7 @@ pub(super) fn invoke(name: &str, args: &[Value]) -> Option<ResultValue> {
                     return web::rest_get(&format!(
                         "https://api.spotify.com/v1/{kind}s/{}",
                         u.rsplit(':').next().unwrap()
-                    ))
+                    ));
                 }
             };
             let vars = match op {
@@ -1036,17 +1142,9 @@ pub(super) fn invoke(name: &str, args: &[Value]) -> Option<ResultValue> {
             Ok(json!(1))
         }
         "DZRenamePlaylist" | "DZUpdatePlaylistJSON" => {
-            let u = uri(args, 0, &["playlist"])?;
-            let title = arg(args, 1)?.trim();
-            if title.is_empty() || title.len() > 300 {
-                return Err("Enter a playlist name".into());
-            }
-            let mut vars = json!({"playlistUri":u,"newName":title});
-            if name == "DZUpdatePlaylistJSON" {
-                vars["newDescription"] = json!(arg(args, 2)?);
-            }
-            let v = web::mutation("editPlaylistAttributes", vars)?;
-            confirmed(&v)?;
+            let (operation, variables) = playlist_details_request(name, args)?;
+            let result = web::mutation(&operation, variables)?;
+            confirmed(&result)?;
             Ok(json!(1))
         }
         "DZCreatePlaylist" => {
@@ -1097,6 +1195,127 @@ pub(super) fn invoke(name: &str, args: &[Value]) -> Option<ResultValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn playlist_details_use_web_player_fields_and_validate_id() {
+        let id = "1234567890123456789012";
+        let (operation, body) = playlist_details_request(
+            "DZUpdatePlaylistJSON",
+            &[
+                json!(format!("spotify:playlist:{id}")),
+                json!("  New name  "),
+                json!(""),
+            ],
+        )
+        .unwrap();
+        assert_eq!(operation, "editPlaylistAttributes");
+        assert_eq!(
+            body,
+            json!({"playlistUri":format!("spotify:playlist:{id}"), "newName":"New name", "newDescription":""})
+        );
+        let (_, body) =
+            playlist_details_request("DZRenamePlaylist", &[json!(id), json!("Name")]).unwrap();
+        assert_eq!(
+            body,
+            json!({"playlistUri":format!("spotify:playlist:{id}"), "newName":"Name"})
+        );
+        assert!(
+            playlist_details_request("DZRenamePlaylist", &[json!("invalid"), json!("Name")])
+                .is_err()
+        );
+    }
+    #[test]
+    fn library_mutations_send_library_item_uris_and_require_confirmation() {
+        for kind in ["playlist", "album", "track", "episode", "show"] {
+            let uri = format!("spotify:{kind}:1234567890123456789012");
+            for save in [true, false] {
+                let result = mutate_library_with(&uri, save, |operation, variables| {
+                    assert_eq!(
+                        operation,
+                        if save {
+                            "addToLibrary"
+                        } else {
+                            "removeFromLibrary"
+                        }
+                    );
+                    assert_eq!(variables, json!({"libraryItemUris":[uri]}));
+                    Ok(json!({"data":{"mutation":{"__typename":"LibraryMutationPayload"}}}))
+                });
+                assert_eq!(result.unwrap(), json!(1));
+            }
+        }
+        for response in [
+            json!({"data":{"mutation":{"__typename":"GenericError"}}}),
+            json!({"errors":[{"message":"Invalid variables"}]}),
+            Value::Null,
+        ] {
+            assert!(mutate_library_with(
+                "spotify:playlist:1234567890123456789012",
+                true,
+                |_, _| Ok(response.clone())
+            )
+            .is_err());
+        }
+        assert!(
+            mutate_library_with("spotify:playlist:1234567890123456789012", true, |_, _| Err(
+                "HTTP 403".into()
+            ))
+            .is_err()
+        );
+    }
+    #[test]
+    fn discover_keeps_personal_mix_shelves_and_browse_categories() {
+        let personal = json!({"sections":[
+            {"title":"Your Decade Mixes","items":[{"uri":"spotify:playlist:decade"}]},
+            {"title":"Your Mood Mixes","items":[{"uri":"spotify:playlist:mood"}]},
+            {"title":"Your Niche Mixes","items":[{"uri":"spotify:playlist:niche"}]}
+        ]});
+        let directory =
+            json!({"sections":[{"title":"Browse all","items":[{"uri":"spotify:page:rock"}]}]});
+        let feed = discovery_feed(Ok(personal.clone()), Ok(directory.clone())).unwrap();
+        let titles: Vec<_> = feed["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["title"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                "Your Decade Mixes",
+                "Your Mood Mixes",
+                "Your Niche Mixes",
+                "Browse all"
+            ]
+        );
+        assert_eq!(
+            discovery_feed(Ok(personal.clone()), Err("offline".into())).unwrap(),
+            personal
+        );
+        assert_eq!(
+            discovery_feed(Err("offline".into()), Ok(directory.clone())).unwrap(),
+            directory
+        );
+        assert!(discovery_feed(Err("offline".into()), Err("offline".into())).is_err());
+    }
+
+    #[test]
+    fn home_supplement_preserves_context_and_adds_only_missing_cards() {
+        let mut shelves =
+            vec![json!({"title":"More like Artist","items":[{"uri":"spotify:playlist:a"}]})];
+        append_home_shelves(
+            &mut shelves,
+            vec![
+                json!({"title":"More like Artist","items":[{"uri":"spotify:playlist:b"}]}),
+                json!({"title":"Your top mixes","items":[{"uri":"spotify:playlist:a"},{"uri":"spotify:playlist:c"}]}),
+                json!({"title":"Already shown","items":[{"uri":"spotify:playlist:c"}]}),
+            ],
+        );
+        assert_eq!(shelves.len(), 2);
+        assert_eq!(shelves[0]["title"], "More like Artist");
+        assert_eq!(shelves[1]["title"], "Your top mixes");
+        assert_eq!(shelves[1]["items"], json!([{"uri":"spotify:playlist:c"}]));
+    }
+
     #[test]
     fn recent_tracks_preserves_order_and_play_times() {
         let value = json!({"items":[

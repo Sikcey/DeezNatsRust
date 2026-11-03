@@ -23,6 +23,7 @@ struct State {
     newest: HashMap<String, u64>,
     saved: HashMap<String, (u64, usize)>,
     epoch: u64,
+    edits: Vec<(String, super::page_updates::Change)>,
 }
 struct Route {
     key: String,
@@ -101,6 +102,76 @@ fn is_flow_key(key: &str) -> bool {
 }
 
 impl Store {
+    /// Keep confirmed local edits over older cached/in-flight snapshots.
+    pub(crate) fn record_change(&self, account: &str, mut change: super::page_updates::Change) {
+        let mut state = self.state.lock().unwrap();
+        if let super::page_updates::Change::PlaylistDetails(new) = &mut change {
+            for (owner, old) in &state.edits {
+                if owner != account {
+                    continue;
+                }
+                if let super::page_updates::Change::PlaylistDetails(old) = old {
+                    if old.id == new.id {
+                        if new.artwork.is_empty() {
+                            new.artwork = old.artwork.clone();
+                        }
+                        if let Some(fields) = old.raw.as_object() {
+                            for (key, value) in fields {
+                                if new.raw.get(key).is_none() {
+                                    new.raw[key] = value.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        state
+            .edits
+            .retain(|(owner, old)| owner != account || !old.same_target(&change));
+        for route in state.routes.values_mut() {
+            if super::page_updates::route(&route.key).is_some_and(|key| key[0] == account) {
+                if let Some(page) = &mut route.page {
+                    if change.affects(&route.key, page) {
+                        change.apply(&route.key, Arc::make_mut(page));
+                    }
+                }
+            }
+        }
+        state.edits.push((account.into(), change));
+    }
+
+    pub(crate) fn patch_page(&self, key: &str, page: &mut Arc<Page>) {
+        let state = self.state.lock().unwrap();
+        patch(&state, key, page);
+    }
+
+    pub(crate) fn patch_library(
+        &self,
+        account: &str,
+        saved: &mut std::collections::HashSet<String>,
+    ) {
+        let state = self.state.lock().unwrap();
+        for (owner, change) in &state.edits {
+            if owner != account {
+                continue;
+            }
+            match change {
+                super::page_updates::Change::Library(item, add) => {
+                    if *add {
+                        saved.insert(item.library_key());
+                    } else {
+                        saved.remove(&item.library_key());
+                    }
+                }
+                super::page_updates::Change::DeletePlaylist(id) => {
+                    saved.remove(&format!("playlist:{id}"));
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub(crate) fn refresh_flow(&self, key: &str) {
         if is_flow_key(key) {
             let _ = fs::remove_file(self.filename(key));
@@ -174,11 +245,12 @@ impl Store {
             }
             route.key.clone()
         };
-        let Some(page) = self.read(&key) else {
+        let Some(mut page) = self.read(&key) else {
             self.state.lock().unwrap().saved.remove(&key);
             return None;
         };
         let mut state = self.state.lock().unwrap();
+        patch(&state, &key, &mut page);
         let route = state.routes.get_mut(&generation)?;
         route.page = Some(page.clone());
         Some(page)
@@ -214,10 +286,11 @@ impl Store {
             if state.newest.get(&key) != Some(&generation) {
                 return incoming;
             }
-            let merged = match route.page.as_deref() {
+            let mut merged = match route.page.as_deref() {
                 Some(previous) => Arc::new(merge(Some(previous), &incoming)),
                 None => incoming,
             };
+            patch(&state, &key, &mut merged);
             state.routes.get_mut(&generation).unwrap().page = Some(merged.clone());
             (key, merged)
         };
@@ -252,6 +325,18 @@ impl Store {
         state.routes.clear();
         state.newest.clear();
         state.saved.clear();
+        state.edits.clear();
+    }
+}
+
+fn patch(state: &State, key: &str, page: &mut Arc<Page>) {
+    let Some(route) = super::page_updates::route(key) else {
+        return;
+    };
+    for (account, change) in &state.edits {
+        if route[0] == *account && change.affects(key, page) {
+            change.apply(key, Arc::make_mut(page));
+        }
     }
 }
 
@@ -573,6 +658,45 @@ mod tests {
         drop(store);
         fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn confirmed_edits_survive_disk_resume_and_late_responses_without_evicting_other_pages() {
+        let (root, store) = fixture();
+        let key = serde_json::json!(["Deezer:me", "Favorites", "", "", "", ""]).to_string();
+        let home = serde_json::json!(["Deezer:me", "Home", "", "", "", ""]).to_string();
+        store.begin(1, key.clone(), None);
+        store.apply(1, page("removed"));
+        store.begin(2, home, None);
+        let unrelated = store.apply(2, page("unrelated"));
+        store.record_change(
+            "Deezer:me",
+            super::super::page_updates::Change::Library(item("removed"), false),
+        );
+        assert!(Arc::ptr_eq(&unrelated, &store.resume(2).unwrap()));
+        store.release_inactive_pages(2);
+        assert!(store.resume(1).unwrap().rows.is_empty());
+        let late = store.apply(1, page("removed"));
+        assert!(late.rows.is_empty());
+        let mut saved = std::collections::HashSet::from(["removed".into(), "unrelated".into()]);
+        store.patch_library("Deezer:me", &mut saved);
+        assert!(!saved.contains("removed"));
+        assert!(saved.contains("unrelated"));
+        store.record_change(
+            "Deezer:me",
+            super::super::page_updates::Change::Library(item("removed"), true),
+        );
+        let mut restored = Arc::new(Page::default());
+        store.patch_page(&key, &mut restored);
+        assert_eq!(restored.rows.len(), 1);
+        assert_eq!(store.state.lock().unwrap().edits.len(), 1);
+        let other_key =
+            serde_json::json!(["Deezer:other", "Favorites", "", "", "", ""]).to_string();
+        let mut other = Arc::new(Page::default());
+        store.patch_page(&other_key, &mut other);
+        assert!(other.rows.is_empty());
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn snapshots_survive_memory_eviction_for_the_whole_session_and_keep_metadata() {
         let (root, store) = fixture();
@@ -590,6 +714,33 @@ mod tests {
         store.begin(102, "user-a/page-0".into(), None);
         assert!(store.resume(102).is_none());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn successive_playlist_edits_preserve_previous_field_changes_on_old_snapshots() {
+        let (root, store) = fixture();
+        let key = serde_json::json!(["Deezer:me", "Playlists", "", "", "", ""]).to_string();
+        let mut playlist = item("playlist");
+        playlist.kind = "playlist".into();
+        playlist.raw = serde_json::json!({"description":"Changed"});
+        store.record_change(
+            "Deezer:me",
+            super::super::page_updates::Change::PlaylistDetails(playlist.clone()),
+        );
+        playlist.title = "Renamed".into();
+        playlist.raw = serde_json::json!({});
+        store.record_change(
+            "Deezer:me",
+            super::super::page_updates::Change::PlaylistDetails(playlist),
+        );
+        let mut old = Arc::new(Page::default());
+        store.patch_page(&key, &mut old);
+        assert_eq!(old.sections[0].entries[0].title, "Renamed");
+        assert_eq!(old.sections[0].entries[0].raw["description"], "Changed");
+        drop(store);
+        if root.exists() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
     #[test]
     fn newer_requests_win_and_corrupt_snapshots_are_repaired() {

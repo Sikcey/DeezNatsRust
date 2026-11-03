@@ -273,17 +273,32 @@ pub fn colorref_luminance(color: u32) -> f32 {
 /// choose the black or white foreground with the best worst-case contrast.
 pub fn gradient_foreground(preferred: u32, start: u32, end: u32) -> u32 {
     fn luminance(color: u32) -> f64 {
-        [0, 8, 16].into_iter().zip([0.2126, 0.7152, 0.0722]).map(|(shift, weight)| {
-            let channel = ((color >> shift) & 255) as f64 / 255.0;
-            weight * if channel <= 0.04045 { channel / 12.92 } else { ((channel + 0.055) / 1.055).powf(2.4) }
-        }).sum()
+        [0, 8, 16]
+            .into_iter()
+            .zip([0.2126, 0.7152, 0.0722])
+            .map(|(shift, weight)| {
+                let channel = ((color >> shift) & 255) as f64 / 255.0;
+                weight
+                    * if channel <= 0.04045 {
+                        channel / 12.92
+                    } else {
+                        ((channel + 0.055) / 1.055).powf(2.4)
+                    }
+            })
+            .sum()
     }
     let contrast = |fg: u32, bg: u32| {
         let (a, b) = (luminance(fg), luminance(bg));
         (a.max(b) + 0.05) / (a.min(b) + 0.05)
     };
     let worst = |fg| contrast(fg, start).min(contrast(fg, end));
-    if worst(preferred) >= 4.5 { preferred } else if worst(0x00000000) > worst(0x00ffffff) { 0x00000000 } else { 0x00ffffff }
+    if worst(preferred) >= 4.5 {
+        preferred
+    } else if worst(0x00000000) > worst(0x00ffffff) {
+        0x00000000
+    } else {
+        0x00ffffff
+    }
 }
 
 /// Shared desktop/browser text protection for the actual backdrop lightness.
@@ -554,9 +569,18 @@ mod tests {
 
     #[test]
     fn gradient_foreground_checks_both_ends() {
-        assert_eq!(super::gradient_foreground(0x00141418, 0x0033152c, 0x00200d1c), 0x00ffffff);
-        assert_eq!(super::gradient_foreground(0x00ffffff, 0x00eeeeee, 0x00ffffff), 0x00000000);
-        assert_eq!(super::gradient_foreground(0x00eeeeee, 0x00000000, 0x00202020), 0x00eeeeee);
+        assert_eq!(
+            super::gradient_foreground(0x00141418, 0x0033152c, 0x00200d1c),
+            0x00ffffff
+        );
+        assert_eq!(
+            super::gradient_foreground(0x00ffffff, 0x00eeeeee, 0x00ffffff),
+            0x00000000
+        );
+        assert_eq!(
+            super::gradient_foreground(0x00eeeeee, 0x00000000, 0x00202020),
+            0x00eeeeee
+        );
     }
     #[test]
     fn cover_crops_the_center_instead_of_stretching() {

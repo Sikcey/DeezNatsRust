@@ -13,6 +13,30 @@ fn shorten(value: &str, max: usize) -> String {
 mod tests {
     use super::*;
     #[test]
+    fn sidebars_open_and_close_immediately() {
+        for devices in [false, true] {
+            let mut ui = Ui {
+                device_menu_open: devices,
+                queue_sidebar_open: !devices,
+                ..Default::default()
+            };
+            assert_eq!(ui.sidebar_values(), (1., 1.));
+            ui.sidebar_collapsed = true;
+            ui.device_menu_open = false;
+            ui.queue_sidebar_open = false;
+            assert_eq!(ui.sidebar_values(), (0., 0.));
+            assert_eq!(ui.right_sidebar_width(1200), 0);
+            let frame = super::super::build(&ui, (1200, 900), true, false, "", false, 50);
+            assert!(frame.device_sidebar.is_none());
+            assert!(frame.queue_frame.is_none());
+            ui.sidebar_collapsed = false;
+            ui.device_menu_open = devices;
+            ui.queue_sidebar_open = !devices;
+            assert_eq!(ui.sidebar_values(), (1., 1.));
+            assert_eq!(ui.right_sidebar_width(1200), 280);
+        }
+    }
+    #[test]
     fn devices_and_queue_share_the_same_docked_frame_and_resize_policy() {
         let mut devices = Ui {
             provider: crate::catalog::Provider::Spotify,
@@ -176,6 +200,19 @@ pub(super) fn build(s: &mut Scene, ui: &Ui, qx: i32, width: i32, h: i32, playing
     s.device_sidebar = Some(rect);
     let x = rect.x + 16;
     let inner = width - 32;
+    if ui.provider != crate::catalog::Provider::Spotify {
+        s.label_sized(x, rect.y + 16, inner - 40, 28, "Devices", 0);
+        s.button(
+            Rect::new(x + inner - 30, rect.y + 14, 30, 30),
+            "",
+            "\u{e711}",
+            Action::CloseDeviceMenu,
+            false,
+        );
+        connect_controls(s, ui, x, rect.y + 65, inner);
+        s.device_sidebar_buttons = first_button..s.buttons.len();
+        return;
+    }
     s.label_sized(x, rect.y + 16, inner - 72, 28, "Spotify Connect", 0);
     s.button(
         Rect::new(x + inner - 66, rect.y + 14, 30, 30),
@@ -240,7 +277,7 @@ pub(super) fn build(s: &mut Scene, ui: &Ui, qx: i32, width: i32, h: i32, playing
     }
 
     let inner = inner - 12;
-    let viewport = Rect::new(x, rect.y + 172, inner, (rect.h - 228).max(1));
+    let viewport = Rect::new(x, rect.y + 172, inner, (rect.h - 338).max(1));
     s.queue_viewport = Some(viewport);
     let device_count = ui
         .spotify_devices
@@ -468,7 +505,7 @@ pub(super) fn build(s: &mut Scene, ui: &Ui, qx: i32, width: i32, h: i32, playing
             s.buttons.push(button);
         }
     }
-    let footer = rect.y + rect.h - 44;
+    let footer = rect.y + rect.h - 154;
     if maximum > 0 {
         let track = Rect::new(rect.x + width - 20, viewport.y, 8, viewport.h);
         let thumb = (track.h * track.h / y.max(1)).max(24).min(track.h);
@@ -482,13 +519,43 @@ pub(super) fn build(s: &mut Scene, ui: &Ui, qx: i32, width: i32, h: i32, playing
             17,
         );
     }
-    s.label(x, footer, inner - 76, "DeezNats Connect", 0);
+    connect_controls(s, ui, x, footer, width - 32);
+    s.device_sidebar_buttons = first_button..s.buttons.len();
+}
+
+fn connect_controls(s: &mut Scene, ui: &Ui, x: i32, y: i32, inner: i32) {
+    s.label(x, y, inner - 76, "DeezNats Connect", 0);
     s.button(
-        Rect::new(x + inner - 64, footer, 60, 28),
+        Rect::new(x + inner - 64, y, 60, 28),
         if ui.jam_enabled { "On" } else { "Off" },
         "",
         Action::ToggleBool("jam_enabled"),
         ui.jam_enabled,
     );
-    s.device_sidebar_buttons = first_button..s.buttons.len();
+    if ui.jam_enabled {
+        s.label(x, y + 32, inner, &ui.jam_url, 1);
+        s.button(
+            Rect::new(x, y + 55, 70, 28),
+            "Open",
+            "",
+            Action::OpenConnect,
+            false,
+        );
+        s.button(
+            Rect::new(x + 76, y + 55, 70, 28),
+            "Copy",
+            "",
+            Action::CopyConnectLink,
+            false,
+        );
+    }
+    if ui.jam_enabled && !ui.connect_nicknames.is_empty() {
+        s.label(
+            x,
+            y + 90,
+            inner,
+            &format!("Joined: {}", ui.connect_nicknames.join(", ")),
+            1,
+        );
+    }
 }

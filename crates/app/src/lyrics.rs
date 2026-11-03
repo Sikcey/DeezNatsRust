@@ -1184,3 +1184,67 @@ pub fn visualizer_bars(playing: bool, position_ms: u64, eq: &[i32; 11]) -> [f32;
     }
     bars
 }
+
+/// Sonora's verse haze and past/ahead treatment, adapted from
+/// sonorahq/sonora crates/views/src/chrome/aside.rs (GPL-3.0-or-later).
+/// Travel is measured in viewport heights from the focused verse.
+pub(crate) fn inactive_verse_look(travel: f32, size: f32, passed: bool, blur: bool) -> (f32, f32) {
+    let haze = if blur {
+        travel.abs().min(1.0).powf(0.45)
+    } else {
+        0.0
+    };
+    let opacity = if passed { 0.4 } else { 0.6 } * (1.0 - 0.3 * haze).clamp(0.0, 1.0);
+    let radius = (size * 0.13 * haze / 0.25).round() * 0.25;
+    (opacity, radius)
+}
+
+/// Exact damped spring step, retaining velocity when a fast verse retargets it.
+pub(crate) fn lyric_spring(
+    position: f32,
+    velocity: f32,
+    seconds: f32,
+    stiffness: f32,
+    damping: f32,
+) -> (f32, f32) {
+    let decay = damping * 0.5;
+    let frequency = (stiffness - decay * decay).sqrt();
+    let t = seconds.max(0.0);
+    let (sin, cos) = (frequency * t).sin_cos();
+    let b = (velocity + decay * position) / frequency;
+    let envelope = (-decay * t).exp();
+    let value = position * cos + b * sin;
+    (
+        envelope * value,
+        envelope * (-decay * value + frequency * (b * cos - position * sin)),
+    )
+}
+
+#[cfg(test)]
+mod verse_look_tests {
+    use super::inactive_verse_look;
+
+    #[test]
+    fn lyric_spring_keeps_velocity_across_fast_retargets_and_settles() {
+        let (position, velocity) = super::lyric_spring(60.0, 0.0, 0.08, 170.0, 23.0);
+        let retargeted = position + 60.0;
+        let (start, speed) = super::lyric_spring(retargeted, velocity, 0.0, 170.0, 23.0);
+        assert!((start - retargeted).abs() < 0.001 && (speed - velocity).abs() < 0.001);
+        let (next, speed) = super::lyric_spring(retargeted, velocity, 0.016, 170.0, 23.0);
+        assert!(next < retargeted && speed < 0.0);
+        let (rest, speed) = super::lyric_spring(next, speed, 1.2, 170.0, 23.0);
+        assert!(rest.abs() < 0.05 && speed.abs() < 0.5);
+    }
+
+    #[test]
+    fn sonora_haze_tracks_distance_and_preserves_directional_opacity() {
+        let near = inactive_verse_look(0.1, 32.0, false, true);
+        let far = inactive_verse_look(0.8, 32.0, false, true);
+        let past = inactive_verse_look(-0.8, 32.0, true, true);
+        assert!(far.1 > near.1 && far.0 < near.0);
+        assert_eq!(past.1, far.1);
+        assert!(past.0 < far.0);
+        assert_eq!(far.1 * 4.0, (far.1 * 4.0).round());
+        assert_eq!(inactive_verse_look(0.8, 32.0, true, false), (0.4, 0.0));
+    }
+}

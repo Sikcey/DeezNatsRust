@@ -42,16 +42,24 @@ pub unsafe fn spotify_logo(dc: HDC, r: RECT) {
         (0.33, 0.61, 0.65, 0.66),
     ] {
         gpu_dispatch::GdipDrawBezier(
-            g, pen, x + size * left, y + size * top,
-            x + size * 0.42, y + size * (top - 0.06),
-            x + size * 0.62, y + size * (top - 0.03),
-            x + size * right, y + size * bottom,
+            g,
+            pen,
+            x + size * left,
+            y + size * top,
+            x + size * 0.42,
+            y + size * (top - 0.06),
+            x + size * 0.62,
+            y + size * (top - 0.03),
+            x + size * right,
+            y + size * bottom,
         );
     }
     GdipDeletePen(pen);
 }
 pub unsafe fn youtube_logo(dc: HDC, r: RECT) {
-    let Some(g) = graphics(dc) else { return; };
+    let Some(g) = graphics(dc) else {
+        return;
+    };
     let size = (r.right - r.left).min(r.bottom - r.top).max(0) as f32;
     let x = r.left as f32 + ((r.right - r.left) as f32 - size) / 2.0;
     let y = r.top as f32 + ((r.bottom - r.top) as f32 - size) / 2.0;
@@ -59,7 +67,15 @@ pub unsafe fn youtube_logo(dc: HDC, r: RECT) {
     GdipCreateSolidFill(0xffff0033, &mut brush);
     gpu_dispatch::GdipFillEllipse(g, brush.cast(), x, y, size, size);
     gpu_dispatch::GdipDeleteBrush(brush.cast());
-    polygon(dc, &[(x + size * 0.40, y + size * 0.29), (x + size * 0.40, y + size * 0.71), (x + size * 0.71, y + size * 0.50)], 0xffffffff);
+    polygon(
+        dc,
+        &[
+            (x + size * 0.40, y + size * 0.29),
+            (x + size * 0.40, y + size * 0.71),
+            (x + size * 0.71, y + size * 0.50),
+        ],
+        0xffffffff,
+    );
 }
 
 pub unsafe fn deezer_logo(dc: HDC, r: RECT) -> bool {
@@ -138,22 +154,44 @@ pub(crate) fn evict_resized_artwork(ids: &std::collections::HashSet<u64>) {
     });
 }
 thread_local! {static CURRENT:Cell<(HDC,*mut GpGraphics)>=const {Cell::new((null_mut(),null_mut()))};}
-fn is_current_graphics(g: *mut GpGraphics) -> bool { CURRENT.get().1 == g && !g.is_null() }
+fn is_current_graphics(g: *mut GpGraphics) -> bool {
+    CURRENT.get().1 == g && !g.is_null()
+}
 thread_local! {static CURRENT_CLIP:Cell<Option<(i32,i32,i32,i32)>>=const {Cell::new(None)};}
 thread_local! {static COMPLEX_CLIP:Cell<bool>=const {Cell::new(false)};}
 thread_local! {static GPU_DC_CLIPS:std::cell::RefCell<Vec<RECT>>=const {std::cell::RefCell::new(Vec::new())};}
-struct DcRegions { current:HRGN,scratch:HRGN }
-impl Drop for DcRegions {fn drop(&mut self){unsafe{DeleteObject(self.current);DeleteObject(self.scratch);}}}
+struct DcRegions {
+    current: HRGN,
+    scratch: HRGN,
+}
+impl Drop for DcRegions {
+    fn drop(&mut self) {
+        unsafe {
+            DeleteObject(self.current);
+            DeleteObject(self.scratch);
+        }
+    }
+}
 thread_local! {static DC_REGIONS:std::cell::RefCell<DcRegions>=std::cell::RefCell::new(DcRegions {
     current:unsafe{CreateRectRgn(0,0,0,0)},scratch:unsafe{CreateRectRgn(0,0,0,0)}
 });}
 thread_local! {static TEXT_PATHS:std::cell::RefCell<std::collections::VecDeque<(String,*mut GpPath)>>=const {std::cell::RefCell::new(std::collections::VecDeque::new())};}
 thread_local! {static LIGHT:Cell<bool>=const {Cell::new(false)};}
 thread_local! {static FRAME_FONTS:std::cell::RefCell<std::collections::HashMap<usize,LOGFONTW>>=std::cell::RefCell::new(std::collections::HashMap::new());}
-unsafe fn font_properties(font:HFONT)->LOGFONTW {
-    let read=|| {let mut lf:LOGFONTW=zeroed();GetObjectW(font,size_of::<LOGFONTW>() as i32,(&mut lf as *mut LOGFONTW).cast());lf};
-    if CURRENT.get().1.is_null(){return read();}
-    FRAME_FONTS.with(|fonts|*fonts.borrow_mut().entry(font as usize).or_insert_with(read))
+unsafe fn font_properties(font: HFONT) -> LOGFONTW {
+    let read = || {
+        let mut lf: LOGFONTW = zeroed();
+        GetObjectW(
+            font,
+            size_of::<LOGFONTW>() as i32,
+            (&mut lf as *mut LOGFONTW).cast(),
+        );
+        lf
+    };
+    if CURRENT.get().1.is_null() {
+        return read();
+    }
+    FRAME_FONTS.with(|fonts| *fonts.borrow_mut().entry(font as usize).or_insert_with(read))
 }
 pub fn argb(color: u32, alpha: u32) -> u32 {
     (alpha << 24) | ((color & 255) << 16) | (color & 0xff00) | ((color >> 16) & 255)
@@ -267,7 +305,7 @@ impl Frame {
         GdipSetSmoothingMode(graphics, SmoothingModeAntiAlias);
         GdipSetInterpolationMode(graphics, InterpolationModeHighQualityBicubic);
         GdipSetPixelOffsetMode(graphics, PixelOffsetModeHighQuality);
-        FRAME_FONTS.with(|fonts|fonts.borrow_mut().clear());
+        FRAME_FONTS.with(|fonts| fonts.borrow_mut().clear());
         CURRENT.set((dc, graphics));
         FRAME_PIXELS.set(
             (!bits.is_null() && stride >= width && width > 0 && height > 0).then_some(
@@ -306,18 +344,41 @@ unsafe fn graphics(dc: HDC) -> Option<*mut GpGraphics> {
     let key = (clip.left, clip.top, clip.right, clip.bottom);
     let was_complex = COMPLEX_CLIP.replace(complex);
     if complex {
-        DC_REGIONS.with(|regions| {let regions=regions.borrow_mut();
-            let has_region=GetClipRgn(dc,regions.scratch)==1;
-            if has_region&&gpu::active(){let mut window:windows_sys::Win32::Foundation::POINT=zeroed();let mut viewport=zeroed();GetWindowOrgEx(dc,&mut window);GetViewportOrgEx(dc,&mut viewport);OffsetRgn(regions.scratch,window.x-viewport.x,window.y-viewport.y);}
-            if has_region && (!was_complex||CURRENT_CLIP.get()!=Some(key)||EqualRgn(regions.current,regions.scratch)==0) {
-                GdipSetClipHrgn(g,regions.scratch,CombineModeReplace);
-                if gpu::active() {GPU_DC_CLIPS.with(|clips|*clips.borrow_mut()=gpu::region_rects(regions.scratch).unwrap_or_default());}
-                CombineRgn(regions.current,regions.scratch,null_mut(),RGN_COPY);
+        DC_REGIONS.with(|regions| {
+            let regions = regions.borrow_mut();
+            let has_region = GetClipRgn(dc, regions.scratch) == 1;
+            if has_region && gpu::active() {
+                let mut window: windows_sys::Win32::Foundation::POINT = zeroed();
+                let mut viewport = zeroed();
+                GetWindowOrgEx(dc, &mut window);
+                GetViewportOrgEx(dc, &mut viewport);
+                OffsetRgn(
+                    regions.scratch,
+                    window.x - viewport.x,
+                    window.y - viewport.y,
+                );
+            }
+            if has_region
+                && (!was_complex
+                    || CURRENT_CLIP.get() != Some(key)
+                    || EqualRgn(regions.current, regions.scratch) == 0)
+            {
+                GdipSetClipHrgn(g, regions.scratch, CombineModeReplace);
+                if gpu::active() {
+                    GPU_DC_CLIPS.with(|clips| {
+                        *clips.borrow_mut() = gpu::region_rects(regions.scratch).unwrap_or_default()
+                    });
+                }
+                CombineRgn(regions.current, regions.scratch, null_mut(), RGN_COPY);
             }
         });
         CURRENT_CLIP.set(Some(key));
     } else if was_complex || CURRENT_CLIP.get() != Some(key) {
-        GPU_DC_CLIPS.with(|clips| {let mut clips=clips.borrow_mut();clips.clear();clips.push(clip);});
+        GPU_DC_CLIPS.with(|clips| {
+            let mut clips = clips.borrow_mut();
+            clips.clear();
+            clips.push(clip);
+        });
         GdipSetClipRectI(
             g,
             clip.left,
@@ -369,7 +430,9 @@ unsafe fn raster_surface(
     radius: f32,
     stroke: f32,
 ) -> bool {
-    if gpu::active() && is_current_graphics(g) { return false; }
+    if gpu::active() && is_current_graphics(g) {
+        return false;
+    }
     let pad = if stroke > 0.0 {
         stroke.ceil() as i32 + 1
     } else {
@@ -478,7 +541,9 @@ pub unsafe fn fill(dc: HDC, r: RECT, color: u32, radius: f32) -> bool {
     if r.right <= r.left || r.bottom <= r.top {
         return true;
     }
-    if gpu::draw(g,|s|s.rounded(r,color,radius,None)) {return true;}
+    if gpu::draw(g, |s| s.rounded(r, color, radius, None)) {
+        return true;
+    }
     if raster_surface(g, r, color, radius, 0.0) {
         return true;
     }
@@ -492,9 +557,13 @@ pub unsafe fn fill(dc: HDC, r: RECT, color: u32, radius: f32) -> bool {
 }
 /// Keep scrollbar movement fractional instead of rounding it to layout pixels.
 pub unsafe fn fill_offset_y(dc: HDC, r: RECT, color: u32, radius: f32, y: f32) -> bool {
-    let Some(g) = graphics(dc) else { return false; };
+    let Some(g) = graphics(dc) else {
+        return false;
+    };
     let color = surface_color(color);
-    if gpu::draw(g, |s| s.rounded_offset(r, color, radius, None, y)) { return true; }
+    if gpu::draw(g, |s| s.rounded_offset(r, color, radius, None, y)) {
+        return true;
+    }
     let p = path(r, radius);
     let mut matrix = null_mut();
     GdipCreateMatrix2(1., 0., 0., 1., 0., y, &mut matrix);
@@ -515,7 +584,9 @@ pub unsafe fn stroke(dc: HDC, r: RECT, color: u32, radius: f32, width: f32) -> b
     if r.right <= r.left || r.bottom <= r.top {
         return true;
     }
-    if gpu::draw(g,|s|s.rounded(r,color,radius,Some(width))) {return true;}
+    if gpu::draw(g, |s| s.rounded(r, color, radius, Some(width))) {
+        return true;
+    }
     if width > 0.0 && raster_surface(g, r, color, radius, width) {
         return true;
     }
@@ -611,7 +682,9 @@ pub unsafe fn line(dc: HDC, x1: f32, y1: f32, x2: f32, y2: f32, color: u32, widt
     let Some(g) = graphics(dc) else {
         return false;
     };
-    if gpu::draw(g,|s|s.line(x1,y1,x2,y2,color,width)) {return true;}
+    if gpu::draw(g, |s| s.line(x1, y1, x2, y2, color, width)) {
+        return true;
+    }
     let mut pen = null_mut();
     GdipCreatePen1(color, width, UnitPixel, &mut pen);
     gpu_dispatch::GdipDrawLine(g, pen, x1, y1, x2, y2);
@@ -677,7 +750,7 @@ pub unsafe fn profile_silhouette(dc: HDC, r: RECT, color: u32) -> bool {
     true
 }
 unsafe fn cached_text_path(font: HFONT, value: &str, r: RECT, flags: u32) -> Option<*mut GpPath> {
-    let lf=font_properties(font);
+    let lf = font_properties(font);
     let key = format!(
         "{:p}:{}:{}:{}:{}:{}:{}",
         font,
@@ -815,8 +888,11 @@ pub unsafe fn text(dc: HDC, font: HFONT, value: &str, r: RECT, color: u32, flags
         CombineModeIntersect,
     );
     GdipTranslateWorldTransform(g, r.left as f32, r.top as f32, MatrixOrderPrepend);
-    if gpu::draw(g,|s|s.text(p,argb(color,255),r.right-r.left,r.bottom-r.top)) {
-        GdipRestoreGraphics(g,state);return true;
+    if gpu::draw(g, |s| {
+        s.text(p, argb(color, 255), r.right - r.left, r.bottom - r.top)
+    }) {
+        GdipRestoreGraphics(g, state);
+        return true;
     }
     let _ = LIGHT.get();
     let mut pen = null_mut();
@@ -847,11 +923,15 @@ fn lyric_cache_budget(default: usize, _name: &str, entry_bytes: usize) -> usize 
 pub unsafe fn lyric_shadow(dc: HDC, font: HFONT, value: &str, r: RECT, flags: u32) -> bool {
     let Some(g) = graphics(dc) else { return false };
     if gpu::active() {
-        if let Some(p) = cached_text_path(font,value,r,flags | LYRICS_UNTRIMMED) {
-            let mut state=0; GdipSaveGraphics(g,&mut state);
-            GdipTranslateWorldTransform(g,r.left as f32,r.top as f32+1.,MatrixOrderPrepend);
-            let drawn=gpu::draw(g,|s| s.blur(p,0xa0000000,2.,Some(3.)));
-            GdipRestoreGraphics(g,state); if drawn { return true; }
+        if let Some(p) = cached_text_path(font, value, r, flags | LYRICS_UNTRIMMED) {
+            let mut state = 0;
+            GdipSaveGraphics(g, &mut state);
+            GdipTranslateWorldTransform(g, r.left as f32, r.top as f32 + 1., MatrixOrderPrepend);
+            let drawn = gpu::draw(g, |s| s.blur(p, 0xa0000000, 2., Some(3.)));
+            GdipRestoreGraphics(g, state);
+            if drawn {
+                return true;
+            }
         }
     }
     let key = format!(
@@ -980,7 +1060,7 @@ unsafe fn raster_text(
     if width <= 0 || height <= 0 || width as i64 * height as i64 > 2_000_000 {
         return false;
     }
-    let lf=font_properties(font);
+    let lf = font_properties(font);
     let key = format!(
         "{:p}:{}:{}:{width}:{height}:{color}:{flags}:{value}",
         font, lf.lfHeight, lf.lfWeight
@@ -1147,7 +1227,7 @@ pub unsafe fn lyric_text_width(dc: HDC, font: HFONT, value: &str) -> i32 {
     if value.is_empty() {
         return 0;
     }
-    let lf=font_properties(font);
+    let lf = font_properties(font);
     let key = format!("{:p}:{}:{}:{}", font, lf.lfHeight, lf.lfWeight, value);
     if let Some(width) =
         LYRIC_WIDTHS.with(|c| c.borrow().iter().find(|(k, _)| *k == key).map(|(_, w)| *w))
@@ -1229,11 +1309,17 @@ pub unsafe fn blurred_text(
         return false;
     };
     if gpu::active() {
-        if let Some(p) = cached_text_path(font,value,r,flags | LYRICS_UNTRIMMED) {
-            let mut state=0; GdipSaveGraphics(g,&mut state);
-            GdipTranslateWorldTransform(g,r.left as f32,r.top as f32,MatrixOrderPrepend);
-            let drawn=gpu::draw(g,|s| s.blur(p,argb(color,255),blur_px.clamp(0.5,6.),None));
-            GdipRestoreGraphics(g,state); if drawn { return true; }
+        if let Some(p) = cached_text_path(font, value, r, flags | LYRICS_UNTRIMMED) {
+            let mut state = 0;
+            GdipSaveGraphics(g, &mut state);
+            GdipTranslateWorldTransform(g, r.left as f32, r.top as f32, MatrixOrderPrepend);
+            let drawn = gpu::draw(g, |s| {
+                s.blur(p, argb(color, 255), blur_px.clamp(0.5, 6.), None)
+            });
+            GdipRestoreGraphics(g, state);
+            if drawn {
+                return true;
+            }
         }
     }
     if value.is_empty() || r.right <= r.left || r.bottom <= r.top {
@@ -1246,7 +1332,7 @@ pub unsafe fn blurred_text(
     if width as usize * height as usize * 4 > 8 * 1024 * 1024 {
         return false;
     }
-    let lf=font_properties(font);
+    let lf = font_properties(font);
     let key = format!(
         "{:p}:{}:{}:{}:{}:{}:{}:{}:{}",
         font, lf.lfHeight, lf.lfWeight, width, height, color, flags, radius, value
@@ -1315,7 +1401,8 @@ pub unsafe fn blurred_text(
             cache.push_back((key, BlurredText { bitmap, pixels }));
         }
         let bitmap = cache.back().unwrap().1.bitmap;
-        gpu_dispatch::GdipDrawImageRectI(g, bitmap.cast(), r.left - pad, r.top - pad, width, height) == 0
+        gpu_dispatch::GdipDrawImageRectI(g, bitmap.cast(), r.left - pad, r.top - pad, width, height)
+            == 0
     })
 }
 
@@ -1453,19 +1540,22 @@ fn spawn_artwork_workers(
         let prepare = prepare.clone();
         std::thread::Builder::new()
             .name(format!("artwork-resize-{index}"))
-            .spawn(move || {crate::catalog::artwork_background_priority();loop {
-                let result = match work.lock() {
-                    std::result::Result::Ok(receiver) => receiver.recv(),
-                    Err(_) => return,
-                };
-                let std::result::Result::Ok((key, image)) = result else {
-                    break;
-                };
-                let bitmap = prepare(key, image);
-                if finished.send((key, bitmap)).is_err() {
-                    break;
+            .spawn(move || {
+                crate::catalog::artwork_background_priority();
+                loop {
+                    let result = match work.lock() {
+                        std::result::Result::Ok(receiver) => receiver.recv(),
+                        Err(_) => return,
+                    };
+                    let std::result::Result::Ok((key, image)) = result else {
+                        break;
+                    };
+                    let bitmap = prepare(key, image);
+                    if finished.send((key, bitmap)).is_err() {
+                        break;
+                    }
                 }
-            }})
+            })
             .expect("start artwork preparation worker");
     }
 }
@@ -1623,8 +1713,20 @@ pub unsafe fn image(
     let Some(g) = graphics(dc) else {
         return false;
     };
-    if gpu::draw(g, |s| s.image((image.id << 1) | 1, image.pixels.as_ptr().cast(), image.width,
-        image.height, image.width * 4, r, radius.max(0.).min(((r.right-r.left).min(r.bottom-r.top)) as f32 / 2.), alpha)) {
+    if gpu::draw(g, |s| {
+        s.image(
+            (image.id << 1) | 1,
+            image.pixels.as_ptr().cast(),
+            image.width,
+            image.height,
+            image.width * 4,
+            r,
+            radius
+                .max(0.)
+                .min(((r.right - r.left).min(r.bottom - r.top)) as f32 / 2.),
+            alpha,
+        )
+    }) {
         return true;
     }
     if r.right <= r.left || r.bottom <= r.top {
@@ -1809,10 +1911,15 @@ pub unsafe fn wave_landscape(
     gpu_dispatch::GdipDeletePath(path);
 
     if glow != 0 {
-        let mut glow_pen = null_mut();
-        GdipCreatePen1(glow, stroke_width * 2.8, UnitPixel, &mut glow_pen);
-        gpu_dispatch::GdipDrawCurve2(g, glow_pen, pts.as_ptr(), pts.len() as i32, 0.45);
-        GdipDeletePen(glow_pen);
+        // Approximate Sonora's broad, soft wave glow with translucent strokes.
+        let alpha = glow >> 24;
+        for (width, opacity) in [(10.0, 0.08), (6.0, 0.12), (3.0, 0.18)] {
+            let color = (glow & 0x00ff_ffff) | (((alpha as f32 * opacity) as u32) << 24);
+            let mut glow_pen = null_mut();
+            GdipCreatePen1(color, stroke_width * width, UnitPixel, &mut glow_pen);
+            gpu_dispatch::GdipDrawCurve2(g, glow_pen, pts.as_ptr(), pts.len() as i32, 0.45);
+            GdipDeletePen(glow_pen);
+        }
     }
 
     let mut pen = null_mut();
@@ -1831,7 +1938,7 @@ pub unsafe fn spectrum_bars(
     width: f32,
     max_height: f32,
     accent: u32,
-    glow: u32,
+    _glow: u32,
 ) -> bool {
     let Some(g) = graphics(dc) else {
         return false;
@@ -1849,24 +1956,9 @@ pub unsafe fn spectrum_bars(
         let bx = x + i as f32 * (bar_w + spacing);
         let by = y + max_height - bh;
 
-        let bounds = RectF {
-            X: bx,
-            Y: by,
-            Width: bar_w,
-            Height: bh,
-        };
-
-        // Linear gradient: vibrant accent at top fading downwards
+        // Sonora uses a flat, translucent fill for its bars.
         let mut brush = null_mut();
-        gpu_dispatch::GdipCreateLineBrushFromRectWithAngle(
-            &bounds,
-            argb(accent, 225),
-            argb(accent, 35),
-            90.0,
-            0,
-            WrapModeTileFlipXY,
-            &mut brush,
-        );
+        GdipCreateSolidFill(argb(accent, 82), &mut brush);
 
         let mut path = null_mut();
         let radius = (bar_w * 0.45).clamp(1.0, 4.0);
@@ -1880,14 +1972,6 @@ pub unsafe fn spectrum_bars(
         gpu_dispatch::GdipFillPath(g, brush.cast(), path);
         gpu_dispatch::GdipDeleteBrush(brush.cast());
         gpu_dispatch::GdipDeletePath(path);
-
-        // Glowing cap at the top of each active bar
-        if glow != 0 {
-            let mut cap_pen = null_mut();
-            GdipCreatePen1(glow, 2.0, UnitPixel, &mut cap_pen);
-            gpu_dispatch::GdipDrawLine(g, cap_pen, bx + radius, by, bx + bar_w - radius, by);
-            GdipDeletePen(cap_pen);
-        }
     }
 
     true
@@ -2333,11 +2417,34 @@ mod tests {
             let previous = SelectObject(dc, bitmap);
             let mut pixels = vec![0u32; 64 * 64];
             {
-                let _frame = Frame::begin(dc, pixels.as_mut_ptr().cast(), 64, 64, 64, false).unwrap();
-                spotify_logo(dc, RECT { left: 0, top: 0, right: 32, bottom: 32 });
-                fill(dc, RECT { left: 40, top: 40, right: 60, bottom: 60 }, 0xffffffff, 0.0);
+                let _frame =
+                    Frame::begin(dc, pixels.as_mut_ptr().cast(), 64, 64, 64, false).unwrap();
+                spotify_logo(
+                    dc,
+                    RECT {
+                        left: 0,
+                        top: 0,
+                        right: 32,
+                        bottom: 32,
+                    },
+                );
+                fill(
+                    dc,
+                    RECT {
+                        left: 40,
+                        top: 40,
+                        right: 60,
+                        bottom: 60,
+                    },
+                    0xffffffff,
+                    0.0,
+                );
             }
-            assert_ne!(pixels[50 * 64 + 50], 0, "drawing after the logo must remain visible");
+            assert_ne!(
+                pixels[50 * 64 + 50],
+                0,
+                "drawing after the logo must remain visible"
+            );
             SelectObject(dc, previous);
             DeleteObject(bitmap);
             DeleteDC(dc);

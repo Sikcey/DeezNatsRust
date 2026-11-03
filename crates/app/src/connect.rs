@@ -8,7 +8,7 @@ use std::{
         Arc, RwLock,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[path = "connect/mp3.rs"]
@@ -26,12 +26,16 @@ use std::sync::{Mutex, OnceLock};
 
 static VISUALIZER_SPECTRUM: OnceLock<RwLock<spectrum::Snapshot>> = OnceLock::new();
 pub(crate) fn visualizer_spectrum() -> Option<[f32; 32]> {
-if Provider::active() == Provider::YouTube { return crate::youtube::routing::levels(false); }
+    if Provider::active() == Provider::YouTube {
+        return crate::youtube::routing::levels(false);
+    }
     let value = VISUALIZER_SPECTRUM.get()?.read().ok()?;
     value.fresh().then_some(value.levels)
 }
 pub(crate) fn visualizer_trap_spectrum() -> Option<[f32; 32]> {
-if Provider::active() == Provider::YouTube { return crate::youtube::routing::levels(true); }
+    if Provider::active() == Provider::YouTube {
+        return crate::youtube::routing::levels(true);
+    }
     let value = VISUALIZER_SPECTRUM.get()?.read().ok()?;
     value.fresh().then_some(value.trap_levels)
 }
@@ -286,6 +290,7 @@ impl ConnectTrack {
 }
 
 pub struct HubState {
+    presence: std::collections::HashMap<String, (String, Instant)>,
     queue_revision: u64,
     spotify_audio_error: Option<String>,
     pub spectrum: spectrum::Snapshot,
@@ -320,6 +325,7 @@ impl ConnectHub {
         let _ = listener.set_nonblocking(true);
         let active = Arc::new(AtomicBool::new(true));
         let state = Arc::new(RwLock::new(HubState {
+            presence: Default::default(),
             queue_revision: 0,
             spotify_audio_error: None,
             spectrum: spectrum::Snapshot::default(),
@@ -478,8 +484,14 @@ impl ConnectHub {
                 }
                 if provider == Provider::YouTube {
                     for pcm in crate::youtube::routing::drain() {
-                        publish_pcm(&audio_state, &audio_active, &spectrum_tx,
-                            spectrum_generation, &pcm, Provider::YouTube);
+                        publish_pcm(
+                            &audio_state,
+                            &audio_active,
+                            &spectrum_tx,
+                            spectrum_generation,
+                            &pcm,
+                            Provider::YouTube,
+                        );
                     }
                 }
                 if provider == Provider::Spotify && broadcaster().has_listeners() {
@@ -625,6 +637,22 @@ impl ConnectHub {
         format!("http://{ip}:{}/", self.port)
     }
 
+    pub fn nicknames(&self) -> Vec<String> {
+        let Ok(mut state) = self.state.write() else {
+            return Vec::new();
+        };
+        state
+            .presence
+            .retain(|_, (_, seen)| seen.elapsed() < Duration::from_secs(45));
+        let mut names: Vec<_> = state
+            .presence
+            .values()
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
     pub fn update(&self, snapshot: &Snapshot) {
         if let Ok(mut st) = self.state.write() {
             if st.snapshot.provider != snapshot.provider
@@ -734,15 +762,50 @@ fn handle_client(
     // A captured host provider prevents requests falling through to Deezer
     // catalog calls or public fallbacks while Spotify is selected.
     let host = state.read().unwrap().snapshot.clone();
-if host.provider == Provider::YouTube && path.starts_with("/api/")
-    && !(method == "GET" && matches!(path, "/api/state" | "/api/queue" | "/api/stream" | "/api/spectrum" | "/api/appearance")) {
-        send_error(stream, "YouTube Music remote controls and catalog are unavailable. Use the desktop player.");
+    if host.provider == Provider::YouTube
+        && path.starts_with("/api/")
+        && path != "/api/presence"
+        && !(method == "GET"
+            && matches!(
+                path,
+                "/api/state" | "/api/queue" | "/api/stream" | "/api/spectrum" | "/api/appearance"
+            ))
+    {
+        send_error(
+            stream,
+            "YouTube Music remote controls and catalog are unavailable. Use the desktop player.",
+        );
+        return;
+    }
+    if method == "POST" && path == "/api/presence" {
+        let payload = serde_json::from_str::<serde_json::Value>(body_slice).unwrap_or_default();
+        let id = payload["id"].as_str().unwrap_or("");
+        let name = payload["nickname"].as_str().unwrap_or("").trim();
+        if !id.is_empty()
+            && id.len() <= 100
+            && name.chars().count() <= 64
+            && !name.chars().any(char::is_control)
+        {
+            if let Ok(mut state) = state.write() {
+                state
+                    .presence
+                    .retain(|_, (_, seen)| seen.elapsed() < Duration::from_secs(45));
+                if name.is_empty() {
+                    state.presence.remove(id);
+                } else if state.presence.len() < 256 || state.presence.contains_key(id) {
+                    state
+                        .presence
+                        .insert(id.to_owned(), (name.to_owned(), Instant::now()));
+                }
+            }
+        }
+        send_json(stream, &serde_json::json!({"ok": true}));
         return;
     }
     let provider_name = if host.provider == Provider::Spotify {
         "spotify"
-} else if host.provider == Provider::YouTube {
-"youtube"
+    } else if host.provider == Provider::YouTube {
+        "youtube"
     } else {
         "deezer"
     };
@@ -750,7 +813,7 @@ if host.provider == Provider::YouTube && path.starts_with("/api/")
         send_error(stream, "Host provider changed. Refresh the catalog.");
         return;
     }
-    if method == "POST" && path.starts_with("/api/") {
+    if method == "POST" && path.starts_with("/api/") && path != "/api/presence" {
         let payload = serde_json::from_str::<serde_json::Value>(body_slice).unwrap_or_default();
         if !valid_host_payload(host.provider, &payload) {
             send_error(
@@ -850,8 +913,8 @@ if host.provider == Provider::YouTube && path.starts_with("/api/")
             };
             let available = if host.provider == Provider::Spotify {
                 stream_target.is_some()
-} else if host.provider == Provider::YouTube {
-host.playback_connected
+            } else if host.provider == Provider::YouTube {
+                host.playback_connected
             } else {
                 state
                     .read()
@@ -1042,7 +1105,7 @@ host.playback_connected
             send_json(
                 stream,
                 &serde_json::json!({
-"provider": if snapshot.provider == Provider::Spotify { "spotify" } else if snapshot.provider == Provider::YouTube { "youtube" } else { "deezer" },
+                "provider": if snapshot.provider == Provider::Spotify { "spotify" } else if snapshot.provider == Provider::YouTube { "youtube" } else { "deezer" },
                     "queue_revision": revision,
                     "queue": connect_queue(&snapshot),
                 }),
@@ -1081,8 +1144,8 @@ host.playback_connected
                     (snap.position, snap.state.to_ascii_lowercase())
                 };
                 let mut json = serde_json::json!({
-"provider": if snap.provider == Provider::Spotify { "spotify" } else if snap.provider == Provider::YouTube { "youtube" } else { "deezer" },
-"stream_available": if snap.provider == Provider::Spotify { crate::spotify::service::audio_target().is_some() } else if snap.provider == Provider::YouTube { snap.playback_connected } else { st.engine.is_some() },
+                "provider": if snap.provider == Provider::Spotify { "spotify" } else if snap.provider == Provider::YouTube { "youtube" } else { "deezer" },
+                "stream_available": if snap.provider == Provider::Spotify { crate::spotify::service::audio_target().is_some() } else if snap.provider == Provider::YouTube { snap.playback_connected } else { st.engine.is_some() },
                 "stream_error": if snap.provider == Provider::Spotify { st.spotify_audio_error.clone() } else { None },
                 "connected": snap.connected,
                     "state": playback_state,
@@ -2316,8 +2379,41 @@ fn url_encode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn presence_tracks_and_expires_browser_sessions() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        let hub = ConnectHub::start(0, tx).unwrap();
+        fn post(hub: &ConnectHub, body: &str) {
+            let mut stream = TcpStream::connect(("127.0.0.1", hub.port())).unwrap();
+            write!(
+                stream,
+                "POST /api/presence HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"));
+        }
+        post(&hub, r#"{"id":"one","nickname":"Alice"}"#);
+        post(&hub, r#"{"id":"two","nickname":"Bob"}"#);
+        assert_eq!(hub.nicknames(), ["Alice", "Bob"]);
+        post(&hub, r#"{"id":"one","nickname":""}"#);
+        assert_eq!(hub.nicknames(), ["Bob"]);
+        hub.state
+            .write()
+            .unwrap()
+            .presence
+            .get_mut("two")
+            .unwrap()
+            .1 = Instant::now() - Duration::from_secs(46);
+        assert!(hub.nicknames().is_empty());
+    }
+
+    #[test]
     fn audio_delivery_continues_when_spectrum_worker_is_backlogged() {
         let state = RwLock::new(HubState {
+            presence: Default::default(),
             queue_revision: 0,
             spotify_audio_error: None,
             spectrum: spectrum::Snapshot::default(),

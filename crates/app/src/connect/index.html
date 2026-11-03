@@ -2824,11 +2824,11 @@ const BrowserProfiles = (() => {
             const actions = document.createElement('div'); actions.className = 'browser-profile-actions';
             const use = document.createElement('button'); use.type = 'button'; use.className = 'btn-act';
             use.textContent = active === name ? 'Selected' : 'Use profile'; use.setAttribute('aria-pressed', String(active === name));
-            use.onclick = () => { if (save(profiles, name)) status.textContent = 'Profile selected.'; };
+            use.onclick = () => { if (save(profiles, name)) { status.textContent = 'Profile selected.'; updatePresence(); } };
             const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'btn-act'; remove.textContent = 'Delete';
             remove.onclick = () => {
                 const remaining = profiles.filter(value => value !== name);
-                if (save(remaining, active === name ? (remaining[0] || '') : active)) status.textContent = 'Profile deleted.';
+                if (save(remaining, active === name ? (remaining[0] || '') : active)) { status.textContent = 'Profile deleted.'; updatePresence(); }
             };
             actions.append(use, remove); row.append(label, actions); list.append(row);
         }
@@ -2841,7 +2841,7 @@ const BrowserProfiles = (() => {
         if (profiles.some(value => value.toLocaleLowerCase() === name.toLocaleLowerCase())) {
             status.textContent = 'That nickname already exists. Select its profile below.'; return;
         }
-        if (save([...profiles, name], name)) { input.value = ''; status.textContent = 'Profile created and selected.'; }
+        if (save([...profiles, name], name)) { updatePresence(); input.value = ''; status.textContent = 'Profile created and selected.'; }
     });
     dialog.addEventListener('cancel', event => event.preventDefault());
     document.getElementById('nickname-form').addEventListener('submit', event => {
@@ -2850,8 +2850,17 @@ const BrowserProfiles = (() => {
         if (!validName(name)) { promptStatus.textContent = 'Use a nickname of 1–64 characters without control characters.'; return; }
         const existing = profiles.find(value => value.toLocaleLowerCase() === name.toLocaleLowerCase());
         save(existing ? profiles : [...profiles, name], existing || name);
+        updatePresence();
     });
+    const presenceId = Math.random().toString(36).slice(2) + Date.now().toString(36);
+    function updatePresence() {
+        fetch('/api/presence', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:presenceId, nickname:active}), keepalive:true}).catch(()=>{});
+    }
     render();
+    updatePresence();
+    setInterval(updatePresence, 15000);
+    window.addEventListener('pagehide', () => navigator.sendBeacon('/api/presence', JSON.stringify({id:presenceId, nickname:''})));
+    window.addEventListener('pageshow', updatePresence);
     return { nickname: () => {
         if (!active) { render(); throw new Error('Choose your nickname before continuing.'); }
         return active;

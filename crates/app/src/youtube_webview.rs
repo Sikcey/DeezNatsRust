@@ -139,16 +139,69 @@ fn valid_youtube_cookie(name: &str, domain: &str, _secure: bool, value: &str) ->
         && !value.contains([';', '\r', '\n'])
 }
 
+// Google installs SID/SAPISID before the cross-domain sign-in handoff has
+// finished. LOGIN_INFO and a return to Music distinguish a completed handoff.
+fn capture_ready(uri: &str, names: &[&str]) -> bool {
+    let music = url::Url::parse(uri).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str() == Some("music.youtube.com")
+            && !url.path().starts_with("/signin")
+    });
+    music
+        && names.contains(&"SID")
+        && names.contains(&"LOGIN_INFO")
+        && names
+            .iter()
+            .any(|name| matches!(*name, "SAPISID" | "__Secure-3PAPISID"))
+}
 #[cfg(test)]
 mod tests {
-    use super::valid_youtube_cookie;
+    use super::{capture_ready, valid_youtube_cookie};
+    #[test]
+    fn capture_waits_for_completed_music_sign_in() {
+        let partial = ["SID", "SAPISID"];
+        let complete = ["SID", "SAPISID", "LOGIN_INFO"];
+        assert!(!capture_ready("https://music.youtube.com/", &partial));
+        assert!(!capture_ready(
+            "https://accounts.google.com/ServiceLogin",
+            &complete
+        ));
+        assert!(!capture_ready(
+            "https://music.youtube.com.evil.test/",
+            &complete
+        ));
+        assert!(!capture_ready(
+            "https://music.youtube.com/signin",
+            &complete
+        ));
+        assert!(capture_ready("https://music.youtube.com/", &complete));
+        assert!(capture_ready(
+            "https://music.youtube.com/",
+            &["SID", "__Secure-3PAPISID", "LOGIN_INFO"]
+        ));
+    }
 
     #[test]
     fn accepts_youtube_session_cookies_without_secure_flag() {
         assert!(valid_youtube_cookie("SID", ".youtube.com", false, "value"));
-        assert!(valid_youtube_cookie("__Secure-3PAPISID", ".youtube.com", true, "value"));
-        assert!(!valid_youtube_cookie("SID", "youtube.com.example.com", false, "value"));
-        assert!(!valid_youtube_cookie("SID", ".youtube.com", false, "bad;value"));
+        assert!(valid_youtube_cookie(
+            "__Secure-3PAPISID",
+            ".youtube.com",
+            true,
+            "value"
+        ));
+        assert!(!valid_youtube_cookie(
+            "SID",
+            "youtube.com.example.com",
+            false,
+            "value"
+        ));
+        assert!(!valid_youtube_cookie(
+            "SID",
+            ".youtube.com",
+            false,
+            "bad;value"
+        ));
     }
 }
 pub(crate) fn run(cancel: &AtomicBool) -> Result<String, String> {
@@ -399,6 +452,7 @@ unsafe fn run_sta(url: &str, cancel: &AtomicBool, smoke: bool) -> Result<String,
         if checked.elapsed() >= Duration::from_millis(750) && !pending.get() {
             checked = Instant::now();
             pending.set(true);
+            let uri = text(|out| webview.Source(out)).unwrap_or_default();
             let output = captured.clone();
             let busy = pending.clone();
             if cookies
@@ -411,8 +465,7 @@ unsafe fn run_sta(url: &str, cancel: &AtomicBool, smoke: bool) -> Result<String,
                                 let mut count = 0;
                                 list.Count(&mut count)?;
                                 let mut header = Vec::new();
-                                let mut signed_in = false;
-                            let mut has_sid = false;
+                                let mut names = Vec::new();
                                 for i in 0..count.min(256) {
                                     let cookie = list.GetValueAtIndex(i)?;
                                     let name = text(|out| cookie.Name(out))?;
@@ -426,13 +479,12 @@ unsafe fn run_sta(url: &str, cancel: &AtomicBool, smoke: bool) -> Result<String,
                                         secure.as_bool(),
                                         &value,
                                     ) {
-                                        signed_in |=
-                                            name == "SAPISID" || name == "__Secure-3PAPISID";
-                                    has_sid |= name == "SID";
+                                        names.push(name.clone());
                                         header.push(format!("{name}={value}"));
                                     }
                                 }
-                            if signed_in && has_sid {
+                                let names: Vec<_> = names.iter().map(String::as_str).collect();
+                                if capture_ready(&uri, &names) {
                                     *output.borrow_mut() = Some(header.join("; "));
                                 }
                             }

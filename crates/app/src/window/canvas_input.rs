@@ -799,6 +799,7 @@ unsafe fn context_menu(hwnd: HWND, lp: isize) {
     let undo = !(*p).editor.undo.is_empty();
     let redo = !(*p).editor.redo.is_empty();
     let menu = CreatePopupMenu();
+    let parent = GetWindowLongPtrW(GetParent(hwnd), GWLP_USERDATA) as *mut App;
     for (id, label, active) in [
         (1, "Undo", enabled && undo),
         (2, "Redo", enabled && redo),
@@ -811,7 +812,12 @@ unsafe fn context_menu(hwnd: HWND, lp: isize) {
             menu,
             MF_STRING | if active { MF_ENABLED } else { MF_GRAYED },
             id,
-            wide(label).as_ptr(),
+            wide(if parent.is_null() {
+                label
+            } else {
+                (*parent).ui.t(label)
+            })
+            .as_ptr(),
         );
     }
     let mut point = POINT {

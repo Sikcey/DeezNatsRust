@@ -1,10 +1,11 @@
 //! UI structure mirrors the original WinForms shell and its in-app views.
 //! Coordinates are device-independent; the HWND host applies the DPI scale.
+mod track_info;
 // Extra rows let scrolling translate the scene between layout rebuilds.
 pub(crate) const SCROLL_OVERSCAN: i32 = 384;
-mod queue_scroll;
 mod catalog_scroll;
-pub(crate) use catalog_scroll::{prepare_catalog_scroll, finish_catalog_scroll};
+mod queue_scroll;
+pub(crate) use catalog_scroll::{finish_catalog_scroll, prepare_catalog_scroll};
 pub(crate) use queue_scroll::refresh_queue_sidebar;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
@@ -258,6 +259,7 @@ pub enum Action {
     OpenItem(crate::catalog::Entry),
     PlayAll,
     More,
+    CollectionMenu,
     RefreshFlow,
     Favorite,
     FavoriteNow,
@@ -363,6 +365,7 @@ pub enum Action {
     VisualizerStyle(u8),
     CornerStyle(usize),
     SolidTheme(usize),
+    ThemeShelf(i32),
     CustomTheme(bool),
     SaveCustomTheme,
     CloseCustomTheme,
@@ -464,6 +467,9 @@ pub struct LyricRow {
     pub label: usize,
     pub line: usize,
     pub range: std::ops::Range<usize>,
+    pub button: Option<usize>,
+    pub lag: f32,
+    pub velocity: f32,
 }
 pub struct Panel {
     pub rect: Rect,
@@ -481,6 +487,8 @@ pub struct Scene {
     pub device_active_card: Option<Rect>,
     pub lyric_rows: Vec<LyricRow>,
     pub lyrics_anchor: Option<i32>,
+    pub lyrics_focus_y: Option<i32>,
+    pub lyrics_motion_at: Option<std::time::Instant>,
     pub lyrics_gap: Option<(u64, u64)>,
     pub karaoke_preview: Option<usize>,
     pub queue_viewport: Option<Rect>,
@@ -495,16 +503,16 @@ pub struct Scene {
     pub queue_panels: std::ops::Range<usize>,
     pub queue_pictures: std::ops::Range<usize>,
     pub queue_row_labels: std::ops::Range<usize>,
-    pub queue_row_buttons:std::ops::Range<usize>,
-    pub queue_layout_scroll:i32,
-    pub queue_pixel_scroll:i32,
+    pub queue_row_buttons: std::ops::Range<usize>,
+    pub queue_layout_scroll: i32,
+    pub queue_pixel_scroll: i32,
     pub queue_frame: Option<Rect>,
     pub content_panels: std::ops::Range<usize>,
     pub content_pictures: std::ops::Range<usize>,
     pub content_top: i32,
     pub(crate) catalog_layout: Option<catalog_scroll::Layout>,
     pub(crate) catalog_rows: Vec<catalog_scroll::Row>,
-    catalog_reuse: std::collections::HashMap<String,catalog_scroll::Nodes>,
+    catalog_reuse: std::collections::HashMap<String, catalog_scroll::Nodes>,
     pub(crate) catalog_preserved_buttons: std::collections::HashSet<usize>,
     pub(crate) catalog_preserved_labels: std::collections::HashSet<usize>,
     pub buttons: Vec<Button>,
@@ -626,6 +634,14 @@ impl Scene {
         });
     }
 }
+pub const LAYOUT_TRANSITION_SECONDS: f32 = 0.32;
+pub const SCROLL_SPRING_RATE: f32 = 18.0;
+
+pub fn layout_transition_ease(progress: f32) -> f32 {
+    let t = progress.clamp(0., 1.);
+    t * t * (3. - 2. * t)
+}
+
 pub struct Ui {
     pub device_menu_open: bool,
     pub device_sidebar_scroll: i32,
@@ -644,9 +660,12 @@ pub struct Ui {
     pub spotify_reset_pending: bool,
     pub playlist_draft: crate::playlist::Draft,
     pub playlist_busy: bool,
+    pub playlist_modal_save: bool,
+    pub library_state_loaded: bool,
     pub playlist_track: Option<crate::catalog::Entry>,
     pub expanded_palettes: bool,
     pub expanded_themes: bool,
+    pub theme_shelf_offset: usize,
     pub expanded_podcast_description: Option<String>,
     pub dpi_scale: f64,
     pub language: String,
@@ -674,6 +693,7 @@ pub struct Ui {
     pub page: Option<std::sync::Arc<crate::catalog::Page>>,
     pub now: crate::catalog::Entry,
     pub account: serde_json::Value,
+    pub pinned: Vec<(crate::catalog::Provider, crate::catalog::Entry)>,
     pub quality: String,
     pub lyrics: Vec<(u64, String)>,
     pub position: u64,
@@ -772,6 +792,8 @@ pub struct Ui {
     pub keep_played_tracks: bool,
     pub jam_enabled: bool,
     pub jam_url: String,
+    pub connect_port: u16,
+    pub connect_nicknames: Vec<String>,
     pub stay_awake: bool,
     pub window_blur: bool,
     pub ui_blur: bool,
@@ -805,9 +827,12 @@ impl Default for Ui {
             spotify_reset_pending: false,
             playlist_draft: Default::default(),
             playlist_busy: false,
+            playlist_modal_save: false,
+            library_state_loaded: false,
             playlist_track: None,
             expanded_palettes: false,
             expanded_themes: false,
+            theme_shelf_offset: 0,
             expanded_podcast_description: None,
             dpi_scale: 1.0,
             language: String::new(),
@@ -835,6 +860,7 @@ impl Default for Ui {
             page: None,
             now: Default::default(),
             account: Default::default(),
+            pinned: Vec::new(),
             quality: String::new(),
             lyrics: Vec::new(),
             position: 0,
@@ -865,7 +891,7 @@ impl Default for Ui {
             flow_customizable: false,
             flow_loaded: false,
             flow_filter: String::new(),
-            flow_genre_limit: 30,
+            flow_genre_limit: 20,
             mix_region: usize::MAX,
             mix_genre: usize::MAX,
             mix_genres: None,
@@ -933,6 +959,8 @@ impl Default for Ui {
             keep_played_tracks: true,
             jam_enabled: false,
             jam_url: String::new(),
+            connect_port: crate::connect::DEFAULT_PORT,
+            connect_nicknames: Vec::new(),
             stay_awake: false,
             window_blur: true,
             ui_blur: true,
@@ -1010,7 +1038,7 @@ impl Ui {
             crate::catalog::Provider::YouTube => self.youtube_flow_id.clone(),
         };
         self.flow_filter.clear();
-        self.flow_genre_limit = 30;
+        self.flow_genre_limit = 20;
         self.flow_customizable = false;
         self.flow_loaded = false;
         self.genres.clear();
@@ -1020,18 +1048,32 @@ impl Ui {
     /// Fold open sidebars before they squeeze the main page below its useful width.
     /// This runs on window resize; users can still explicitly reopen a sidebar.
     pub fn right_sidebar_open(&self) -> bool {
-        self.queue_sidebar_open
-            || (self.provider == crate::catalog::Provider::Spotify && self.device_menu_open)
+        self.queue_sidebar_open || self.device_menu_open
+    }
+    pub fn sidebar_values(&self) -> (f32, f32) {
+        (
+            if self.sidebar_collapsed { 0. } else { 1. },
+            if self.right_sidebar_open() { 1. } else { 0. },
+        )
+    }
+    pub fn content_left(&self) -> i32 {
+        (70. + 176. * self.sidebar_values().0).round() as i32
+    }
+    pub fn right_sidebar_width(&self, width: i32) -> i32 {
+        (280.min(width / 3) as f32 * self.sidebar_values().1).round() as i32
+    }
+    pub fn visible_device_sidebar(&self) -> bool {
+        self.device_menu_open
     }
     pub fn toggle_device_sidebar(&mut self) {
         self.device_menu_open = !self.device_menu_open;
-        if self.device_menu_open && self.provider == crate::catalog::Provider::Spotify {
+        if self.device_menu_open {
             self.queue_sidebar_open = false;
         }
     }
     pub fn toggle_queue_sidebar(&mut self) {
         self.queue_sidebar_open = !self.queue_sidebar_open;
-        if self.queue_sidebar_open && self.provider == crate::catalog::Provider::Spotify {
+        if self.queue_sidebar_open {
             self.device_menu_open = false;
         }
     }
@@ -1060,9 +1102,7 @@ impl Ui {
         let right = if lyrics { 32 } else { 40 };
         if self.right_sidebar_open() && width - left - right - queue < minimum {
             self.queue_sidebar_open = false;
-            if self.provider == crate::catalog::Provider::Spotify {
-                self.device_menu_open = false;
-            }
+            self.device_menu_open = false;
         }
     }
     pub fn t<'a>(&'a self, value: &'a str) -> &'a str {
@@ -1100,7 +1140,7 @@ impl Ui {
         };
         self.translations = std::sync::Arc::new(serde_json::from_str(catalog).unwrap_or_default());
     }
-    fn translated_text(&self, text: &str) -> String {
+    pub(crate) fn translated_text(&self, text: &str) -> String {
         // Setting values carry a dropdown marker outside the translatable text.
         if let Some(value) = text.strip_suffix("   \u{25be}") {
             return format!("{}   \u{25be}", self.t(value));
@@ -1211,6 +1251,7 @@ impl Ui {
             (value["Volume"].as_f64().unwrap_or(0.7).clamp(0.0, 1.0) * 100.0).round() as u32;
         ui.last_provider = serde_json::from_value(value["LastProvider"].clone()).ok();
         ui.restore_flow_preferences(&value);
+        ui.pinned = serde_json::from_value(value["PinnedCollections"].clone()).unwrap_or_default();
         ui.blur = value["BackgroundBlur"].as_u64().unwrap_or(30).min(100) as u32;
         ui.brightness = value["LightBrightness"].as_u64().unwrap_or(50).min(110) as u32;
         ui.surface_opacity = value["SurfaceOpacity"].as_u64().unwrap_or(26).min(100) as u32;
@@ -1293,6 +1334,10 @@ impl Ui {
         ui.player_layout = value["PlayerLayout"].as_u64().unwrap_or(0).min(1) as usize;
         ui.transparent_player = true;
 
+        ui.connect_port = value["ConnectPort"]
+            .as_u64()
+            .filter(|p| (1..=65535).contains(p))
+            .unwrap_or(crate::connect::DEFAULT_PORT as u64) as u16;
         ui.jam_enabled = false;
         ui.autoplay = value["Autoplay"].as_bool().unwrap_or(true);
         ui.karaoke_lyrics = value["KaraokeLyrics"].as_bool().unwrap_or(true);
@@ -1495,10 +1540,12 @@ impl Ui {
             value["BackgroundFps"] = serde_json::json!(self.value("Background FPS"));
             value["ShowOnStartup"] = serde_json::json!(self.value("Show on startup"));
             value["LastProvider"] = serde_json::json!(self.last_provider);
+            value["PinnedCollections"] = serde_json::json!(self.pinned);
             self.write_flow_preferences(&mut value);
-        value["CustomDarkColors"] = encode(&self.custom_dark_colors);
-        value["CustomLightColors"] = encode(&self.custom_light_colors);
-        value["JamEnabled"] = serde_json::json!(false);
+            value["CustomDarkColors"] = encode(&self.custom_dark_colors);
+            value["CustomLightColors"] = encode(&self.custom_light_colors);
+            value["ConnectPort"] = serde_json::json!(self.connect_port);
+            value["JamEnabled"] = serde_json::json!(false);
             value["Autoplay"] = serde_json::json!(self.autoplay);
             value["AutoCheckUpdates"] = serde_json::json!(self.auto_updates);
             value["LastUpdateCheck"] = serde_json::json!(self.last_update_check);
@@ -1788,7 +1835,11 @@ fn settings_action_card(
     action: Action,
 ) -> i32 {
     let narrow = w < 600;
-    let icon_offset = if matches!(title, "Spotify library" | "YouTube Music") { 56 } else { 0 };
+    let icon_offset = if matches!(title, "Spotify library" | "YouTube Music") {
+        56
+    } else {
+        0
+    };
     let text_w = if narrow {
         w - 32 - icon_offset
     } else {
@@ -1812,12 +1863,21 @@ fn settings_action_card(
             Rect::new(x + 16, y + 12, 40, 40),
             "",
             "",
-            if title == "YouTube Music" { Action::YouTubeLogo } else { Action::SpotifyLogo },
+            if title == "YouTube Music" {
+                Action::YouTubeLogo
+            } else {
+                Action::SpotifyLogo
+            },
             false,
         );
         if let Some(button) = scene.buttons.last_mut() {
             button.enabled = false;
-            button.accessible = if title == "YouTube Music" { "YouTube Music" } else { "Spotify" }.into();
+            button.accessible = if title == "YouTube Music" {
+                "YouTube Music"
+            } else {
+                "Spotify"
+            }
+            .into();
         }
     }
     let mut line_y = y + 10;
@@ -2027,95 +2087,6 @@ fn spotify_catalog_card(
         cy = spotify_setup_card(scene, ui, x + indent, cy, (w - indent).max(1), signed_in);
     }
     cy
-}
-
-fn spotify_jam_card(scene: &mut Scene, ui: &Ui, x: i32, y: i32, w: i32) -> i32 {
-    let first = scene.buttons.len();
-    let mut cy = settings_action_card(
-        scene,
-        ui,
-        x,
-        y,
-        w,
-        "Spotify Jam",
-        "Listen together on Spotify. Playback uses your active Spotify device.",
-        if ui.spotify_jam_busy {
-            "Loading..."
-        } else {
-            "Refresh Jam"
-        },
-        Action::SpotifyJamRefresh,
-    );
-    if !ui.spotify_jam_status.is_empty() {
-        for line in wrap_text(ui.t(&ui.spotify_jam_status), w - 16, 14) {
-            scene.label(x + 8, cy, w - 16, &line, 1);
-            cy += 22;
-        }
-        cy += 8;
-    }
-    if let Some(session) = &ui.spotify_jam {
-        if session.active {
-            scene.label(
-                x + 8,
-                cy,
-                w - 16,
-                if session.owner {
-                    "You are hosting this Jam"
-                } else {
-                    "Participating in a Jam"
-                },
-                0,
-            );
-            cy += 28;
-            if session.invite.is_some() || session.invite_uri.is_some() {
-                scene.button(
-                    Rect::new(x + 8, cy, (w - 16).min(200), 34),
-                    "Copy invite link",
-                    "",
-                    Action::SpotifyJamCopyInvite,
-                    false,
-                );
-                cy += 42;
-            }
-            for member in &session.members {
-                scene.label(x + 8, cy + 4, (w - 130).max(60), &member.name, 1);
-                if session.owner && !member.owner && !member.id.is_empty() {
-                    scene.button(
-                        Rect::new(x + w - 112, cy, 104, 30),
-                        "Remove",
-                        "",
-                        Action::SpotifyJamRemove(session.id.clone(), member.id.clone()),
-                        false,
-                    );
-                }
-                cy += 38;
-            }
-            if session.owner {
-                scene.button(
-                    Rect::new(x + 8, cy, (w - 16).min(200), 34),
-                    "End Jam",
-                    "",
-                    Action::SpotifyJamEnd(session.id.clone()),
-                    false,
-                );
-                cy += 44;
-            }
-        }
-    }
-    if !ui.spotify_jam.as_ref().is_some_and(|s| s.active) {
-        scene.button(
-            Rect::new(x + 8, cy, (w - 16).min(200), 34),
-            "Start Jam",
-            "",
-            Action::SpotifyJamStart,
-            false,
-        );
-        cy += 44;
-    }
-    for button in &mut scene.buttons[first..] {
-        button.enabled = !ui.spotify_jam_busy;
-    }
-    cy + 12
 }
 
 fn spotify_setup_card(scene: &mut Scene, ui: &Ui, x: i32, y: i32, w: i32, signed_in: bool) -> i32 {
@@ -2529,8 +2500,20 @@ fn settings(scene: &mut Scene, ui: &Ui, x: i32, y: i32, w: i32, connected: bool,
             } else {
                 Action::YouTubeLogin
             };
-            cy = provider_card(scene, ui, x, cy + 8, w, "YouTube Music", Action::YouTubeLogo,
-                (active && connected && saved).then_some(name.as_str()), saved, action, None, busy);
+            cy = provider_card(
+                scene,
+                ui,
+                x,
+                cy + 8,
+                w,
+                "YouTube Music",
+                Action::YouTubeLogo,
+                (active && connected && saved).then_some(name.as_str()),
+                saved,
+                action,
+                None,
+                busy,
+            );
             scene.content_height = cy + 40 + ui.scroll;
         }
         2 => {
@@ -2591,73 +2574,62 @@ fn settings(scene: &mut Scene, ui: &Ui, x: i32, y: i32, w: i32, connected: bool,
             cy = settings_slider(scene, ui, x, cy, w, "Surface opacity", ui.surface_opacity);
             scene.label(x, cy, w, "THEMES", 9);
             cy += 28;
-            let cols = if narrow { 1 } else { (w / 168).clamp(2, 4) };
-            let card_w = (w - (cols - 1) * 10) / cols;
-            let visible = if ui.expanded_themes {
-                SOLID_THEMES.len()
-            } else {
-                cols as usize
-            };
-            let mut themes: Vec<_> = SOLID_THEMES.iter().enumerate().collect();
-            themes.sort_by_key(|(_, theme)| theme.1 != ui.light);
-            for (cell, (idx, (name, _, _, _, _, _, _, _))) in
-                themes.into_iter().take(visible).enumerate()
-            {
-                let row = cell as i32 / cols;
-                let col = cell as i32 % cols;
+            let nav_w = 32.min((w / 6).max(1));
+            let shelf_x = x + nav_w + 6;
+            let shelf_w = (w - 2 * (nav_w + 6)).max(1);
+            let cols = (shelf_w / 168).clamp(1, 4) as usize;
+            let card_w = (shelf_w - (cols as i32 - 1) * 10) / cols as i32;
+            let total = SOLID_THEMES.len() + 2;
+            let offset = ui.theme_shelf_offset.min(total - 1);
+            if offset > 0 {
                 scene.button(
-                    Rect::new(x + col * (card_w + 10), cy + row * 82, card_w, 72),
-                    *name,
+                    Rect::new(x, cy + 40, nav_w, 36),
+                    "<",
                     "",
-                    Action::SolidTheme(idx),
-                    ui.solid_theme == idx,
-                );
-            }
-            let built_in_count = visible.min(SOLID_THEMES.len());
-            let custom_start = built_in_count;
-            for (offset, (label, is_light)) in [("Custom dark", false), ("Custom light", true)]
-                .iter()
-                .enumerate()
-            {
-                let cell = custom_start + offset;
-                let row = cell as i32 / cols;
-                let col = cell as i32 % cols;
-                let card_x = x + col * (card_w + 10);
-                let card_y = cy + row * 82;
-                let selected = ui.light == *is_light
-                    && ui.solid_theme == SOLID_THEMES.len() + usize::from(*is_light);
-                scene.button(
-                    Rect::new(card_x, card_y, card_w, 72),
-                    *label,
-                    "",
-                    Action::CustomTheme(*is_light),
-                    selected,
-                );
-                scene.button(
-                    Rect::new(card_x + 12, card_y + 44, 54.min((card_w - 24).max(1)), 22),
-                    "Edit",
-                    "",
-                    Action::CustomTheme(*is_light),
+                    Action::ThemeShelf(-1),
                     false,
                 );
             }
-            let rows = ((built_in_count + 2) as i32 + cols - 1) / cols;
-            cy += rows * 82 + 16;
-            if SOLID_THEMES.len() > cols as usize {
-                let button_w = w.min(180);
+            for cell in 0..cols.min(total - offset) {
+                let index = offset + cell;
+                let card_x = shelf_x + cell as i32 * (card_w + 10);
+                if let Some((name, ..)) = SOLID_THEMES.get(index) {
+                    scene.button(
+                        Rect::new(card_x, cy, card_w, 132),
+                        *name,
+                        "",
+                        Action::SolidTheme(index),
+                        ui.solid_theme == index,
+                    );
+                } else {
+                    let light = index == SOLID_THEMES.len() + 1;
+                    let label = if light { "Custom light" } else { "Custom dark" };
+                    scene.button(
+                        Rect::new(card_x, cy, card_w, 132),
+                        label,
+                        "",
+                        Action::CustomTheme(light),
+                        ui.solid_theme == index && ui.light == light,
+                    );
+                    scene.button(
+                        Rect::new(card_x + 12, cy + 134, 54.min((card_w - 24).max(1)), 22),
+                        "Edit",
+                        "",
+                        Action::CustomTheme(light),
+                        false,
+                    );
+                }
+            }
+            if offset + cols < total {
                 scene.button(
-                    Rect::new(x + (w - button_w) / 2, cy, button_w, 34),
-                    ui.t(if ui.expanded_themes {
-                        "See less"
-                    } else {
-                        "See more"
-                    }),
+                    Rect::new(x + w - nav_w, cy + 40, nav_w, 36),
+                    ">",
                     "",
-                    Action::ToggleBool("expand_themes"),
+                    Action::ThemeShelf(1),
                     false,
                 );
-                cy += 50;
             }
+            cy += 172;
             scene.button(
                 Rect::new(x, cy, (w - 12) / 2, 36),
                 "Import theme",
@@ -2978,16 +2950,22 @@ fn settings(scene: &mut Scene, ui: &Ui, x: i32, y: i32, w: i32, connected: bool,
                     for line in wrap_text(ui.t(message), w, 14) {notice(scene, x, cy, w, &line); cy += 22;}
                     cy += 8;
                 }
-scene.label(x, cy, 220, "EQUALIZER", 9);
-scene.button(Rect::new(x + w - 80, cy - 4, 80, 30), "Reset", "\u{e777}", Action::EqReset, false);
-cy += 36;
-cy = field_pair(scene, ui, x, cy, w, "Equalizer", "Preset");
-scene.eq_graph = Some(Rect::new(x, cy, w, 160));
-scene.panel(x, cy, w, 160, 7);
-cy += 176;
-scene.eq_sliders = Some(Rect::new(x, cy, w, 170));
-scene.panel(x, cy, w, 170, 13);
-cy += 190;
+                scene.label(x, cy, 220, "EQUALIZER", 9);
+                scene.button(
+                    Rect::new(x + w - 80, cy - 4, 80, 30),
+                    "Reset",
+                    "\u{e777}",
+                    Action::EqReset,
+                    false,
+                );
+                cy += 36;
+                cy = field_pair(scene, ui, x, cy, w, "Equalizer", "Preset");
+                scene.eq_graph = Some(Rect::new(x, cy, w, 160));
+                scene.panel(x, cy, w, 160, 7);
+                cy += 176;
+                scene.eq_sliders = Some(Rect::new(x, cy, w, 170));
+                scene.panel(x, cy, w, 170, 13);
+                cy += 190;
             } else {
                 for message in [
                     "Local Spotify playback follows the Windows default output. Audio reconnects automatically when the default device changes or reconnects. Windows per-app output overrides still apply.",
@@ -3024,41 +3002,6 @@ cy += 190;
         5 => {
             // Integrations
             let mut cy = top;
-            cy = toggle_row(
-                scene,
-                ui,
-                x,
-                cy,
-                w,
-                "DeezNats Connect",
-                "Share playback and controls on your local network",
-                "jam_enabled",
-                ui.jam_enabled,
-            );
-            if ui.jam_enabled && !ui.jam_url.is_empty() {
-                scene.label(x, cy + 4, w, "Listening on your network", 9);
-                scene.label(x, cy + 28, w, &ui.jam_url, 1);
-                let button_w = ((w - 12) / 2).min(180);
-                scene.button(
-                    Rect::new(x, cy + 58, button_w, 34),
-                    "Open Connect",
-                    "",
-                    Action::OpenConnect,
-                    false,
-                );
-                scene.button(
-                    Rect::new(x + button_w + 12, cy + 58, button_w, 34),
-                    "Copy link",
-                    "",
-                    Action::CopyConnectLink,
-                    false,
-                );
-                cy += 108;
-            }
-            cy += 16;
-            if ui.provider == crate::catalog::Provider::Spotify {
-                cy = spotify_jam_card(scene, ui, x, cy, w) + 16;
-            }
             scene.label(x, cy, w, "DISCORD RICH PRESENCE", 9);
             cy += 28;
             // Rich Presence Preview Card
@@ -3511,14 +3454,18 @@ fn queue_button(
 }
 fn build_queue_sidebar(s: &mut Scene, ui: &Ui, qx: i32, qw: i32, h: i32) {
     let start = s.labels.len();
-    let buttons=s.buttons.len(); let panels=s.panels.len(); let pictures=s.pictures.len();
+    let buttons = s.buttons.len();
+    let panels = s.panels.len();
+    let pictures = s.pictures.len();
     build_queue_sidebar_contents(s, ui, qx, qw, h);
     s.queue_labels = start..s.labels.len();
-    s.queue_buttons=buttons..s.buttons.len(); s.queue_panels=panels..s.panels.len(); s.queue_pictures=pictures..s.pictures.len();
+    s.queue_buttons = buttons..s.buttons.len();
+    s.queue_panels = panels..s.panels.len();
+    s.queue_pictures = pictures..s.pictures.len();
 }
 fn build_queue_sidebar_contents(s: &mut Scene, ui: &Ui, qx: i32, qw: i32, h: i32) {
     let bottom = h - if ui.view == View::Lyrics { 12 } else { 96 };
-    s.queue_frame=Some(Rect::new(qx,10,qw,bottom-20));
+    s.queue_frame = Some(Rect::new(qx, 10, qw, bottom - 20));
     s.panel(qx, 10, qw, bottom - 20, 0);
     // Reserve action space first, then let the localized title use the rest.
     // Icon actions keep a predictable hit area regardless of translation length.
@@ -3600,35 +3547,38 @@ fn build_queue_sidebar_contents(s: &mut Scene, ui: &Ui, qx: i32, qw: i32, h: i32
     } else {
         0
     };
-    let pixels=offset*24+fractional_offset;
-    s.queue_layout_scroll=pixels;s.queue_pixel_scroll=pixels;
-    let first = (pixels.saturating_sub(144).max(0)/72) as usize;
-    let mut row_y = y+first as i32*72-pixels;
-    let row_labels=s.labels.len();
-    let row_buttons=s.buttons.len();
+    let pixels = offset * 24 + fractional_offset;
+    s.queue_layout_scroll = pixels;
+    s.queue_pixel_scroll = pixels;
+    let first = (pixels.saturating_sub(144).max(0) / 72) as usize;
+    let mut row_y = y + first as i32 * 72 - pixels;
+    let row_labels = s.labels.len();
+    let row_buttons = s.buttons.len();
     for (idx, entry) in upcoming.iter().enumerate().skip(first) {
         let idx = upcoming_start + idx;
         let height = 72;
-        if row_y >= viewport.y + viewport.h+144 {
+        if row_y >= viewport.y + viewport.h + 144 {
             break;
         }
-        let top = row_y.max(viewport.y-144);
-        let end = (row_y + height - 6).min(viewport.y + viewport.h+144);
+        let top = row_y.max(viewport.y - 144);
+        let end = (row_y + height - 6).min(viewport.y + viewport.h + 144);
         if end > top {
             let rect = Rect::new(qx + 12, row_y, qw - 38, height - 6);
             queue_button(s, entry, idx, rect, idx == cur, idx > cur);
         }
         row_y += height;
     }
-    s.queue_row_labels=row_labels..s.labels.len();
-    s.queue_row_buttons=row_buttons..s.buttons.len();
+    s.queue_row_labels = row_labels..s.labels.len();
+    s.queue_row_buttons = row_buttons..s.buttons.len();
     if max > 0 {
         let track = Rect::new(qx + qw - 20, viewport.y, 8, viewport.h);
         let thumb = (track.h * track.h / total.max(1)).max(24).min(track.h);
         s.queue_scrollbar = Some(track);
         s.panel(
             track.x,
-            track.y + (((offset as i64*24+fractional_offset as i64)*(track.h-thumb) as i64)/(max as i64*24)) as i32,
+            track.y
+                + (((offset as i64 * 24 + fractional_offset as i64) * (track.h - thumb) as i64)
+                    / (max as i64 * 24)) as i32,
             8,
             thumb,
             17,
@@ -3850,7 +3800,7 @@ fn build_lyrics_view(s: &mut Scene, ui: &Ui, w: i32, h: i32, playing: bool, volu
         (col_w + 32, (w - col_w - 36).max(220))
     };
 
-    s.lyrics_area = Some(Rect::new(right_x, 0, right_w, h - 64));
+    s.lyrics_area = Some(Rect::new(right_x, 72, right_w, (h - 144).max(1)));
 
     // Floating pill at bottom-right
     let pill_w = 78;
@@ -3910,7 +3860,8 @@ fn build_lyrics_view(s: &mut Scene, ui: &Ui, w: i32, h: i32, playing: bool, volu
     let lyrics_lbl_start = s.labels.len();
 
     let scale_pct = ui.lyrics_scale_percent(w);
-    let center_y = h / 2 - 20;
+    let area = s.lyrics_area.unwrap();
+    let center_y = area.y + (area.h as f32 * 0.3).round() as i32;
 
     if ui.rich_lyrics.is_empty() && ui.lyrics.is_empty() {
         s.label(
@@ -3995,6 +3946,8 @@ fn build_lyrics_view(s: &mut Scene, ui: &Ui, w: i32, h: i32, playing: bool, volu
         } else {
             center_y - ui.scroll
         };
+        // Retain the focus even when its verse is outside the virtualized rows.
+        s.lyrics_focus_y = timed.then_some(ly + anchor);
         let mut total = 0;
         for (block_index, (start, source, ranges)) in blocks.iter().enumerate() {
             let height = ranges.len() as i32 * row_h;
@@ -4013,6 +3966,9 @@ fn build_lyrics_view(s: &mut Scene, ui: &Ui, w: i32, h: i32, playing: bool, volu
                         label: s.labels.len() - 1,
                         line: *source,
                         range: range.clone(),
+                        button: timed.then_some(s.buttons.len()),
+                        lag: 0.0,
+                        velocity: 0.0,
                     });
                     if timed {
                         s.button(
@@ -4052,366 +4008,7 @@ fn build_lyrics_view(s: &mut Scene, ui: &Ui, w: i32, h: i32, playing: bool, volu
 }
 
 fn build_track_info(s: &mut Scene, ui: &Ui, x: i32, top: i32, cw: i32) {
-    let (track, meta, artist_meta) = if let Some((t, m, a)) = &ui.track_info {
-        (t.clone(), m.clone(), a.clone())
-    } else {
-        (ui.now.clone(), ui.now.raw.clone(), serde_json::Value::Null)
-    };
-    // Catalog rows can be sparse; enrich them with the full track response.
-    let mut track = track;
-    if let Some(full) = crate::catalog::entry(&meta, "track") {
-        if track.artwork.is_empty() {
-            track.artwork = full.artwork;
-        }
-        if track.album.is_empty() {
-            track.album = full.album;
-        }
-        if track.album_id.is_empty() {
-            track.album_id = full.album_id;
-        }
-        if track.artist_id.is_empty() {
-            track.artist_id = full.artist_id;
-        }
-        if track.subtitle.is_empty() {
-            track.subtitle = full.subtitle;
-        }
-        if track.duration == 0 {
-            track.duration = full.duration;
-        }
-        if let (Some(original), Some(details)) = (track.raw.as_object_mut(), meta.as_object()) {
-            for (key, value) in details {
-                original.insert(key.clone(), value.clone());
-            }
-        }
-    }
-    let narrow = cw < 700;
-    let header_h = if narrow { 236 } else { 184 };
-    let art_size = if narrow { 76 } else { 132 };
-    let text_left = if narrow { 110 } else { 168 };
-    let text_width = (cw - text_left - 18).max(1);
-    let mut release = crate::catalog::string(
-        &meta,
-        &["release_date", "releaseDate", "physical_release_date"],
-    );
-    if release.is_empty() {
-        release = crate::catalog::string(&meta["album"], &["release_date", "releaseDate"]);
-    }
-    if release.is_empty() {
-        release = crate::catalog::string(
-            &track.raw,
-            &["release_date", "releaseDate", "physical_release_date"],
-        );
-    }
-    let duration = if track.duration > 0 {
-        format!(
-            "{}:{:02}",
-            track.duration / 60000,
-            track.duration / 1000 % 60
-        )
-    } else {
-        "\u{2014}".into()
-    };
-    let release_text = if release.is_empty() {
-        "\u{2014}"
-    } else {
-        &release
-    };
-    s.panel(x, top, cw, header_h, 8);
-    let cover = Rect::new(x + 18, top + 18, art_size, art_size);
-    if track.artwork.is_empty() {
-        s.panel(cover.x, cover.y, cover.w, cover.h, 1);
-    } else {
-        s.pictures.push((cover, track.artwork.clone()));
-    }
-    s.label(x + text_left, top + 18, text_width, "TRACK", 9);
-    let title = if track.title.is_empty() {
-        "Unknown track"
-    } else {
-        &track.title
-    };
-    if narrow || wrap_text(title, text_width, 28).len() > 1 {
-        let mut lines = wrap_text(title, text_width, 20);
-        if lines.len() > 2 {
-            lines.truncate(2);
-            if let Some(last) = lines.last_mut() {
-                last.pop();
-                last.push('\u{2026}');
-            }
-        }
-        for (index, line) in lines.into_iter().enumerate() {
-            s.label_sized(
-                x + text_left,
-                top + 40 + index as i32 * 26,
-                text_width,
-                26,
-                line,
-                3,
-            );
-        }
-    } else {
-        s.label(x + text_left, top + 40, text_width, title, 2);
-    }
-    s.label(
-        x + text_left,
-        top + if narrow { 108 } else { 94 },
-        text_width,
-        if narrow {
-            track.subtitle.clone()
-        } else {
-            format!(
-                "{} \u{2022} {release_text} \u{2022} {duration}",
-                track.subtitle
-            )
-        },
-        1,
-    );
-    if narrow {
-        s.label(
-            x + 18,
-            top + 140,
-            cw - 36,
-            format!("{release_text} \u{2022} {duration}"),
-            1,
-        );
-    }
-    let button_left = if narrow { 18 } else { text_left };
-    let button_y = top + if narrow { 182 } else { 140 };
-    let button_w = if narrow {
-        (cw - 48) / 2
-    } else {
-        148.min((cw - text_left - 30) / 2)
-    }
-    .max(1);
-    s.button(
-        Rect::new(x + button_left, button_y, button_w, 36),
-        "Play track",
-        "\u{e768}",
-        Action::OpenItem(track.clone()),
-        true,
-    );
-    if let Some(album) = track.album_entry() {
-        s.button(
-            Rect::new(x + button_left + button_w + 12, button_y, button_w, 36),
-            "View album",
-            "\u{e93c}",
-            Action::OpenItem(album),
-            false,
-        );
-    }
-    let mut cy = top + header_h + 18;
-    let col_w = if narrow { cw } else { (cw - 16) / 2 };
-    let right_x = if narrow { x } else { x + col_w + 16 };
-    let key_w = 140.min((col_w - 44) / 2).max(1);
-    let value_left = key_w + 28;
-    let value_w = (col_w - value_left - 18).max(1);
-    s.panel(x, cy, col_w, 224, 8);
-    s.label(x + 18, cy + 14, col_w - 36, "ABOUT THIS TRACK", 9);
-    let rank = crate::catalog::string(&meta, &["rank", "popularity"]);
-    let track_pos = crate::catalog::string(&meta, &["track_position", "track_number"]);
-    let isrc = crate::catalog::string(&meta, &["isrc"]);
-    let isrc = if isrc.is_empty() {
-        crate::catalog::string(&meta["external_ids"], &["isrc"])
-    } else {
-        isrc
-    };
-    let bpm = crate::catalog::string(&meta, &["bpm"]);
-    let plays = [
-        meta.get("playCount"),
-        meta.get("playcount"),
-        meta.pointer("/stats/streamCount"),
-    ]
-    .into_iter()
-    .flatten()
-    .find_map(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()));
-    let count_text = plays.map(crate::catalog::format_count).unwrap_or(rank);
-    let missing = |value: &str| {
-        if value.is_empty() {
-            "\u{2014}".to_owned()
-        } else {
-            value.to_owned()
-        }
-    };
-    for (i, (key, value)) in [
-        ("Album", missing(&track.album)),
-        ("Release date", missing(&release)),
-        ("Track number", missing(&track_pos)),
-        ("ISRC", missing(&isrc)),
-        (
-            if plays.is_some() {
-                "Streams"
-            } else {
-                "Popularity / Rank"
-            },
-            missing(&count_text),
-        ),
-        (
-            "BPM",
-            if bpm.is_empty() || bpm == "0" {
-                "\u{2014}".into()
-            } else {
-                bpm
-            },
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let ry = cy + 44 + i as i32 * 28;
-        s.label(x + 18, ry, key_w, key, 1);
-        s.label(x + value_left, ry, value_w, value, 0);
-    }
-    let contributor_y = if narrow { cy + 240 } else { cy };
-    s.panel(right_x, contributor_y, col_w, 224, 8);
-    s.label(
-        right_x + 18,
-        contributor_y + 14,
-        col_w - 36,
-        "CONTRIBUTORS",
-        9,
-    );
-    let mut contributors = crate::catalog::entries(&meta["contributors"], "artist");
-    if contributors.is_empty() {
-        contributors = track.artist_entries();
-    }
-    if contributors.is_empty() {
-        s.label(right_x + 18, contributor_y + 48, col_w - 36, "\u{2014}", 1);
-    }
-    let primary_artist = crate::catalog::entry(&artist_meta, "artist");
-    for (i, mut artist) in contributors.into_iter().take(3).enumerate() {
-        if let Some(primary) = primary_artist.as_ref().filter(|a| a.id == artist.id) {
-            if artist.artwork.is_empty() {
-                artist.artwork = primary.artwork.clone();
-            }
-            if artist.title.is_empty() {
-                artist.title = primary.title.clone();
-            }
-        }
-        let ry = contributor_y + 44 + i as i32 * 56;
-        let offset = if artist.artwork.is_empty() { 18 } else { 68 };
-        if !artist.artwork.is_empty() {
-            s.pictures.push((
-                Rect::new(right_x + 18, ry + 2, 42, 42),
-                artist.artwork.clone(),
-            ));
-        }
-        let role = crate::catalog::string(&artist.raw, &["role"]);
-        let title = if role.is_empty() {
-            artist.title.clone()
-        } else {
-            format!("{} \u{00b7} {role}", artist.title)
-        };
-        s.button(
-            Rect::new(right_x + offset, ry + 2, col_w - offset - 18, 42),
-            title,
-            "",
-            Action::OpenItem(artist),
-            false,
-        );
-    }
-    cy += if narrow { 480 } else { 240 };
-    s.panel(x, cy, col_w, 148, 8);
-    s.label(x + 18, cy + 14, col_w - 36, "GENRES AND DETAILS", 9);
-    let explicit = meta["explicit_lyrics"]
-        .as_bool()
-        .or_else(|| meta["explicit"].as_bool())
-        .or_else(|| track.raw["explicit"].as_bool());
-    for (i, (key, value)) in [
-        (
-            "Format",
-            if ui.quality.is_empty() {
-                "Unknown"
-            } else {
-                &ui.quality
-            },
-        ),
-        (
-            "Content",
-            match explicit {
-                Some(true) => "Explicit",
-                Some(false) => "Clean",
-                None => "Unknown",
-            },
-        ),
-        ("Source", provider_name(ui)),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        s.label(x + 18, cy + 46 + i as i32 * 30, key_w, key, 1);
-        s.label(x + value_left, cy + 46 + i as i32 * 30, value_w, value, 0);
-    }
-    let artist_y = if narrow { cy + 164 } else { cy };
-    s.panel(right_x, artist_y, col_w, 148, 8);
-    s.label(
-        right_x + 18,
-        artist_y + 14,
-        col_w - 36,
-        "ABOUT THE ARTIST",
-        9,
-    );
-    let artist_offset = if primary_artist
-        .as_ref()
-        .is_some_and(|artist| !artist.artwork.is_empty())
-    {
-        68
-    } else {
-        18
-    };
-    if let Some(artist) = primary_artist
-        .as_ref()
-        .filter(|artist| !artist.artwork.is_empty())
-    {
-        s.pictures.push((
-            Rect::new(right_x + 18, artist_y + 46, 42, 42),
-            artist.artwork.clone(),
-        ));
-    }
-    let artist_name = primary_artist
-        .as_ref()
-        .map(|artist| artist.title.as_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or(if track.subtitle.is_empty() {
-            "Artist"
-        } else {
-            &track.subtitle
-        });
-    s.label(
-        right_x + artist_offset,
-        artist_y + 46,
-        col_w - artist_offset - 18,
-        artist_name,
-        3,
-    );
-    let mut facts = Vec::new();
-    let audience = artist_audience(&artist_meta, ui);
-    if !audience.is_empty() {
-        facts.push(audience);
-    }
-    let releases = crate::catalog::string(&artist_meta, &["nb_album"]);
-    if !releases.is_empty() {
-        facts.push(format!("{releases} {}", ui.t("releases")));
-    }
-    s.label(
-        right_x + artist_offset,
-        artist_y + 78,
-        col_w - artist_offset - 18,
-        if facts.is_empty() {
-            "\u{2014}".into()
-        } else {
-            facts.join(" \u{00b7} ")
-        },
-        1,
-    );
-    if let Some(artist) = primary_artist.or_else(|| track.artist_entry()) {
-        s.button(
-            Rect::new(right_x + 18, artist_y + 104, 150.min(col_w - 36), 34),
-            "Go to artist",
-            "\u{e77b}",
-            Action::OpenItem(artist),
-            false,
-        );
-    }
-    s.content_height = artist_y + 166 + ui.scroll;
+    track_info::build(s, ui, x, top, cw);
 }
 
 pub fn build(
@@ -4440,25 +4037,18 @@ pub fn build(
         return s;
     }
     let is_lyrics = ui.view == View::Lyrics;
+    let (expansion, right_expansion) = ui.sidebar_values();
     let side = if is_lyrics {
         0
-    } else if ui.sidebar_collapsed {
-        56
     } else {
-        214
+        (56. + 158. * expansion).round() as i32
     };
     let x = if is_lyrics {
         32
-    } else if ui.sidebar_collapsed {
-        side + 20
     } else {
-        side + 48
+        (76. + 186. * expansion).round() as i32
     };
-    let queue_w = if ui.right_sidebar_open() {
-        280.min(w / 3)
-    } else {
-        0
-    };
+    let queue_w = (280.min(w / 3) as f32 * right_expansion).round() as i32;
     let cw = w - x - queue_w - if is_lyrics { 32 } else { 40 };
     let (x, cw) = if ui.view == View::Settings {
         let settings_width = cw.min(800);
@@ -4469,7 +4059,7 @@ pub fn build(
     let bottom = h - player_height(ui, w) - 8;
     let step = 41;
     if !is_lyrics {
-        if !ui.sidebar_collapsed {
+        if expansion > 0.5 {
             s.label(14, 22, 170, "MUSIC", 9);
         }
         let navigation: Vec<_> = NAV
@@ -4482,12 +4072,17 @@ pub fn build(
             } else {
                 66 + 3 * step + (i as i32 - 3) * step
             };
-            if i == 3 && !ui.sidebar_collapsed {
+            if i == 3 && expansion > 0.5 {
                 s.label(14, 48 + 3 * step, 170, "LIBRARY", 9);
             }
-            if !ui.sidebar_collapsed {
+            if expansion > 0.5 {
                 s.button(
-                    Rect::new(13, y, 178, step - 4),
+                    Rect::new(
+                        10 + (3. * expansion).round() as i32,
+                        y,
+                        (38. + 140. * expansion).round() as i32,
+                        step - 4,
+                    ),
                     if *view == View::Home {
                         "Home"
                     } else {
@@ -4499,7 +4094,12 @@ pub fn build(
                 );
             } else {
                 s.button(
-                    Rect::new(10, y, 38, step - 4),
+                    Rect::new(
+                        10 + (3. * expansion).round() as i32,
+                        y,
+                        (38. + 140. * expansion).round() as i32,
+                        step - 4,
+                    ),
                     "",
                     glyph,
                     Action::Go(*view),
@@ -4508,9 +4108,14 @@ pub fn build(
             }
         }
         let settings_y = 66 + 3 * step + (navigation.len() as i32 - 3) * step;
-        if !ui.sidebar_collapsed {
+        if expansion > 0.5 {
             s.button(
-                Rect::new(13, settings_y, 178, step - 4),
+                Rect::new(
+                    10 + (3. * expansion).round() as i32,
+                    settings_y,
+                    (38. + 140. * expansion).round() as i32,
+                    step - 4,
+                ),
                 "Settings",
                 "\u{e713}",
                 Action::Go(View::Settings),
@@ -4518,18 +4123,19 @@ pub fn build(
             );
         } else {
             s.button(
-                Rect::new(10, settings_y, 38, step - 4),
+                Rect::new(
+                    10 + (3. * expansion).round() as i32,
+                    settings_y,
+                    (38. + 140. * expansion).round() as i32,
+                    step - 4,
+                ),
                 "",
                 "\u{e713}",
                 Action::Go(View::Settings),
                 ui.view == View::Settings,
             );
         }
-        let main_panel_w = if queue_w > 0 {
-            w - side - queue_w - 36
-        } else {
-            w - side - 24
-        };
+        let main_panel_w = w - side - queue_w - 24 - (12. * right_expansion).round() as i32;
         s.panel(side + 12, 10, main_panel_w, bottom - 20, 0);
         if !ui.history.is_empty() || ui.is_subpage() {
             s.button(
@@ -4557,13 +4163,14 @@ pub fn build(
         }
     }
     if queue_w > 0 {
-        let qx = w - queue_w - 12;
-        if ui.provider == crate::catalog::Provider::Spotify && ui.device_menu_open {
+        let qx = w - queue_w - (12. * right_expansion).round() as i32;
+        let panel_w = 280.min(w / 3);
+        if ui.visible_device_sidebar() {
             let first = s.labels.len();
-            device_sidebar::build(&mut s, ui, qx, queue_w, h, playing);
+            device_sidebar::build(&mut s, ui, qx, panel_w, h, playing);
             s.queue_labels = first..s.labels.len();
         } else {
-            build_queue_sidebar(&mut s, ui, qx, queue_w, h);
+            build_queue_sidebar(&mut s, ui, qx, panel_w, h);
         }
     }
     let entity = if is_lyrics {
@@ -4590,6 +4197,15 @@ pub fn build(
     let title_y = if is_artist { 82 } else { 102 };
     let sub_y = if is_artist { 138 } else { 158 };
     let header_actions_w = match ui.view {
+        View::Flow
+            if ui
+                .page
+                .as_ref()
+                .and_then(|page| page.entity.as_ref())
+                .is_some_and(|entry| entry.kind == "track") =>
+        {
+            156
+        }
         View::Flow => 360,
         View::Offline => 190,
         View::Playlists => 200,
@@ -4597,7 +4213,7 @@ pub fn build(
         View::Settings => 196,
         _ => 0,
     };
-    if !is_lyrics {
+    if !is_lyrics && ui.view != View::TrackInfo {
         s.label(
             title_x,
             title_y,
@@ -4678,6 +4294,21 @@ pub fn build(
             1,
         );
         match ui.view {
+            View::Flow
+                if ui
+                    .page
+                    .as_ref()
+                    .and_then(|page| page.entity.as_ref())
+                    .is_some_and(|entry| entry.kind == "track") =>
+            {
+                s.button(
+                    Rect::new(x + cw - 144, 114, 144, 36),
+                    "Play",
+                    "\u{e768}",
+                    Action::PlayAll,
+                    true,
+                );
+            }
             View::Flow => {
                 s.button(
                     Rect::new(x + cw - 344, 114, 190, 36),
@@ -4718,6 +4349,8 @@ pub fn build(
     }
     let body_top = if is_lyrics {
         70
+    } else if ui.view == View::TrackInfo {
+        82
     } else if is_artist {
         240
     } else {
@@ -4746,60 +4379,69 @@ pub fn build(
             entity.artwork.clone(),
         ));
         if !is_artist {
+            let collection = matches!(entity.kind.as_str(), "album" | "playlist");
+            let play_label = match entity.kind.as_str() {
+                "album" => "Play album",
+                "playlist" => "Play playlist",
+                _ => "Play",
+            };
+            let play_width = if collection { 160 } else { 100 };
             s.button(
-                Rect::new(x, body_top - 64, 56, 56),
-                "",
+                Rect::new(x, body_top - 54, play_width, 36),
+                play_label,
                 "\u{e768}",
                 Action::PlayAll,
                 true,
             );
-            if let Some(button) = s.buttons.last_mut() {
-                button.accessible = "Play".into();
-            }
-            let mut ax = x + 70;
-            if crate::playlist::can_edit(entity, &ui.account) {
+            let mut ax = x + play_width + 10;
+            if collection {
                 s.button(
-                    Rect::new(ax, body_top - 54, 100, 36),
-                    "Edit",
-                    "\u{e70f}",
-                    Action::EditPlaylist(entity.clone()),
-                    false,
+                    Rect::new(ax, body_top - 54, 48, 36),
+                    "",
+                    "\u{e8b1}",
+                    Action::Shuffle,
+                    ui.shuffle,
                 );
-                ax += 112;
+                s.buttons.last_mut().unwrap().accessible = "Shuffle".into();
+                ax += 58;
             }
-            if !matches!(entity.kind.as_str(), "mix" | "flow") {
+            if matches!(entity.kind.as_str(), "album" | "podcast") {
                 let liked = ui.liked_ids.contains(&entity.library_key())
                     || ui.liked_ids.contains(&entity.id);
                 s.button(
-                    Rect::new(ax, body_top - 54, 160, 36),
-                    if liked {
-                        "In library"
-                    } else {
-                        "Add to library"
-                    },
+                    Rect::new(ax, body_top - 54, 48, 36),
+                    "",
                     "\u{eb51}",
                     Action::Favorite,
                     liked,
                 );
-                ax += 172;
-                s.button(
-                    Rect::new(ax, body_top - 54, 100, 36),
-                    "Share",
-                    "\u{e72d}",
-                    Action::Share,
-                    false,
-                );
-                ax += 112;
+                s.buttons.last_mut().unwrap().accessible = if liked {
+                    "In library"
+                } else {
+                    "Add to library"
+                }
+                .into();
+                ax += 58;
             }
             if supports_downloads(ui) {
                 s.button(
-                    Rect::new(ax, body_top - 54, 150, 36),
-                    "Download",
+                    Rect::new(ax, body_top - 54, 48, 36),
+                    "",
                     "\u{e896}",
                     Action::Download,
                     false,
                 );
+                s.buttons.last_mut().unwrap().accessible = "Download".into();
+                ax += 58;
             }
+            s.button(
+                Rect::new(ax, body_top - 54, 48, 36),
+                "",
+                "\u{e712}",
+                Action::CollectionMenu,
+                false,
+            );
+            s.buttons.last_mut().unwrap().accessible = "More options".into();
             // Open, library, share and download already have direct page actions.
             // The only extra collection-menu target is its artist: expose that
             // credit directly instead of keeping an otherwise redundant menu.
@@ -4814,7 +4456,7 @@ pub fn build(
     }
     s.content_top = if is_lyrics {
         70
-    } else if entity.is_some() {
+    } else if entity.is_some() || ui.view == View::TrackInfo {
         body_top
     } else {
         190
@@ -5106,51 +4748,37 @@ pub fn build(
                 s.label_sized(x + cw - 34, yy + 7, 24, 26, "\u{e721}", 4);
                 yy += 54;
                 let footer = h - 174;
-                let selected = ui.genres.iter().filter(|g| g.2).count();
+                // Keep selected and edited entries accessible without discarding provider state.
+                let mut catalog: Vec<_> = ui.genres.iter().enumerate().collect();
+                catalog.sort_by_key(|(_, genre)| {
+                    (
+                        !genre.2,
+                        genre.2 == genre.3,
+                        crate::style_mix::popularity_rank(&genre.1),
+                    )
+                });
+                catalog.truncate(100);
+                catalog.sort_by_key(|(_, genre)| crate::style_mix::popularity_rank(&genre.1));
+                let selected = catalog.iter().filter(|(_, genre)| genre.2).count();
                 s.label(
                     x,
                     footer + 8,
                     (cw - 310).max(100),
                     ui.t("{0} genres selected \u{00b7} {1} options")
                         .replace("{0}", &selected.to_string())
-                        .replace(
-                            "{1}",
-                            &if ui.provider != crate::catalog::Provider::Deezer {
-                                ui.genres
-                                    .iter()
-                                    .filter(|g| {
-                                        g.2 || crate::spotify::flow::BROWSE_GENRES
-                                            .iter()
-                                            .any(|name| name.eq_ignore_ascii_case(&g.1))
-                                    })
-                                    .count()
-                            } else {
-                                ui.genres.len()
-                            }
-                            .to_string(),
-                        ),
+                        .replace("{1}", &catalog.len().to_string()),
                     1,
                 );
                 s.genre_viewport = Some(Rect::new(x, yy, cw, (h - 188 - yy).max(24)));
                 let cols = (cw / 200).max(2);
                 let width = cw / cols;
                 let filter = ui.flow_filter.to_lowercase();
-                let visible: Vec<_> = ui
-                    .genres
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, g)| {
-                        if filter.is_empty() && ui.provider != crate::catalog::Provider::Deezer {
-                            g.2 || crate::spotify::flow::BROWSE_GENRES
-                                .iter()
-                                .any(|name| name.eq_ignore_ascii_case(&g.1))
-                        } else {
-                            g.1.to_lowercase().contains(&filter)
-                        }
-                    })
+                let visible: Vec<_> = catalog
+                    .into_iter()
+                    .filter(|(_, genre)| genre.1.to_lowercase().contains(&filter))
                     .collect();
-                let limit = if ui.provider != crate::catalog::Provider::Deezer {
-                    ui.flow_genre_limit
+                let limit = if filter.is_empty() && ui.flow_genre_limit != usize::MAX {
+                    cols as usize * 3
                 } else {
                     usize::MAX
                 };
@@ -5193,17 +4821,13 @@ pub fn build(
                     }
                 }
                 let mut genre_bottom = yy + ((shown as i32 + cols - 1) / cols) * 42;
-                if shown < visible.len()
-                    || (ui.provider != crate::catalog::Provider::Deezer
-                        && filter.is_empty()
-                        && ui.flow_genre_limit > 30)
-                {
+                if filter.is_empty() && visible.len() > cols as usize * 3 {
                     s.button(
                         Rect::new(x, genre_bottom - ui.scroll, 180, 34),
-                        if filter.is_empty() && ui.flow_genre_limit > 30 {
-                            "See less"
+                        if ui.flow_genre_limit == usize::MAX {
+                            "Show less"
                         } else {
-                            "See more"
+                            "Show all"
                         },
                         "",
                         Action::FlowMoreGenres,
@@ -5254,49 +4878,134 @@ pub fn build(
                 volume,
             ),
             View::PlaylistEdit => {
-            let width = cw.clamp(1, 650);
-            let left = x + (cw - width) / 2;
-            let inset = 24.min((width / 12).max(4));
-            let inner = (width - inset * 2).max(1);
-            let stacked = inner < 430;
-            let cover = if stacked { inner.min(180) } else { (inner * 37 / 100).min(220) };
-            let fields_x = if stacked { left + inset } else { left + inset + cover + 20 };
-            let fields_y = if stacked { top + 68 + cover + 54 } else { top + 68 };
-            let fields_w = if stacked { inner } else { (inner - cover - 20).max(1) };
-            let cover_y = top + 68;
-            let controls_y = if stacked { fields_y + 210 } else { cover_y + cover + 62 };
-            let panel_height = controls_y - top + if ui.playlist_draft.id.is_empty() { 74 } else { 124 };
-            s.panel(left, top, width, panel_height, 8);
-            s.label(left + inset, top + 18, (inner - 45).max(1), "Edit playlist", 3);
-            s.button(Rect::new(left + width - inset - 36, top + 14, 36, 36), "", "\u{e711}", Action::Back, false);
-            if let Some(button) = s.buttons.last_mut() { button.accessible = "Close".into(); }
-            s.panel(left + inset, cover_y, cover, cover, 2);
-            if !ui.playlist_draft.preview.is_empty() {
-                s.pictures.push((Rect::new(left + inset, cover_y, cover, cover), ui.playlist_draft.preview.clone()));
-            }
-            if ui.provider != crate::catalog::Provider::YouTube {
-                s.button(Rect::new(left + inset, cover_y + cover + 8, cover, 36), "Choose cover", "\u{e70f}", Action::Go(View::CoverEdit), false);
-            } else {
-                s.label(left + inset, cover_y + cover + 8, cover, "Cover editing unavailable", 1);
-            }
-            s.label(fields_x, fields_y, fields_w, "Playlist name", 1);
-            s.name = Some(Rect::new(fields_x, fields_y + 25, fields_w, 40));
-            s.label(fields_x, fields_y + 79, fields_w, "Description", 1);
-            s.description = Some(Rect::new(fields_x, fields_y + 104, fields_w, 106));
-            let save_width = inner.min(150);
-            s.button(Rect::new(left + width - inset - save_width, controls_y, save_width, 42), "Save", "", Action::SavePlaylist, true);
-            if !ui.playlist_draft.id.is_empty() {
-                s.button(Rect::new(left + inset, controls_y + 54, inner.min(170), 38), "Delete playlist", "", Action::DeletePlaylist, false);
-            }
-            if ui.playlist_busy {
-                s.label(left + inset, controls_y + 10, (inner - save_width - 12).max(1), "Saving playlist...", 1);
-                for button in &mut s.buttons {
-                    if matches!(button.action, Action::SavePlaylist | Action::DeletePlaylist | Action::Go(View::CoverEdit) | Action::Back) { button.enabled = false; }
+                let width = cw.clamp(1, 650);
+                let left = x + (cw - width) / 2;
+                let inset = 24.min((width / 12).max(4));
+                let inner = (width - inset * 2).max(1);
+                let stacked = inner < 430;
+                let cover = if stacked {
+                    inner.min(180)
+                } else {
+                    (inner * 37 / 100).min(220)
+                };
+                let fields_x = if stacked {
+                    left + inset
+                } else {
+                    left + inset + cover + 20
+                };
+                let fields_y = if stacked {
+                    top + 68 + cover + 54
+                } else {
+                    top + 68
+                };
+                let fields_w = if stacked {
+                    inner
+                } else {
+                    (inner - cover - 20).max(1)
+                };
+                let cover_y = top + 68;
+                let controls_y = if stacked {
+                    fields_y + 210
+                } else {
+                    cover_y + cover + 62
+                };
+                let panel_height = controls_y - top
+                    + if ui.playlist_draft.id.is_empty() {
+                        74
+                    } else {
+                        124
+                    };
+                s.panel(left, top, width, panel_height, 8);
+                s.label(
+                    left + inset,
+                    top + 18,
+                    (inner - 45).max(1),
+                    "Edit playlist",
+                    3,
+                );
+                s.button(
+                    Rect::new(left + width - inset - 36, top + 14, 36, 36),
+                    "",
+                    "\u{e711}",
+                    Action::Back,
+                    false,
+                );
+                if let Some(button) = s.buttons.last_mut() {
+                    button.accessible = "Close".into();
                 }
+                s.panel(left + inset, cover_y, cover, cover, 2);
+                if !ui.playlist_draft.preview.is_empty() {
+                    s.pictures.push((
+                        Rect::new(left + inset, cover_y, cover, cover),
+                        ui.playlist_draft.preview.clone(),
+                    ));
+                }
+                if ui.provider != crate::catalog::Provider::YouTube {
+                    s.button(
+                        Rect::new(left + inset, cover_y + cover + 8, cover, 36),
+                        "Choose cover",
+                        "\u{e70f}",
+                        Action::ChoosePlaylistCover,
+                        false,
+                    );
+                } else {
+                    s.label(
+                        left + inset,
+                        cover_y + cover + 8,
+                        cover,
+                        "Cover editing unavailable",
+                        1,
+                    );
+                }
+                s.label(fields_x, fields_y, fields_w, "Playlist name", 1);
+                s.name = Some(Rect::new(fields_x, fields_y + 25, fields_w, 40));
+                s.label(fields_x, fields_y + 79, fields_w, "Description", 1);
+                s.description = Some(Rect::new(fields_x, fields_y + 104, fields_w, 106));
+                let save_width = inner.min(150);
+                s.button(
+                    Rect::new(
+                        left + width - inset - save_width,
+                        controls_y,
+                        save_width,
+                        42,
+                    ),
+                    "Save",
+                    "",
+                    Action::SavePlaylist,
+                    true,
+                );
+                if !ui.playlist_draft.id.is_empty() {
+                    s.button(
+                        Rect::new(left + inset, controls_y + 54, inner.min(170), 38),
+                        "Delete playlist",
+                        "",
+                        Action::DeletePlaylist,
+                        false,
+                    );
+                }
+                if ui.playlist_busy {
+                    s.label(
+                        left + inset,
+                        controls_y + 10,
+                        (inner - save_width - 12).max(1),
+                        "Saving playlist...",
+                        1,
+                    );
+                    for button in &mut s.buttons {
+                        if matches!(
+                            button.action,
+                            Action::SavePlaylist
+                                | Action::DeletePlaylist
+                                | Action::ChoosePlaylistCover
+                                | Action::Back
+                        ) {
+                            button.enabled = false;
+                        }
+                    }
+                }
+                s.content_height = top + panel_height + 24 + ui.scroll;
             }
-            s.content_height = top + panel_height + 24 + ui.scroll;
-        }
-        View::CoverEdit => {
+            View::CoverEdit => {
                 s.label(x, top, cw, "Playlist cover", 3);
                 let side = cw.min(240);
                 s.panel(x, top + 54, side, side, 2);
@@ -5581,12 +5290,6 @@ pub fn build(
         }
     }
 
-    if ui.device_menu_open
-        && ui.provider != crate::catalog::Provider::Spotify
-        && !ui.deezer_login_open
-    {
-        build_device_menu(&mut s, ui, w, h, playing);
-    }
     if ui.onboarding_open {
         build_onboarding(&mut s, ui, w, h);
     }
@@ -5871,6 +5574,8 @@ fn translate_scene(scene: &mut Scene, ui: &Ui) {
         .collect();
     let mut media = std::collections::HashSet::new();
     for entry in std::iter::once(&ui.now)
+        .chain(ui.track_info.iter().map(|(track, _, _)| track))
+        .chain(ui.pinned.iter().map(|(_, entry)| entry))
         .chain(ui.queue.iter())
         .chain(ui.offline.iter())
         .chain(ui.page.iter().flat_map(|page| {
@@ -6160,6 +5865,7 @@ mod device_menu_scene_tests {
         for provider in [
             crate::catalog::Provider::Deezer,
             crate::catalog::Provider::Spotify,
+            crate::catalog::Provider::YouTube,
         ] {
             for (width, height) in [(640, 640), (900, 720), (1180, 900)] {
                 for layout in [0, 1] {
@@ -6175,36 +5881,20 @@ mod device_menu_scene_tests {
                         ..Default::default()
                     };
                     let scene = build(&ui, (width, height), true, false, "Song", false, 50);
-                    let (rect, first_label, first_button) =
-                        if provider == crate::catalog::Provider::Spotify {
-                            assert!(scene.auth_modal.is_none());
-                            assert!(scene.device_popover_anchor.is_none());
-                            (
-                                scene.device_sidebar.expect("docked devices"),
-                                scene.queue_labels.start,
-                                scene.device_sidebar_buttons.start,
-                            )
-                        } else {
-                            scene.auth_modal.expect("device menu")
-                        };
+                    assert!(scene.auth_modal.is_none());
+                    let rect = scene.device_sidebar.expect("docked devices");
+                    let first_label = scene.queue_labels.start;
                     assert!(
                         rect.x >= 0
                             && rect.y >= 0
                             && rect.x + rect.w <= width
                             && rect.y + rect.h <= height
                     );
-                    assert_eq!(
-                        scene.device_popover_anchor.is_some(),
-                        provider == crate::catalog::Provider::Deezer
-                    );
+                    assert!(scene.device_popover_anchor.is_none());
                     assert!(scene.labels[first_label..]
                         .iter()
                         .any(|label| label.text == "DeezNats Connect"));
-                    let buttons = if provider == crate::catalog::Provider::Spotify {
-                        &scene.buttons[scene.device_sidebar_buttons.clone()]
-                    } else {
-                        &scene.buttons[first_button..]
-                    };
+                    let buttons = &scene.buttons[scene.device_sidebar_buttons.clone()];
                     let connect = buttons
                         .iter()
                         .find(|b| matches!(b.action, Action::ToggleBool("jam_enabled")))
@@ -6290,7 +5980,7 @@ fn player_extras(s: &mut Scene, ui: &Ui, right: i32, y: i32, volume: u32, narrow
     } else {
         player_utility(
             s,
-            Rect::new(fullscreen - 50, y, 34, 32),
+            Rect::new(fullscreen, y, 34, 32),
             "\u{e772}",
             Action::ToggleDeviceMenu,
             ui.device_menu_open,
@@ -6305,15 +5995,12 @@ fn player_extras(s: &mut Scene, ui: &Ui, right: i32, y: i32, volume: u32, narrow
         volume == 0,
         if volume == 0 { "Unmute" } else { "Mute" },
     );
-    s.volume = Some(Rect::new(volume_x, y + 4, volume_w, 24));
-    player_utility(
-        s,
-        Rect::new(fullscreen, y, 32, 32),
-        "\u{e740}",
-        Action::PlayerFullscreen,
-        false,
-        "Fullscreen lyrics",
-    );
+    s.volume = Some(Rect::new(
+        volume_x,
+        y + 4,
+        volume_w + if narrow { 60 } else { 56 },
+        24,
+    ));
 }
 fn build_player(s: &mut Scene, ui: &Ui, w: i32, h: i32, title: &str, playing: bool, volume: u32) {
     let height = player_height(ui, w);
@@ -6677,38 +6364,48 @@ fn style_mix_controls(s: &mut Scene, ui: &Ui, x: i32, top: i32, cw: i32) -> i32 
     let cols = (cw / 145).clamp(1, 5);
     let width = cw / cols;
     let mut y = top;
+    let filter = ui.flow_filter.trim().to_lowercase();
     if ui.mix_region == usize::MAX {
         s.label(x, y, cw, "Country / language", 0);
         y += 30;
-        let visible = crate::style_mix::REGIONS
-            .len()
-            .min(cols as usize * ui.mix_language_rows);
-        for (index, (name, _)) in crate::style_mix::REGIONS.iter().take(visible).enumerate() {
+        s.panel(x, y, cw, 40, 8);
+        s.search = Some(Rect::new(x + 14, y + 7, (cw - 56).max(60), 26));
+        y += 54;
+        let regions: Vec<_> = crate::style_mix::REGIONS
+            .iter()
+            .enumerate()
+            .filter(|(_, (name, _))| name.to_lowercase().contains(&filter))
+            .take(if filter.is_empty() && ui.mix_language_rows != usize::MAX {
+                cols as usize * 3
+            } else {
+                usize::MAX
+            })
+            .collect();
+        for (cell, (index, (name, _))) in regions.iter().enumerate() {
             s.button(
                 Rect::new(
-                    x + index as i32 % cols * width,
-                    y + index as i32 / cols * 42,
+                    x + cell as i32 % cols * width,
+                    y + cell as i32 / cols * 42,
                     width - 8,
                     34,
                 ),
                 *name,
                 "",
-                Action::MixRegion(index),
+                Action::MixRegion(*index),
                 false,
             );
         }
-        y += (visible as i32 + cols - 1) / cols * 42 + 12;
-        if crate::style_mix::REGIONS.len() > cols as usize * 3 {
-            let width = 150.min(cw);
+        y += (regions.len() as i32 + cols - 1) / cols * 42 + 12;
+        if filter.is_empty() && crate::style_mix::REGIONS.len() > cols as usize * 3 {
             s.button(
-                Rect::new(x + (cw - width) / 2, y, width, 34),
-                if visible == crate::style_mix::REGIONS.len() {
-                    "See less"
+                Rect::new(x, y, 150.min(cw), 34),
+                if ui.mix_language_rows == usize::MAX {
+                    "Show less"
                 } else {
-                    "See more"
+                    "Show all"
                 },
                 "",
-                if visible == crate::style_mix::REGIONS.len() {
+                if ui.mix_language_rows == usize::MAX {
                     Action::MixLess(true)
                 } else {
                     Action::MixMore(true)
@@ -6767,8 +6464,27 @@ fn style_mix_controls(s: &mut Scene, ui: &Ui, x: i32, top: i32, cw: i32) -> i32 
         0,
     );
     y += 30;
-    let visible = genres.len().min(cols as usize * ui.mix_genre_rows);
-    for (cell, genre) in genres.iter().take(visible).enumerate() {
+    s.panel(x, y, cw, 40, 8);
+    s.search = Some(Rect::new(x + 14, y + 7, (cw - 56).max(60), 26));
+    y += 54;
+    let mut filtered: Vec<_> = genres
+        .iter()
+        .filter(|genre| {
+            genre["title"]
+                .as_str()
+                .unwrap_or("")
+                .to_lowercase()
+                .contains(&filter)
+        })
+        .collect();
+    filtered.sort_by_key(|genre| {
+        crate::style_mix::popularity_rank(genre["title"].as_str().unwrap_or(""))
+    });
+    let total = filtered.len();
+    if filter.is_empty() && ui.mix_genre_rows != usize::MAX {
+        filtered.truncate(cols as usize * 3);
+    }
+    for (cell, genre) in filtered.iter().enumerate() {
         let index = genre["id"].as_u64().unwrap_or_default() as usize;
         s.button(
             Rect::new(
@@ -6783,18 +6499,17 @@ fn style_mix_controls(s: &mut Scene, ui: &Ui, x: i32, top: i32, cw: i32) -> i32 
             ui.mix_genre == index,
         );
     }
-    y += (visible as i32 + cols - 1) / cols * 42 + 12;
-    if genres.len() > cols as usize * 3 {
-        let width = 150.min(cw);
+    y += (filtered.len() as i32 + cols - 1) / cols * 42 + 12;
+    if filter.is_empty() && total > cols as usize * 3 {
         s.button(
-            Rect::new(x + (cw - width) / 2, y, width, 34),
-            if visible == genres.len() {
-                "See less"
+            Rect::new(x, y, 150.min(cw), 34),
+            if ui.mix_genre_rows == usize::MAX {
+                "Show less"
             } else {
-                "See more"
+                "Show all"
             },
             "",
-            if visible == genres.len() {
+            if ui.mix_genre_rows == usize::MAX {
                 Action::MixLess(false)
             } else {
                 Action::MixMore(false)
@@ -6896,15 +6611,55 @@ fn live_catalog(
     cw: i32,
     h: i32,
 ) {
-    let start=catalog_scroll::Ranges::at(s);
-    live_catalog_contents(s,ui,page,x,top,cw,h);
-    s.catalog_layout=Some(catalog_scroll::Layout{x,origin:top+ui.scroll,width:cw,ranges:start.finish(s)});
+    let start = catalog_scroll::Ranges::at(s);
+    let pinned: Vec<_> = ui
+        .pinned
+        .iter()
+        .filter(|(provider, _)| *provider == ui.provider)
+        .map(|(_, entry)| entry.clone())
+        .collect();
+    if ui.view == View::Home && !pinned.is_empty() {
+        let mut page = page.clone();
+        page.sections.insert(
+            0,
+            crate::catalog::Section {
+                title: "Pinned".into(),
+                entries: pinned,
+                ..Default::default()
+            },
+        );
+        live_catalog_contents(s, ui, &page, x, top, cw, h);
+    } else {
+        live_catalog_contents(s, ui, page, x, top, cw, h);
+    }
+    s.catalog_layout = Some(catalog_scroll::Layout {
+        x,
+        origin: top + ui.scroll,
+        width: cw,
+        ranges: start.finish(s),
+    });
 }
-fn live_catalog_contents(s:&mut Scene,ui:&Ui,page:&crate::catalog::Page,x:i32,top:i32,cw:i32,h:i32) {
+
+fn live_catalog_contents(
+    s: &mut Scene,
+    ui: &Ui,
+    page: &crate::catalog::Page,
+    x: i32,
+    top: i32,
+    cw: i32,
+    h: i32,
+) {
     let mut y = top;
-    if ui.view == View::Artist && ui.provider == crate::catalog::Provider::YouTube && !page.subtitle.is_empty() {
+    if ui.view == View::Artist
+        && ui.provider == crate::catalog::Provider::YouTube
+        && !page.subtitle.is_empty()
+    {
         let lines = wrap_text(&plain_description(&page.subtitle), cw, 14);
-        let artist_id = page.entity.as_ref().map(|entry| entry.id.as_str()).unwrap_or("");
+        let artist_id = page
+            .entity
+            .as_ref()
+            .map(|entry| entry.id.as_str())
+            .unwrap_or("");
         let expanded = ui.expanded_podcast_description.as_deref() == Some(artist_id);
         for line in lines.iter().take(if expanded { lines.len() } else { 3 }) {
             s.label(x, y, cw, line, 1);
@@ -6912,8 +6667,16 @@ fn live_catalog_contents(s:&mut Scene,ui:&Ui,page:&crate::catalog::Page,x:i32,to
         }
         if lines.len() > 3 && !artist_id.is_empty() {
             let label = if expanded { "Read less" } else { "Read more" };
-            s.button(Rect::new(x, y, cw.min(180), 24), label, "", Action::TogglePodcastDescription(artist_id.to_owned()), false);
-            if let Some(button) = s.buttons.last_mut() { button.text_link = true; }
+            s.button(
+                Rect::new(x, y, cw.min(180), 24),
+                label,
+                "",
+                Action::TogglePodcastDescription(artist_id.to_owned()),
+                false,
+            );
+            if let Some(button) = s.buttons.last_mut() {
+                button.text_link = true;
+            }
             y += 32;
         }
         y += 18;
@@ -6971,14 +6734,15 @@ fn live_catalog_contents(s:&mut Scene,ui:&Ui,page:&crate::catalog::Page,x:i32,to
             Action::PlayAll,
             true,
         );
-        if ui.view != View::Offline && supports_downloads(ui) {
+        if ui.view == View::Favorites {
             s.button(
-                Rect::new(x + 144, y, 130, 36),
-                "Download",
-                "\u{e896}",
-                Action::Download,
-                false,
+                Rect::new(x + 144, y, 48, 36),
+                "",
+                "\u{e8b1}",
+                Action::Shuffle,
+                ui.shuffle,
             );
+            s.buttons.last_mut().unwrap().accessible = "Shuffle".into();
         }
         y += 56;
     }
@@ -7130,8 +6894,10 @@ fn live_catalog_contents(s:&mut Scene,ui:&Ui,page:&crate::catalog::Page,x:i32,to
                 s.artwork_ahead.push((y, item.artwork.clone()));
             }
             if y + 56 >= s.content_top - SCROLL_OVERSCAN && y < h - 124 + SCROLL_OVERSCAN {
-                if catalog_scroll::reuse(s,format!("track:{index}"),y) {continue;}
-                let row_start=catalog_scroll::Ranges::at(s);
+                if catalog_scroll::reuse(s, format!("track:{index}"), y) {
+                    continue;
+                }
+                let row_start = catalog_scroll::Ranges::at(s);
                 let active_track = !ui.now.id.is_empty() && ui.now.id == item.id;
                 let checked = ui.checked_ids.contains(&item.id);
                 if active_track || checked {
@@ -7210,7 +6976,7 @@ fn live_catalog_contents(s:&mut Scene,ui:&Ui,page:&crate::catalog::Page,x:i32,to
                         checked,
                     );
                 }
-                catalog_scroll::record(s,format!("track:{index}"),y,row_start);
+                catalog_scroll::record(s, format!("track:{index}"), y, row_start);
             }
         }
         y = row_origin + rows.len() as i32 * 56;
@@ -7226,7 +6992,7 @@ fn live_catalog_contents(s:&mut Scene,ui:&Ui,page:&crate::catalog::Page,x:i32,to
         .max(32);
     let discover = ui.view == View::Explore && page.is_discover();
     let staged = page.is_catalogue();
-    for (section_index,section) in page.sections.iter().enumerate() {
+    for (section_index, section) in page.sections.iter().enumerate() {
         if section.entries.is_empty() && section.error.is_empty() {
             continue;
         }
@@ -7283,13 +7049,6 @@ fn live_catalog_contents(s:&mut Scene,ui:&Ui,page:&crate::catalog::Page,x:i32,to
         let shelf_has_more = shelf && items.len() > cols as usize;
         if shelf_has_more && !discover {
             s.button(
-                Rect::new(x + cw - 260, y, 136, 36),
-                ui.t("Show all"),
-                "",
-                Action::ShelfAll(section.title.clone()),
-                false,
-            );
-            s.button(
                 Rect::new(x + cw - 112, y, 38, 36),
                 "",
                 "\u{e76b}",
@@ -7306,7 +7065,7 @@ fn live_catalog_contents(s:&mut Scene,ui:&Ui,page:&crate::catalog::Page,x:i32,to
         }
         y += 40;
         if !section.error.is_empty() {
-            s.label(x, y, cw, &section.error, 1);
+            s.label(x + 14, y, cw - 14, &section.error, 1);
             y += 60;
             continue;
         }
@@ -7356,7 +7115,13 @@ fn live_catalog_contents(s:&mut Scene,ui:&Ui,page:&crate::catalog::Page,x:i32,to
                     staged_cols,
                     page.loading,
                 );
-            } else if tiles_have_more || (!staged && discover && ui.filter == 0 && ui.provider == crate::catalog::Provider::YouTube && section.title == "Categories") {
+            } else if tiles_have_more
+                || (!staged
+                    && discover
+                    && ui.filter == 0
+                    && ui.provider == crate::catalog::Provider::YouTube
+                    && section.title == "Categories")
+            {
                 discover_show_all(s, ui, x, &mut y, cw, &section.title);
             }
             continue;
@@ -7399,9 +7164,11 @@ fn live_catalog_contents(s:&mut Scene,ui:&Ui,page:&crate::catalog::Page,x:i32,to
             }
             if yy + row_height >= s.content_top - SCROLL_OVERSCAN && yy < h - 124 + SCROLL_OVERSCAN
             {
-                let row_key=format!("section:{section_index}:row:{row}");
-                if catalog_scroll::reuse(s,row_key.clone(),yy) {continue;}
-                let row_start=catalog_scroll::Ranges::at(s);
+                let row_key = format!("section:{section_index}:row:{row}");
+                if catalog_scroll::reuse(s, row_key.clone(), yy) {
+                    continue;
+                }
+                let row_start = catalog_scroll::Ranges::at(s);
                 let metadata: Vec<_> = chunk
                     .iter()
                     .map(|item| {
@@ -7470,7 +7237,7 @@ fn live_catalog_contents(s:&mut Scene,ui:&Ui,page:&crate::catalog::Page,x:i32,to
                         );
                     }
                 }
-                catalog_scroll::record(s,row_key,yy,row_start);
+                catalog_scroll::record(s, row_key, yy, row_start);
             }
         }
         y = row_origin + row_count as i32 * row_height;
@@ -7520,9 +7287,9 @@ fn live_catalog_contents(s:&mut Scene,ui:&Ui,page:&crate::catalog::Page,x:i32,to
         && page.sections.iter().all(|s| s.entries.is_empty())
     {
         s.label(
-            x,
+            x + 14,
             y + 40,
-            cw,
+            cw - 14,
             if ui.view == View::Podcasts && !supports_downloads(ui) {
                 ui.t("Your saved podcasts and episodes appear here.").to_owned()
             } else if ui.view == View::Podcasts {
@@ -7654,124 +7421,97 @@ fn wrap_text(text: &str, width: i32, font: i32) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn spotify_jam_controls_follow_host_permissions_and_busy_state() {
-        for width in [300, 725] {
-            for owner in [false, true] {
-                let mut ui = Ui {
-                    provider: crate::catalog::Provider::Spotify,
-                    ..Default::default()
-                };
-                ui.spotify_jam = Some(crate::spotify::jam::Session {
-                    id: "session".into(),
-                    active: true,
-                    owner,
-                    invite_uri: Some("spotify:socialsession:token".into()),
-                    members: vec![
-                        crate::spotify::jam::Member {
-                            id: "host".into(),
-                            name: "Host".into(),
-                            owner: true,
-                        },
-                        crate::spotify::jam::Member {
-                            id: "guest".into(),
-                            name: "Guest".into(),
-                            owner: false,
-                        },
-                    ],
-                    ..Default::default()
-                });
-                for busy in [false, true] {
-                    ui.spotify_jam_busy = busy;
-                    let mut scene = Scene::default();
-                    spotify_jam_card(&mut scene, &ui, 0, 0, width);
-                    assert!(!scene
-                        .buttons
-                        .iter()
-                        .any(|b| matches!(b.action, Action::SpotifyJamStart)));
-                    assert_eq!(
-                        scene
-                            .buttons
-                            .iter()
-                            .any(|b| matches!(b.action, Action::SpotifyJamEnd(_))),
-                        owner
-                    );
-                    assert_eq!(
-                        scene
-                            .buttons
-                            .iter()
-                            .filter(|b| matches!(b.action, Action::SpotifyJamRemove(_, _)))
-                            .count(),
-                        usize::from(owner)
-                    );
-                    assert!(scene.buttons.iter().all(|b| b.enabled != busy));
-                    assert!(scene
-                        .buttons
-                        .iter()
-                        .all(|b| b.rect.x >= 0 && b.rect.x + b.rect.w <= width));
-                }
-            }
-        }
-    }
-    #[test]
-    fn style_mix_languages_and_genres_expand_three_rows_at_a_time() {
+    fn flow_catalog_is_limited_and_counted_for_every_provider() {
         for provider in [
             crate::catalog::Provider::Deezer,
             crate::catalog::Provider::Spotify,
+            crate::catalog::Provider::YouTube,
         ] {
-            for width in [300, 725] {
-                let columns = (width / 145).clamp(1, 5) as usize;
-                let mut ui = Ui {
-                    provider,
-                    view: View::StyleMix,
-                    ..Default::default()
-                };
-                for rows in [3, 6, 9, 90] {
-                    ui.mix_language_rows = rows;
-                    let mut scene = Scene::default();
-                    style_mix_controls(&mut scene, &ui, 0, 0, width);
-                    let total = crate::style_mix::REGIONS.len();
-                    let shown = total.min(columns * rows);
-                    assert_eq!(
-                        scene
-                            .buttons
-                            .iter()
-                            .filter(|b| matches!(b.action, Action::MixRegion(_)))
-                            .count(),
-                        shown
-                    );
-                    assert!(scene.buttons.iter().any(|b| if shown < total {
-                        matches!(b.action, Action::MixMore(true)) && b.text == "See more"
-                    } else {
-                        matches!(b.action, Action::MixLess(true)) && b.text == "See less"
-                    }));
-                }
-                ui.mix_region = 0;
-                ui.mix_genres = Some(
-                    serde_json::json!({"genres":crate::style_mix::GENRES.iter().enumerate().map(|(id, (title, _))| serde_json::json!({"id":id,"title":title})).collect::<Vec<_>>()}),
-                );
-                for rows in [3, 6, 9, 90] {
-                    ui.mix_genre_rows = rows;
-                    let mut scene = Scene::default();
-                    style_mix_controls(&mut scene, &ui, 0, 0, width);
-                    let total = crate::style_mix::GENRES.len();
-                    let shown = total.min(columns * rows);
-                    assert_eq!(
-                        scene
-                            .buttons
-                            .iter()
-                            .filter(|b| matches!(b.action, Action::MixGenre(_)))
-                            .count(),
-                        shown
-                    );
-                    assert!(scene.buttons.iter().any(|b| if shown < total {
-                        matches!(b.action, Action::MixMore(false)) && b.text == "See more"
-                    } else {
-                        matches!(b.action, Action::MixLess(false)) && b.text == "See less"
-                    }));
-                }
-            }
+            let mut ui = Ui {
+                provider,
+                view: View::FlowTune,
+                flow_loaded: true,
+                flow_customizable: true,
+                genres: (0..120)
+                    .map(|i| {
+                        (
+                            i.to_string(),
+                            format!("TestGenre{i:03}"),
+                            i == 119,
+                            i == 119,
+                        )
+                    })
+                    .collect(),
+                flow_genre_limit: usize::MAX,
+                ..Default::default()
+            };
+            let scene = build(&ui, (1043, 674), true, false, "", false, 40);
+            assert!(scene
+                .labels
+                .iter()
+                .any(|label| label.text.contains("1 genres selected")
+                    && label.text.contains("100 options")));
+            ui.flow_filter = "TestGenre119".into();
+            let scene = build(&ui, (1043, 674), true, false, "", false, 40);
+            assert!(scene
+                .buttons
+                .iter()
+                .any(|button| matches!(button.action, Action::Genre(119))));
+            ui.flow_filter = "TestGenre118".into();
+            let scene = build(&ui, (1043, 674), true, false, "", false, 40);
+            assert!(!scene
+                .buttons
+                .iter()
+                .any(|button| matches!(button.action, Action::Genre(118))));
         }
     }
+
+    #[test]
+    fn style_mix_limits_initial_options_and_searches_all() {
+        let mut ui = Ui {
+            view: View::StyleMix,
+            ..Default::default()
+        };
+        let mut scene = Scene::default();
+        style_mix_controls(&mut scene, &ui, 0, 0, 725);
+        assert_eq!(
+            scene
+                .buttons
+                .iter()
+                .filter(|b| matches!(b.action, Action::MixRegion(_)))
+                .count(),
+            15
+        );
+        let last = crate::style_mix::REGIONS.last().unwrap().0;
+        ui.flow_filter = last.to_string();
+        let mut scene = Scene::default();
+        style_mix_controls(&mut scene, &ui, 0, 0, 725);
+        assert!(scene.buttons.iter().any(
+            |b| matches!(b.action, Action::MixRegion(i) if i == crate::style_mix::REGIONS.len() - 1)
+        ));
+        ui.mix_region = 0;
+        ui.flow_filter.clear();
+        ui.mix_genres = Some(
+            serde_json::json!({"genres": crate::style_mix::GENRES.iter().enumerate().map(|(id, g)| serde_json::json!({"id": id, "title": g.0})).collect::<Vec<_>>() }),
+        );
+        let mut scene = Scene::default();
+        style_mix_controls(&mut scene, &ui, 0, 0, 725);
+        assert_eq!(
+            scene
+                .buttons
+                .iter()
+                .filter(|b| matches!(b.action, Action::MixGenre(_)))
+                .count(),
+            15
+        );
+        ui.flow_filter = crate::style_mix::GENRES.last().unwrap().0.to_string();
+        let mut scene = Scene::default();
+        style_mix_controls(&mut scene, &ui, 0, 0, 725);
+        assert!(scene.buttons.iter().any(
+            |b| matches!(b.action, Action::MixGenre(i) if i == crate::style_mix::GENRES.len() - 1)
+        ));
+    }
+
     #[test]
     fn style_mix_opens_from_flow_and_selects_country_and_genre_independently() {
         let mut ui = Ui {
@@ -7886,13 +7626,22 @@ mod tests {
             for offset in 0..=scene.queue_scroll_max {
                 ui.queue_scroll = offset;
                 let frame = build(&ui, size, true, false, "", false, 50);
-                for (index,label) in frame.labels.iter().enumerate() {
+                for (index, label) in frame.labels.iter().enumerate() {
                     if label.rect.x >= frame.queue_viewport.unwrap().x {
-                        let viewport=frame.queue_viewport.unwrap();
-                        let clipped=frame.queue_row_labels.contains(&index);
-                        let bottom=if clipped {(label.rect.y+label.rect.h).min(viewport.y+viewport.h)} else {label.rect.y+label.rect.h};
+                        let viewport = frame.queue_viewport.unwrap();
+                        let clipped = frame.queue_row_labels.contains(&index);
+                        let bottom = if clipped {
+                            (label.rect.y + label.rect.h).min(viewport.y + viewport.h)
+                        } else {
+                            label.rect.y + label.rect.h
+                        };
                         assert!(bottom <= size.1 - player_height(&ui, size.0));
-                        if !clipped || label.rect.y<viewport.y+viewport.h && label.rect.y+label.rect.h>viewport.y {seen.push_str(&label.text);}
+                        if !clipped
+                            || label.rect.y < viewport.y + viewport.h
+                                && label.rect.y + label.rect.h > viewport.y
+                        {
+                            seen.push_str(&label.text);
+                        }
                     }
                 }
             }
@@ -8004,7 +7753,8 @@ mod tests {
             .iter()
             .find(|l| l.text == "Complete lyric line 0")
             .unwrap();
-        assert_eq!(first.rect.y, 380);
+        let area = scene.lyrics_area.unwrap();
+        assert_eq!(first.rect.y, area.y + (area.h as f32 * 0.3).round() as i32);
         assert!(scene.panels.iter().any(|p| p.kind == 6));
         ui.scroll = 1200;
         ui.lyrics_manual_scroll = true;
@@ -8021,7 +7771,7 @@ mod tests {
                 .unwrap()
                 .rect
                 .y,
-            380
+            first.rect.y
         );
     }
     #[test]
@@ -8166,11 +7916,50 @@ mod tests {
     }
 
     #[test]
+    fn catalog_messages_stay_inside_sidebar_clip() {
+        for collapsed in [false, true] {
+            let ui = Ui {
+                sidebar_collapsed: collapsed,
+                ..Default::default()
+            };
+            let x = (76. + 186. * ui.sidebar_values().0).round() as i32;
+            for page in [
+                crate::catalog::Page::default(),
+                crate::catalog::Page {
+                    sections: vec![crate::catalog::Section {
+                        error: "Section error".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ] {
+                let mut scene = Scene::default();
+                live_catalog_contents(&mut scene, &ui, &page, x, 200, 600, 800);
+                let message = scene
+                    .labels
+                    .iter()
+                    .find(|label| {
+                        label.text == "Section error"
+                            || label.text.starts_with("No items were returned")
+                    })
+                    .unwrap();
+                assert!(message.rect.x >= ui.content_left());
+            }
+        }
+    }
+    #[test]
     fn empty_results_message_localizes_each_provider() {
         let mut ui = Ui::default();
-        for (language, expected) in [("tr", "üzerinden sonuç gelmedi"), ("az", "vasitəsilə nəticə gəlmədi")] {
+        for (language, expected) in [
+            ("tr", "üzerinden sonuç gelmedi"),
+            ("az", "vasitəsilə nəticə gəlmədi"),
+        ] {
             ui.set_language(language);
-            for provider in [crate::catalog::Provider::Deezer, crate::catalog::Provider::Spotify, crate::catalog::Provider::YouTube] {
+            for provider in [
+                crate::catalog::Provider::Deezer,
+                crate::catalog::Provider::Spotify,
+                crate::catalog::Provider::YouTube,
+            ] {
                 let text = format!("No items were returned by {}.", provider.label());
                 let translated = ui.translated_text(&text);
                 assert!(translated.contains(provider.label()));
@@ -8204,6 +7993,28 @@ mod tests {
             }
             let setup_notice = &catalog[crate::spotify::wizard::NOTICE];
             assert_eq!(setup_notice.matches('?').count(), 1);
+        }
+    }
+
+    #[test]
+    fn new_ui_messages_and_provider_notices_are_localized() {
+        let mut ui = Ui::default();
+        for language in ["tr", "az"] {
+            ui.set_language(language);
+            for text in [
+                "Custom light",
+                "Custom dark",
+                "More options",
+                "Enter a playlist name",
+                "Delete download",
+                "Go to album",
+                "Loading song radio…",
+                "Click digits to change port",
+                "Select all",
+                "Connect to Spotify first",
+            ] {
+                assert_ne!(ui.translated_text(text), text, "{language}: {text}");
+            }
         }
     }
 
@@ -8467,14 +8278,26 @@ mod tests {
         let automatic = build(&ui, (1000, 800), true, false, "", true, 50);
         assert!(automatic.lyric_rows.len() < 100);
         assert!(automatic.lyric_rows.iter().any(|row| row.line == 60));
+        let active = automatic
+            .labels
+            .iter()
+            .find(|label| label.kind == 13)
+            .unwrap();
+        assert_eq!(automatic.lyrics_focus_y, Some(active.rect.y));
         ui.lyrics_manual_scroll = true;
         let manual = build(&ui, (1000, 800), true, false, "", true, 50);
         assert!(manual.lyric_rows.len() < 100);
         assert!(manual.lyric_rows.iter().any(|row| row.line == 0));
+        assert!(!manual.lyric_rows.iter().any(|row| row.line == 60));
+        assert!(manual.lyrics_focus_y.unwrap() > 1600);
         ui.scroll = 4_000;
         let scrolled = build(&ui, (1000, 800), true, false, "", true, 50);
         assert!(scrolled.lyric_rows.len() < 100);
         assert!(scrolled.lyric_rows.iter().any(|row| row.line > 70));
+        assert_eq!(
+            scrolled.lyrics_focus_y,
+            manual.lyrics_focus_y.map(|y| y - 4000)
+        );
     }
 
     #[test]
@@ -8817,10 +8640,10 @@ mod tests {
                 .count()
                 < 120
         );
-        assert!(!first
+        assert!(first
             .buttons
             .iter()
-            .any(|b| matches!(b.action, Action::FlowMoreGenres | Action::FlowAddGenre)));
+            .any(|b| matches!(b.action, Action::FlowMoreGenres)));
         ui.scroll = 900;
         let scrolled = build(&ui, (1043, 674), true, false, "", false, 40);
         let save = |scene: &Scene| {
@@ -8915,13 +8738,13 @@ mod tests {
                     .iter()
                     .filter(|b| matches!(b.action, Action::Genre(_)))
                     .count(),
-                30
+                10
             );
             assert!(scene
                 .buttons
                 .iter()
                 .any(|b| matches!(b.action, Action::FlowMoreGenres)));
-            ui.flow_genre_limit = crate::spotify::flow::BROWSE_GENRES.len();
+            ui.flow_genre_limit = usize::MAX;
             let expanded = build(&ui, (1043, 674), true, false, "", false, 40);
             assert!(
                 expanded
@@ -8938,12 +8761,14 @@ mod tests {
             assert!(expanded
                 .buttons
                 .iter()
-                .any(|b| matches!(b.action, Action::FlowMoreGenres) && b.text == "See less"));
+                .any(|b| matches!(b.action, Action::FlowMoreGenres) && b.text == "Show less"));
             ui.flow_filter = "arabesk".into();
             let searched = build(&ui, (1043, 674), true, false, "", false, 40);
-            assert!(searched.buttons.iter().any(
-                |b| matches!(b.action, Action::Genre(_)) && b.text.eq_ignore_ascii_case("arabesk")
-            ));
+            assert!(searched
+                .buttons
+                .iter()
+                .any(|b| matches!(b.action, Action::Genre(_))
+                    && b.text.eq_ignore_ascii_case("arabesk")));
             ui.flow_filter = "My emerging subgenre".into();
             let custom = build(&ui, (1043, 674), true, false, "", false, 40);
             assert!(custom
@@ -8970,7 +8795,7 @@ mod tests {
                     .iter()
                     .filter(|b| matches!(b.action, Action::Genre(_)))
                     .count(),
-                31
+                11
             );
             ui.view = View::Flow;
             ui.page = Some(std::sync::Arc::new(crate::catalog::Page {
@@ -9088,24 +8913,22 @@ mod tests {
         );
         ui.go(View::Settings);
         ui.tab = 5;
+        ui.provider = crate::catalog::Provider::Spotify;
+        ui.jam_enabled = true;
+        ui.jam_url = "http://192.168.1.20:3132/".into();
         for size in [(520, 700), (1120, 700)] {
-            ui.jam_enabled = true;
-            ui.jam_url = "http://192.168.1.20:3132/".into();
-            let scene = build(&ui, size, false, false, "", false, 70);
-            assert!(scene
-                .buttons
-                .iter()
-                .any(|b| matches!(b.action, Action::OpenConnect)));
-            assert!(scene
-                .buttons
-                .iter()
-                .any(|b| matches!(b.action, Action::CopyConnectLink)));
-            ui.jam_enabled = false;
             let scene = build(&ui, size, false, false, "", false, 70);
             assert!(!scene
-                .buttons
+                .labels
                 .iter()
-                .any(|b| matches!(b.action, Action::OpenConnect | Action::CopyConnectLink)));
+                .any(|label| matches!(label.text.as_str(), "DeezNats Connect" | "Spotify Jam")));
+            assert!(!scene.buttons.iter().any(|button| matches!(
+                button.action,
+                Action::OpenConnect
+                    | Action::CopyConnectLink
+                    | Action::ToggleBool("jam_enabled")
+                    | Action::SpotifyJamRefresh
+            )));
         }
     }
 
@@ -9114,6 +8937,8 @@ mod tests {
         let mut ui = Ui::default();
         ui.go(View::Settings);
         ui.tab = 2;
+        // Custom themes live at the end of the paged theme shelf.
+        ui.theme_shelf_offset = SOLID_THEMES.len();
         let s0 = build(&ui, (1200, 800), false, false, "", false, 70);
         ui.scroll = 300;
         let s1 = build(&ui, (1200, 800), false, false, "", false, 70);
@@ -9461,12 +9286,33 @@ mod tests {
     }
     #[test]
     fn queue_drag_handles_appear_only_on_upcoming_rows_for_each_provider() {
-        for provider in [crate::catalog::Provider::Deezer, crate::catalog::Provider::Spotify, crate::catalog::Provider::YouTube] {
-            let mut ui = Ui { provider, queue_sidebar_open: true, ..Default::default() };
-            ui.queue = (0..3).map(|i| crate::catalog::Entry { id: i.to_string(), kind: "track".into(), ..Default::default() }).collect();
+        for provider in [
+            crate::catalog::Provider::Deezer,
+            crate::catalog::Provider::Spotify,
+            crate::catalog::Provider::YouTube,
+        ] {
+            let mut ui = Ui {
+                provider,
+                queue_sidebar_open: true,
+                ..Default::default()
+            };
+            ui.queue = (0..3)
+                .map(|i| crate::catalog::Entry {
+                    id: i.to_string(),
+                    kind: "track".into(),
+                    ..Default::default()
+                })
+                .collect();
             ui.now = ui.queue[0].clone();
             let scene = build(&ui, (1200, 800), true, false, "", false, 50);
-            assert_eq!(scene.labels.iter().filter(|label| label.text == "\u{22ee}\u{22ee}").count(), 2);
+            assert_eq!(
+                scene
+                    .labels
+                    .iter()
+                    .filter(|label| label.text == "\u{22ee}\u{22ee}")
+                    .count(),
+                2
+            );
         }
     }
 
@@ -9731,10 +9577,17 @@ mod tests {
             let scene = build(&ui, (width, 1000), true, false, "", false, 80);
             let name = scene.name.unwrap();
             let description = scene.description.unwrap();
-            let save = scene.buttons.iter().find(|button| matches!(button.action, Action::SavePlaylist)).unwrap();
+            let save = scene
+                .buttons
+                .iter()
+                .find(|button| matches!(button.action, Action::SavePlaylist))
+                .unwrap();
             assert!(name.y + name.h <= description.y);
             assert!(description.y + description.h <= save.rect.y);
-            assert!(scene.buttons.iter().any(|button| matches!(button.action, Action::Go(View::CoverEdit))));
+            assert!(scene
+                .buttons
+                .iter()
+                .any(|button| matches!(button.action, Action::ChoosePlaylistCover)));
         }
     }
 
@@ -9778,7 +9631,7 @@ mod tests {
                 .pictures
                 .iter()
                 .any(|(_, url)| url == "https://example.com/artist.jpg"));
-            assert!(scene.labels.iter().any(|label| label.text == "2024-01-01"));
+            assert!(scene.labels.iter().any(|label| label.text == "1 Jan 2024"));
             let play = scene
                 .buttons
                 .iter()
@@ -10167,7 +10020,7 @@ mod tests {
             .iter()
             .find(|b| b.text == "View album")
             .unwrap();
-        assert_eq!(album_btn.glyph, "\u{e93c}");
+        assert!(album_btn.glyph.is_empty());
         assert!(play_btn.rect.x + play_btn.rect.w <= album_btn.rect.x);
     }
     #[test]
@@ -10512,6 +10365,55 @@ mod tests {
     }
 
     #[test]
+    fn home_pins_form_the_first_separate_shelf_and_stay_provider_specific() {
+        use crate::catalog::{Entry, Page, Provider, Section};
+        let entry = |id: &str| Entry {
+            id: id.into(),
+            title: id.into(),
+            kind: "album".into(),
+            ..Default::default()
+        };
+        let ui = Ui {
+            view: View::Home,
+            provider: Provider::Deezer,
+            pinned: vec![
+                (Provider::Deezer, entry("pin1")),
+                (Provider::Spotify, entry("spotify:album:other")),
+                (Provider::Deezer, entry("pin2")),
+            ],
+            page: Some(std::sync::Arc::new(Page {
+                sections: vec![Section {
+                    title: "Recommendations".into(),
+                    entries: vec![entry("recommended")],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let scene = build(&ui, (1200, 1000), true, false, "", false, 50);
+        let position = |id: &str| {
+            scene
+                .buttons
+                .iter()
+                .find_map(|button| match &button.action {
+                    Action::OpenItem(entry) if entry.id == id && !button.text_link => {
+                        Some(button.rect.y)
+                    }
+                    _ => None,
+                })
+        };
+        assert!(scene.labels.iter().any(|label| label.text == "Pinned"));
+        assert_eq!(position("pin1"), position("pin2"));
+        assert!(position("pin1").unwrap() < position("recommended").unwrap());
+        assert!(position("spotify:album:other").is_none());
+        let restored: Vec<(Provider, Entry)> =
+            serde_json::from_value(serde_json::to_value(&ui.pinned).unwrap()).unwrap();
+        assert_eq!(restored.len(), 3);
+        assert_eq!(restored[1].0, Provider::Spotify);
+    }
+
+    #[test]
     fn queue_sidebar_and_settings_fixes() {
         // 1. Tab icon for lyrics is \u{ec71} (vocal mic)
         assert_eq!(TAB_ICONS[3], "\u{ec71}");
@@ -10639,7 +10541,8 @@ mod tests {
             .iter()
             .find(|b| matches!(b.action, Action::Favorite))
             .unwrap();
-        assert_eq!(fav_btn_unliked.text, "Add to library");
+        assert_eq!(fav_btn_unliked.accessible, "Add to library");
+        assert!(!fav_btn_unliked.selected);
 
         // When saved with podcast namespace key
         show_ui.liked_ids.insert(podcast_entry.library_key());
@@ -10649,7 +10552,8 @@ mod tests {
             .iter()
             .find(|b| matches!(b.action, Action::Favorite))
             .unwrap();
-        assert_eq!(fav_btn_liked.text, "In library");
+        assert_eq!(fav_btn_liked.accessible, "In library");
+        assert!(fav_btn_liked.selected);
     }
     #[test]
     fn reference_player_controls_and_metadata_never_collide_at_responsive_widths() {
@@ -10714,7 +10618,7 @@ mod tests {
                 assert!(scene
                     .buttons
                     .iter()
-                    .any(|b| matches!(b.action, Action::PlayerFullscreen)));
+                    .all(|b| !matches!(b.action, Action::PlayerFullscreen)));
             }
         }
     }
@@ -10787,7 +10691,7 @@ mod tests {
         assert_eq!(titles[0].rect.h, 23);
     }
     #[test]
-    fn appearance_options_expand_and_tint_slider_matches_background() {
+    fn appearance_theme_shelf_pages_and_tint_slider_matches_background() {
         for mode in [0, 3] {
             let mut ui = Ui {
                 view: View::Settings,
@@ -10805,17 +10709,16 @@ mod tests {
             };
             let count = option_count(&small);
             assert!(count > 0);
-            let expand = small
+            let next = small
                 .buttons
                 .iter()
-                .find(|b| {
-                    matches!(
-                        b.action,
-                        Action::ToggleBool("expand_palettes" | "expand_themes")
-                    )
-                })
+                .find(|b| matches!(b.action, Action::ThemeShelf(1)))
                 .unwrap();
-            assert_eq!(expand.text, ui.t("See more"));
+            assert!(next.enabled);
+            assert!(!small
+                .buttons
+                .iter()
+                .any(|b| matches!(b.action, Action::ThemeShelf(-1))));
             assert_eq!(
                 small
                     .sliders
@@ -10830,12 +10733,36 @@ mod tests {
                     .any(|(_, key, _)| *key == "Background brightness"),
                 mode != 3
             );
-            ui.expanded_palettes = true;
-            ui.expanded_themes = true;
-            let large = build(&ui, (1200, 900), true, false, "", false, 50);
-            assert!(option_count(&large) > count);
-            assert!(large.content_height > small.content_height);
-            assert!(large.buttons.iter().any(|b| b.text == ui.t("See less")));
+            let mut seen = std::collections::HashSet::new();
+            for offset in (0..SOLID_THEMES.len() + 2).step_by(count) {
+                ui.theme_shelf_offset = offset;
+                let page = build(&ui, (1200, 900), true, false, "", false, 50);
+                assert_eq!(page.content_height, small.content_height);
+                for button in &page.buttons {
+                    match button.action {
+                        Action::SolidTheme(index) => {
+                            seen.insert(index);
+                        }
+                        Action::CustomTheme(light) => {
+                            seen.insert(SOLID_THEMES.len() + usize::from(light));
+                        }
+                        _ => {}
+                    }
+                }
+                assert_eq!(
+                    page.buttons
+                        .iter()
+                        .any(|b| matches!(b.action, Action::ThemeShelf(-1))),
+                    offset > 0
+                );
+                assert_eq!(
+                    page.buttons
+                        .iter()
+                        .any(|b| matches!(b.action, Action::ThemeShelf(1))),
+                    offset + count < SOLID_THEMES.len() + 2
+                );
+            }
+            assert_eq!(seen.len(), SOLID_THEMES.len() + 2);
         }
     }
     #[test]
@@ -11678,7 +11605,7 @@ mod spotify_scene_tests {
                     .buttons
                     .iter()
                     .any(|b| matches!(b.action, Action::Download)),
-                supports_downloads(&ui)
+                false
             );
             assert_eq!(
                 scene
@@ -11752,11 +11679,8 @@ mod spotify_scene_tests {
                     );
                 }
             }
-            assert!(scene.labels.iter().any(|label| label.text == "Streams"));
-            assert!(scene
-                .labels
-                .iter()
-                .any(|label| label.text == crate::catalog::format_count(12345)));
+            assert!(scene.labels.iter().any(|label| label.text == "Plays"));
+            assert!(scene.labels.iter().any(|label| label.text == "12,345"));
             for fake in ["2024", "1", "DEEZNATS", "88%", "120"] {
                 assert!(!scene.labels.iter().any(|label| label.text == fake));
             }

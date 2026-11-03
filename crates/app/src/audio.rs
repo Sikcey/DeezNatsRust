@@ -218,6 +218,24 @@ pub(crate) fn reordered_queue(
 }
 // The engine retains its selected WASAPI endpoint. Watch Windows on the audio
 // thread so changing the system default also moves an already playing stream.
+pub(crate) fn windows_default_output_id() -> Result<String, String> {
+    use windows::Win32::{
+        Media::Audio::{eMultimedia, eRender, IMMDeviceEnumerator, MMDeviceEnumerator},
+        System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL},
+    };
+    unsafe {
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|e| e.to_string())?;
+        let device = enumerator
+            .GetDefaultAudioEndpoint(eRender, eMultimedia)
+            .map_err(|e| e.to_string())?;
+        let id = device.GetId().map_err(|e| e.to_string())?;
+        let result = id.to_string().map_err(|e| e.to_string());
+        CoTaskMemFree(Some(id.0.cast()));
+        result
+    }
+}
+
 struct DefaultOutput {
     enumerator: Option<windows::Win32::Media::Audio::IMMDeviceEnumerator>,
     endpoint: Option<String>,
@@ -451,10 +469,8 @@ impl Worker {
                             if let Some(dz) = &engine {
                                 let _ = dz.invoke("DZPause", &[]);
                             }
-                        } else if let Some(service) = &spotify {
-                            let _ = service
-                                .handle()
-                                .control(&crate::spotify::soloist::Control::Pause);
+                        } else if snapshot.provider == crate::catalog::Provider::Spotify {
+                            drop(spotify.take());
                         }
                         snapshot = if provider == crate::catalog::Provider::Deezer {
                             deezer_snapshot.take().unwrap_or_default()

@@ -273,22 +273,39 @@ unsafe fn resize_surface(s: &mut Surface, width: i32, height: i32, caption: i32)
         bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET,
         ..Default::default()
     };
-    let size = D2D_SIZE_U { width: width as u32, height: height as u32 };
+    let size = D2D_SIZE_U {
+        width: width as u32,
+        height: height as u32,
+    };
     let backing = s.context.CreateBitmap(size, None, 0, &props)?;
-    let base = ID2D1RenderTarget::CreateBitmap(&s.context, size, None, 0, &D2D1_BITMAP_PROPERTIES {
-        pixelFormat: props.pixelFormat,
-        dpiX: 96.,
-        dpiY: 96.,
-    })?;
+    let base = ID2D1RenderTarget::CreateBitmap(
+        &s.context,
+        size,
+        None,
+        0,
+        &D2D1_BITMAP_PROPERTIES {
+            pixelFormat: props.pixelFormat,
+            dpiX: 96.,
+            dpiY: 96.,
+        },
+    )?;
     s.context.SetTarget(None::<&ID2D1Image>);
     s.output = backing.clone();
-    s.swap.ResizeBuffers(0, width as u32, height as u32, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(0))?;
+    s.swap.ResizeBuffers(
+        0,
+        width as u32,
+        height as u32,
+        DXGI_FORMAT_UNKNOWN,
+        DXGI_SWAP_CHAIN_FLAG(0),
+    )?;
     let buffer: IDXGISurface = s.swap.GetBuffer(0)?;
     let output_props = D2D1_BITMAP_PROPERTIES1 {
         bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
         ..props
     };
-    s.output = s.context.CreateBitmapFromDxgiSurface(&buffer, Some(&output_props))?;
+    s.output = s
+        .context
+        .CreateBitmapFromDxgiSurface(&buffer, Some(&output_props))?;
     s.backing = backing;
     s.base = base;
     s.width = width;
@@ -381,7 +398,10 @@ pub(crate) unsafe fn begin_with_region(
     SURFACE.with(|slot| {
         let mut slot = slot.borrow_mut();
         let hwnd = HWND(hwnd);
-        if slot.as_ref().is_some_and(|s| s.hwnd == hwnd && (s.width != width || s.height != height)) {
+        if slot
+            .as_ref()
+            .is_some_and(|s| s.hwnd == hwnd && (s.width != width || s.height != height))
+        {
             if dirty.is_some() {
                 return false;
             }

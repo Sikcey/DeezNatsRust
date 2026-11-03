@@ -18,7 +18,14 @@ foreach ($directory in $PreviousDirectories) {
 }
 Push-Location $project
 try {
-    & cargo @arguments
-    if ($LASTEXITCODE -ne 0) { throw 'Update package generation failed.' }
+    # Cargo writes normal build progress to stderr. Windows PowerShell can turn
+    # redirected stderr into error records; only Cargo's exit code means failure.
+    $previousErrorAction = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & cargo @arguments
+        $buildExit = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $previousErrorAction }
+    if ($buildExit -ne 0) { throw 'Update package generation failed.' }
 } finally { Pop-Location }
 Write-Output "Publish the manifest and referenced assets from $OutputDirectory alongside the installer and corresponding source archive."

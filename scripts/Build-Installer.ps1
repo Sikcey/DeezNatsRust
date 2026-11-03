@@ -32,7 +32,7 @@ function Add-SourceFile([string]$File, [string]$Name) {
 try {
     foreach ($directory in @('crates', 'assets', 'themes', 'scripts', 'installer', 'docs', 'vendor', 'patches')) {
         Get-ChildItem -LiteralPath (Join-Path $project $directory) -Recurse -File |
-            Where-Object { $_.FullName -notmatch '[\\/]__pycache__[\\/]' -and $_.Extension -notin @('.pyc', '.pyo') } | ForEach-Object {
+            Where-Object { $_.FullName -notmatch '[\\/](?:__pycache__|target|\.git|\.privateinfo|\.local)[\\/]' -and $_.Extension -notin @('.pyc', '.pyo') } | ForEach-Object {
             Add-SourceFile $_.FullName ('DeezNatsRust/' + $_.FullName.Substring($project.Length + 1))
         }
     }

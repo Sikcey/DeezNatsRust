@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.3
 
 - Fix the queue drag handle displaying a question mark instead of the grip icon.
 

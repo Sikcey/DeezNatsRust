@@ -1,12 +1,14 @@
 # DeezNats Rust
 
-A native Windows music client for Deezer, built with Rust, Win32 and a modified
-OpenDeezer audio engine. Unofficial; not affiliated with Deezer.
+A native Windows music client for Deezer, Spotify and YouTube Music, built with
+Rust and Win32. Deezer playback uses a modified OpenDeezer audio engine. This is
+an unofficial project and is not affiliated with those services.
 
 ## Features
 
 - Personalized home shelves, discovery, search, artist pages, albums and playlists.
-- Favorites, liked albums, podcasts, Flow and a playback queue.
+- Favorites, liked albums, podcasts, Flow and a playback queue. Upcoming queue
+  items can be reordered by dragging their grip icons.
 - Flow's **Style Mix** button starts with languages, checks Deezer for playable matching playlists, then shows the available genres. Pick a genre to build a mix such as Turkish Pop or Japanese Rock. Playlist labels guide the selection; individual tracks are not language-verified.
 - Synchronized lyrics, equalizer, ReplayGain, gapless and crossfade controls.
 - Background downloads with persistent pending jobs, automatic retries, cancellation and verified offline library entries.
@@ -18,7 +20,11 @@ OpenDeezer audio engine. Unofficial; not affiliated with Deezer.
   Settings > Keyboard shortcuts and reset individually to the media-key defaults.
 - In-app updates with binary delta downloads and restart-to-apply controls in
   Settings > General. Release update assets must be published to enable delivery.
-- Connect hosting with a browser client.
+- Connect hosting with a browser client and MP3 audio streaming. See
+  [Connect audio](docs/CONNECT-AUDIO.md) for provider-specific behavior.
+
+See [Spotify](docs/SPOTIFY.md) and [YouTube Music](docs/YOUTUBE-MUSIC.md) for
+account setup, supported features and provider limitations.
 
 Full playback and available quality depend on your account's entitlements.
 Saved sessions are encrypted for the current Windows user with DPAPI.

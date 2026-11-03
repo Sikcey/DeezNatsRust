@@ -3487,7 +3487,7 @@ fn queue_button(
         );
     }
     if draggable {
-        s.label_sized(rect.x + 5, rect.y + 20, 18, 24, "?", 1);
+        s.label_sized(rect.x + 5, rect.y + 20, 18, 24, "\u{22ee}\u{22ee}", 1);
     }
     // Artwork has its own bounds: button artwork fills the entire button.
     if !entry.artwork.is_empty() && rect.h >= 64 {
@@ -9466,7 +9466,7 @@ mod tests {
             ui.queue = (0..3).map(|i| crate::catalog::Entry { id: i.to_string(), kind: "track".into(), ..Default::default() }).collect();
             ui.now = ui.queue[0].clone();
             let scene = build(&ui, (1200, 800), true, false, "", false, 50);
-            assert_eq!(scene.labels.iter().filter(|label| label.text == "?").count(), 2);
+            assert_eq!(scene.labels.iter().filter(|label| label.text == "\u{22ee}\u{22ee}").count(), 2);
         }
     }
 

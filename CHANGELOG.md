@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Fix the queue drag handle displaying a question mark instead of the grip icon.
+
 ## 0.1.2
 
 - Add YouTube Music account, catalog and playback integration.

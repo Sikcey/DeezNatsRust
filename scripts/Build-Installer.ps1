@@ -32,7 +32,9 @@ function Add-SourceFile([string]$File, [string]$Name) {
 try {
     foreach ($directory in @('crates', 'assets', 'themes', 'scripts', 'installer', 'docs', 'vendor', 'patches')) {
         Get-ChildItem -LiteralPath (Join-Path $project $directory) -Recurse -File |
-            Where-Object { $_.FullName -notmatch '[\\/](?:__pycache__|target|\.git|\.privateinfo|\.local)[\\/]' -and $_.Extension -notin @('.pyc', '.pyo') } | ForEach-Object {
+            # The workspace lockfile is added below; dependency-local lockfiles
+            # and build caches are not inputs to this workspace build.
+            Where-Object { $_.FullName -notmatch '[\\/](?:__pycache__|target|\.git|\.privateinfo|\.local)[\\/]' -and $_.Name -ne 'Cargo.lock' -and $_.Extension -notin @('.pyc', '.pyo') } | ForEach-Object {
             Add-SourceFile $_.FullName ('DeezNatsRust/' + $_.FullName.Substring($project.Length + 1))
         }
     }

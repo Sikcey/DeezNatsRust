@@ -53,8 +53,8 @@ Upload retries repaint artwork rectangles on a separate frame timer, avoiding
 full-frame native search backdrop readbacks. Catalog thumbnails display fully
 opaque, so retained lists never freeze an arrival fade and thumbnail arrivals
 do not start unnecessary half-second animations. Playing/lyrics cover fades
-remain independent. Thumbnail cropping/downscaling adapts Sonora's routine
-(see NOTICE.md), including retaining small sources without CPU upscaling.
+remain independent. Thumbnail cropping/downscaling retains small sources without
+CPU upscaling.
 Set `DEEZNATS_SOFTWARE_RENDERING=1` before launch to compare with software
 rendering. Compare identical workloads to measure scrolling performance.
 Device failures discard the GPU surface, redraw through the software renderer,

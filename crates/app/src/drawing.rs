@@ -50,6 +50,17 @@ pub unsafe fn spotify_logo(dc: HDC, r: RECT) {
     }
     GdipDeletePen(pen);
 }
+pub unsafe fn youtube_logo(dc: HDC, r: RECT) {
+    let Some(g) = graphics(dc) else { return; };
+    let size = (r.right - r.left).min(r.bottom - r.top).max(0) as f32;
+    let x = r.left as f32 + ((r.right - r.left) as f32 - size) / 2.0;
+    let y = r.top as f32 + ((r.bottom - r.top) as f32 - size) / 2.0;
+    let mut brush = null_mut();
+    GdipCreateSolidFill(0xffff0033, &mut brush);
+    gpu_dispatch::GdipFillEllipse(g, brush.cast(), x, y, size, size);
+    gpu_dispatch::GdipDeleteBrush(brush.cast());
+    polygon(dc, &[(x + size * 0.40, y + size * 0.29), (x + size * 0.40, y + size * 0.71), (x + size * 0.71, y + size * 0.50)], 0xffffffff);
+}
 
 pub unsafe fn deezer_logo(dc: HDC, r: RECT) -> bool {
     let Some(g) = graphics(dc) else {

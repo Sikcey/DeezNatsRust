@@ -533,6 +533,15 @@ mod tests {
                 .unwrap();
             let frames = client.GetBufferSize().unwrap();
             let renderer: IAudioRenderClient = client.GetService().unwrap();
+            let volume: ISimpleAudioVolume = client.GetService().unwrap();
+            // Set each fixture explicitly: Windows can retain session volume
+            // from an earlier fixture process using the same executable.
+            let level = if std::env::var_os("DEEZNATS_CAPTURE_FIXTURE_MUTED").is_some() {
+                0.
+            } else {
+                1.
+            };
+            volume.SetMasterVolume(level, std::ptr::null()).unwrap();
             client.Start().unwrap();
             let start = Instant::now();
             let mut cursor = 0u64;
@@ -555,6 +564,52 @@ mod tests {
             }
             client.Stop().unwrap();
         }
+    }
+
+    #[test]
+    #[ignore = "opt-in: silent process capture test; requires a Windows audio endpoint"]
+    fn muted_render_session_produces_silent_process_capture() {
+        use std::os::windows::process::CommandExt;
+        let child = Child(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "connect::spotify_audio::tests::synthetic_renderer_child",
+                    "--nocapture",
+                ])
+                .env("DEEZNATS_CAPTURE_FIXTURE_HZ", "440")
+                .env("DEEZNATS_CAPTURE_FIXTURE_MUTED", "1")
+                .creation_flags(0x08000000)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let target = Arc::new(AudioTarget::from_child(&child.0).unwrap());
+        let mut capture = Capture::start(target).unwrap();
+        let mut pcm = Vec::new();
+        let mut peak = 0i32;
+        let mut captured_bytes = 0;
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(4) {
+            pcm.clear();
+            capture.read(&mut pcm).unwrap();
+            captured_bytes += pcm.len();
+            for sample in pcm.chunks_exact(2) {
+                peak = peak.max(i16::from_le_bytes([sample[0], sample[1]]) as i32);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // This documents the integration limit, not volume independence:
+        // process loopback cannot recover samples muted before its capture tap.
+        assert!(
+            captured_bytes > RATE as usize * FRAME_BYTES,
+            "capture did not run"
+        );
+        assert!(
+            peak < 10,
+            "muted process capture unexpectedly retained signal: peak={peak}"
+        );
     }
 
     #[test]

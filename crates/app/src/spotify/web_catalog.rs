@@ -415,6 +415,11 @@ fn browse_section(uri: &str, offset: u64, limit: u64) -> ResultValue {
 }
 
 fn recent() -> ResultValue {
+    if let Ok(value) = web::rest_get("https://api.spotify.com/v1/me/player/recently-played?limit=50") {
+        if let Some(items) = recent_tracks(&value) {
+            return Ok(json!({"items": items, "next": null}));
+        }
+    }
     let account = web::account()?;
     let user = account["id"]
         .as_str()
@@ -454,6 +459,16 @@ fn recent() -> ResultValue {
         }
     }
     Ok(json!({"items":items,"next":null}))
+}
+
+fn recent_tracks(value: &Value) -> Option<Vec<Value>> {
+    Some(value.get("items")?.as_array()?.iter().filter_map(|play| {
+        let mut track = play.get("track")?.as_object()?.clone();
+        if let Some(played_at) = play.get("played_at") {
+            track.insert("played_at".into(), played_at.clone());
+        }
+        Some(Value::Object(track))
+    }).collect())
 }
 fn page(op: &str, vars: Value, pointer: &str) -> ResultValue {
     let value = web::query(op, vars.clone())?;
@@ -1082,6 +1097,18 @@ pub(super) fn invoke(name: &str, args: &[Value]) -> Option<ResultValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recent_tracks_preserves_order_and_play_times() {
+        let value = json!({"items":[
+            {"track":{"uri":"spotify:track:first","name":"First"},"played_at":"2026-11-03T12:00:00Z"},
+            {"track":{"uri":"spotify:track:second","name":"Second"},"played_at":"2026-11-03T11:00:00Z"}
+        ]});
+        let tracks = recent_tracks(&value).unwrap();
+        assert_eq!(tracks[0]["name"], "First");
+        assert_eq!(tracks[0]["played_at"], "2026-11-03T12:00:00Z");
+        assert_eq!(tracks[1]["name"], "Second");
+        assert!(recent_tracks(&json!({"error": {}})).is_none());
+    }
     #[test]
     fn style_mix_playlist_matching_requires_both_country_and_genre() {
         let selected = crate::style_mix::Selection::new(0, 1).unwrap();

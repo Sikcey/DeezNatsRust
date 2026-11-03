@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Sonora Contributors.
-// Adapted from Sonora b525b2a, crates/ui/src/artwork.rs::artwork_frame.
-// https://github.com/sonorahq/sonora
 // Changes: return DynamicImage; borrow large crops; crop small covers too.
-// See assets/licenses/sonora-GPL-3.0.txt and NOTICE.md.
 use image::{imageops, DynamicImage};
 
 pub(super) fn cover(image: DynamicImage, edge: u32) -> DynamicImage {

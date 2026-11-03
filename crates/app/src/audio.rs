@@ -198,7 +198,7 @@ fn set_queue(dz: &Deezer, tracks: &[crate::catalog::Entry], index: usize) -> Res
     }
     Ok(())
 }
-fn reordered_queue(
+pub(crate) fn reordered_queue(
     tracks: &[crate::catalog::Entry],
     current: usize,
     from: usize,
@@ -388,6 +388,7 @@ impl Worker {
             let (account_tx, account_rx) =
                 mpsc::channel::<(u64, Result<serde_json::Value, String>)>();
             let mut account_epoch = 0u64;
+            let mut youtube = crate::youtube::Player::default();
             let mut deezer_snapshot: Option<Snapshot> = None;
 
             let mut failed_index: Option<usize> = None;
@@ -440,6 +441,7 @@ impl Worker {
                     spotify_remote.enable(false, account_epoch);
                     let provider = *provider;
                     if provider != snapshot.provider {
+                        youtube.suspend();
                         crate::spotify::remote::select_device(None);
                         spotify_pending = None;
                         spotify_queue = Default::default();
@@ -463,6 +465,9 @@ impl Worker {
                         snapshot.state = "Stopped".into();
                     }
                     provider.set_active();
+                    if provider == crate::catalog::Provider::YouTube {
+                        youtube.handle(&Command::LoginSaved, &mut snapshot);
+                    }
                     if provider == crate::catalog::Provider::Spotify {
                         snapshot.connected = false;
                         snapshot.account = serde_json::Value::Null;
@@ -484,6 +489,26 @@ impl Worker {
                             }
                         }
                     }
+                }
+                if snapshot.provider == crate::catalog::Provider::YouTube {
+                    if matches!(&command, Ok(Command::Quit)) {
+                        youtube.stop();
+                        break;
+                    }
+                    if let Ok(cmd) = &command {
+                        if let Command::Discord(value) = cmd {
+                            match discord.configure(value) {
+                                Ok(settings) => snapshot.discord_settings = settings,
+                                Err(e) => snapshot.message = e,
+                            }
+                        } else {
+                            youtube.handle(cmd, &mut snapshot);
+                        }
+                    }
+                    youtube.poll(&mut snapshot);
+                    discord.update(&snapshot);
+                    let _ = tx.try_send(snapshot.clone());
+                    continue;
                 }
                 if snapshot.provider == crate::catalog::Provider::Spotify {
                     if let Ok(Command::Discord(value)) = &command {

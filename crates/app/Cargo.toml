@@ -8,6 +8,9 @@ publish.workspace = true
 memory-profile = []
 diagnostics = ["memory-profile"]
 
+[target.'cfg(windows)'.dev-dependencies]
+symphonia = { version = "0.5.5", default-features = false, features = ["mp3"] }
+
 [dependencies]
 deeznats-core = { path = "../core" }
 deeznats-updater = { path = "../updater" }
@@ -17,6 +20,12 @@ winresource = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 libloading = "0.8"
+anyhow = "1"
+async-trait = "0.1"
+ytmusic = { git = "https://github.com/sonorahq/ytmusic-rs", rev = "a8fb6f5" }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+rodio = { version = "0.21", default-features = false, features = ["playback", "symphonia-aac", "symphonia-isomp4", "symphonia-mkv", "symphonia-vorbis"] }
+mp3lame-encoder = "0.2.5"
 unicode-segmentation = "1.12"
 windows-core = "0.62"
 windows-numerics = "0.3"

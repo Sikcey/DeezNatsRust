@@ -117,7 +117,7 @@ impl Engine {
     }
 }
 
-fn normalize_eq(args: &[serde_json::Value]) -> Result<serde_json::Value, String> {
+pub(crate) fn normalize_eq(args: &[serde_json::Value]) -> Result<serde_json::Value, String> {
     use serde_json::{json, Value};
     if args.len() != 1 {
         return Err("Equalizer update requires one JSON argument".into());

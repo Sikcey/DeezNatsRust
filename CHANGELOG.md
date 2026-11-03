@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.2
+
+- Add YouTube Music account, catalog and playback integration.
+- Add MP3 streaming and more efficient state and queue updates for Connect listeners.
+- Reuse the GPU device during window resizing and remove the debug paint FPS counter.
+- Improve catalog, artwork, playback and localization handling.
+
 ## 0.1.1
 
 - Render search and playlist text fields directly in the application canvas so text, selections and the caret remain visible under DirectComposition.

@@ -243,6 +243,8 @@ pub const GRADIENT_PRESETS: [(&str, u32, u32); 18] = [
 pub enum Action {
     SwitchProvider(crate::catalog::Provider),
     DeezerLogin,
+    YouTubeLogin,
+    YouTubeLogout,
     SpotifyLogin,
     OnboardingSelect(crate::catalog::Provider),
     OnboardingNext,
@@ -372,6 +374,7 @@ pub enum Action {
 
     DeezerLogo,
     SpotifyLogo,
+    YouTubeLogo,
 
     StreamingQuality(usize),
     EqMode(bool),
@@ -633,6 +636,7 @@ pub struct Ui {
     pub spotify_jam_busy: bool,
     pub spotify_jam_status: String,
     pub provider: crate::catalog::Provider,
+    pub last_provider: Option<crate::catalog::Provider>,
     pub spotify_catalog_busy: bool,
     pub spotify_credentials_refreshing: bool,
     pub spotify_catalog_status: String,
@@ -695,6 +699,7 @@ pub struct Ui {
     pub flow_id: String,
     pub deezer_flow_id: String,
     pub spotify_flow_id: String,
+    pub youtube_flow_id: String,
 
     pub flow_customizable: bool,
     pub flow_loaded: bool,
@@ -792,6 +797,7 @@ impl Default for Ui {
             spotify_jam_busy: false,
             spotify_jam_status: String::new(),
             provider: crate::catalog::Provider::Deezer,
+            last_provider: None,
             spotify_catalog_busy: false,
             spotify_credentials_refreshing: false,
             spotify_catalog_status: String::new(),
@@ -854,6 +860,7 @@ impl Default for Ui {
             flow_id: "default".into(),
             deezer_flow_id: "default".into(),
             spotify_flow_id: "default".into(),
+            youtube_flow_id: "default".into(),
 
             flow_customizable: false,
             flow_loaded: false,
@@ -960,9 +967,14 @@ impl Ui {
                 "default"
             })
             .to_owned();
+        self.youtube_flow_id = value["YouTubeFlowConfigId"]
+            .as_str()
+            .unwrap_or("default")
+            .to_owned();
         self.flow_id = match self.provider {
             crate::catalog::Provider::Deezer => self.deezer_flow_id.clone(),
             crate::catalog::Provider::Spotify => self.spotify_flow_id.clone(),
+            crate::catalog::Provider::YouTube => self.youtube_flow_id.clone(),
         };
     }
 
@@ -970,17 +982,32 @@ impl Ui {
         match self.provider {
             crate::catalog::Provider::Deezer => (&self.flow_id, &self.spotify_flow_id),
             crate::catalog::Provider::Spotify => (&self.deezer_flow_id, &self.flow_id),
+            crate::catalog::Provider::YouTube => (&self.deezer_flow_id, &self.spotify_flow_id),
         }
     }
 
+    fn write_flow_preferences(&self, value: &mut serde_json::Value) {
+        let (deezer, spotify) = self.flow_preferences();
+        value["FlowConfigId"] = serde_json::json!(deezer);
+        value["DeezerFlowConfigId"] = serde_json::json!(deezer);
+        value["SpotifyFlowConfigId"] = serde_json::json!(spotify);
+        value["YouTubeFlowConfigId"] =
+            serde_json::json!(if self.provider == crate::catalog::Provider::YouTube {
+                &self.flow_id
+            } else {
+                &self.youtube_flow_id
+            });
+    }
     pub fn switch_flow_provider(&mut self, provider: crate::catalog::Provider) {
         match self.provider {
             crate::catalog::Provider::Deezer => self.deezer_flow_id = self.flow_id.clone(),
             crate::catalog::Provider::Spotify => self.spotify_flow_id = self.flow_id.clone(),
+            crate::catalog::Provider::YouTube => self.youtube_flow_id = self.flow_id.clone(),
         }
         self.flow_id = match provider {
             crate::catalog::Provider::Deezer => self.deezer_flow_id.clone(),
             crate::catalog::Provider::Spotify => self.spotify_flow_id.clone(),
+            crate::catalog::Provider::YouTube => self.youtube_flow_id.clone(),
         };
         self.flow_filter.clear();
         self.flow_genre_limit = 30;
@@ -1182,6 +1209,7 @@ impl Ui {
         ui.adaptive_colors = false;
         ui.initial_volume =
             (value["Volume"].as_f64().unwrap_or(0.7).clamp(0.0, 1.0) * 100.0).round() as u32;
+        ui.last_provider = serde_json::from_value(value["LastProvider"].clone()).ok();
         ui.restore_flow_preferences(&value);
         ui.blur = value["BackgroundBlur"].as_u64().unwrap_or(30).min(100) as u32;
         ui.brightness = value["LightBrightness"].as_u64().unwrap_or(50).min(110) as u32;
@@ -1466,13 +1494,11 @@ impl Ui {
             let mut value = serde_json::json!({"Volume":self.initial_volume as f64/100.0,"Language":match self.value("Language"){1=>"tr",2=>"en",3=>"az",_=>""},"FlowConfigId":self.flow_id,"LightTheme":self.light,"BackgroundBlur":self.blur,"WindowBlur":self.window_blur,"UiBlur":self.ui_blur,"LightBrightness":self.brightness,"SurfaceOpacity":self.surface_opacity,"LightOpacity":self.light_opacity,"LightTint":hex(self.light_tint),"FixedBackgroundColor":hex(self.solid_color),"BackgroundMode":match self.background_mode{1=>2,2=>1,other=>other},"BackgroundFile":self.background_file,"DarkColors":encode(&self.dark_colors),"LightColors":encode(&self.light_colors),"CornerStyle":self.corner_style,"SolidTheme":self.solid_theme,"PlayerLayout":self.player_layout,"TransparentPlayer":self.transparent_player,"KaraokeLyrics":self.karaoke_lyrics,"BlurInactiveLyrics":self.blur_inactive_lyrics,"LyricsSizePanel":self.lyrics_size_panel,"LyricsSizeFullscreen":self.lyrics_size_fullscreen,"LyricsSources":self.lyrics_sources,"LyricsSourcesVersion":3,"VisualizerStyle":self.visualizer_style,"LyricsVisualizer":self.lyrics_visualizer,"SidebarCollapsed":self.sidebar_collapsed,"WindowControls":self.window_controls,"ControlsRight":self.controls_right,"TrafficLights":self.traffic_lights,"KeepPlayingOnClose":self.keep_playing_on_close,"ShowInTray":self.show_in_tray,"SmoothScrolling":self.smooth_scrolling,"ScrollAnimation":self.scroll_animation,"AudioQuality":self.value("Audio quality"),"DownloadQuality":self.value("Download quality"),"Preset":self.value("Preset"),"Equalizer":self.value("Equalizer"),"EQ":self.eq});
             value["BackgroundFps"] = serde_json::json!(self.value("Background FPS"));
             value["ShowOnStartup"] = serde_json::json!(self.value("Show on startup"));
-            let (deezer, spotify) = self.flow_preferences();
-            value["FlowConfigId"] = serde_json::json!(deezer);
-            value["CustomDarkColors"] = encode(&self.custom_dark_colors);
-            value["CustomLightColors"] = encode(&self.custom_light_colors);
-            value["DeezerFlowConfigId"] = serde_json::json!(deezer);
-            value["SpotifyFlowConfigId"] = serde_json::json!(spotify);
-            value["JamEnabled"] = serde_json::json!(false);
+            value["LastProvider"] = serde_json::json!(self.last_provider);
+            self.write_flow_preferences(&mut value);
+        value["CustomDarkColors"] = encode(&self.custom_dark_colors);
+        value["CustomLightColors"] = encode(&self.custom_light_colors);
+        value["JamEnabled"] = serde_json::json!(false);
             value["Autoplay"] = serde_json::json!(self.autoplay);
             value["AutoCheckUpdates"] = serde_json::json!(self.auto_updates);
             value["LastUpdateCheck"] = serde_json::json!(self.last_update_check);
@@ -1762,7 +1788,7 @@ fn settings_action_card(
     action: Action,
 ) -> i32 {
     let narrow = w < 600;
-    let icon_offset = if title == "Spotify library" { 56 } else { 0 };
+    let icon_offset = if matches!(title, "Spotify library" | "YouTube Music") { 56 } else { 0 };
     let text_w = if narrow {
         w - 32 - icon_offset
     } else {
@@ -1786,12 +1812,12 @@ fn settings_action_card(
             Rect::new(x + 16, y + 12, 40, 40),
             "",
             "",
-            Action::SpotifyLogo,
+            if title == "YouTube Music" { Action::YouTubeLogo } else { Action::SpotifyLogo },
             false,
         );
         if let Some(button) = scene.buttons.last_mut() {
             button.enabled = false;
-            button.accessible = "Spotify".into();
+            button.accessible = if title == "YouTube Music" { "YouTube Music" } else { "Spotify" }.into();
         }
     }
     let mut line_y = y + 10;
@@ -1818,13 +1844,14 @@ fn settings_action_card(
     y + h + 8
 }
 
-fn deezer_card(
+fn provider_card(
     scene: &mut Scene,
     ui: &Ui,
     x: i32,
     y: i32,
     w: i32,
     name: &str,
+    logo: Action,
     profile: Option<&str>,
     saved: bool,
     login: Action,
@@ -1847,7 +1874,7 @@ fn deezer_card(
         Rect::new(x + 16, y + 12, 52, 52),
         "",
         "",
-        Action::DeezerLogo,
+        logo.clone(),
         false,
     );
     if let Some(button) = scene.buttons.last_mut() {
@@ -1864,9 +1891,9 @@ fn deezer_card(
         y + (height - 34) / 2
     };
     let can_refresh = refresh.is_some();
-    {
+    if matches!(logo, Action::DeezerLogo) {
         scene.button(
-            Rect::new(x + w - 192, action_y, 34, 34),
+            Rect::new(x + (w - 192).max(0), action_y, 34, 34),
             "",
             "\u{e72c}",
             refresh.unwrap_or(Action::Notice("Sign in before refreshing this provider.")),
@@ -1972,54 +1999,29 @@ fn spotify_catalog_card(
     let active = ui.provider == crate::catalog::Provider::Spotify;
     let signed_in = active && connected && !ui.spotify_reset_failed;
     let name = crate::catalog::string(&ui.account, &["display_name", "name", "userName", "userId"]);
-    let status = if signed_in {
-        if name.is_empty() {
-            ui.t("Connected").into()
-        } else {
-            format!("{} {name}", ui.t("Connected as"))
-        }
-    } else if !ui.spotify_catalog_status.is_empty() && active {
-        ui.spotify_catalog_status.clone()
-    } else if crate::spotify::api_configured() && !ui.spotify_reset_failed {
-        ui.t("Sign-in data saved").into()
-    } else {
-        ui.t("Sign in to load your Spotify library and liked songs.")
-            .into()
-    };
-    let (label, action) = if !active {
-        (
-            if crate::spotify::api_configured() {
-                "Switch to Spotify"
-            } else {
-                "Log in to Spotify"
-            },
-            if crate::spotify::api_configured() {
-                Action::SwitchProvider(crate::catalog::Provider::Spotify)
-            } else {
-                Action::SpotifyLogin
-            },
-        )
+    let saved = crate::spotify::api_configured() && !ui.spotify_reset_failed;
+    let action = if !active && saved {
+        Action::SwitchProvider(crate::catalog::Provider::Spotify)
     } else if signed_in {
-        ("Log out", Action::SpotifyLogout)
+        Action::SpotifyLogout
     } else {
-        ("Log in", Action::SpotifyLogin)
+        Action::SpotifyLogin
     };
     let mut cy = y;
-    let start = scene.buttons.len();
-    cy = settings_action_card(
+    cy = provider_card(
         scene,
         ui,
         x,
         cy,
         w,
         "Spotify library",
-        &status,
-        label,
+        Action::SpotifyLogo,
+        signed_in.then_some(name.as_str()),
+        saved,
         action,
+        None,
+        ui.spotify_catalog_busy,
     );
-    for button in &mut scene.buttons[start..] {
-        button.enabled = !ui.spotify_catalog_busy;
-    }
     if active {
         let indent = 20.min((w / 10).max(0));
         cy = spotify_setup_card(scene, ui, x + indent, cy, (w - indent).max(1), signed_in);
@@ -2489,13 +2491,14 @@ fn settings(scene: &mut Scene, ui: &Ui, x: i32, y: i32, w: i32, connected: bool,
             if spotify_first {
                 cy = spotify_catalog_card(scene, ui, x, cy, w, connected) + 8;
             }
-            cy = deezer_card(
+            cy = provider_card(
                 scene,
                 ui,
                 x,
                 cy,
                 w,
                 "Deezer",
+                Action::DeezerLogo,
                 (connected && ui.provider == crate::catalog::Provider::Deezer)
                     .then_some(name.as_str()),
                 crate::session::deezer_saved_exists(),
@@ -2517,6 +2520,17 @@ fn settings(scene: &mut Scene, ui: &Ui, x: i32, y: i32, w: i32, connected: bool,
             if !spotify_first {
                 cy = spotify_catalog_card(scene, ui, x, cy + 8, w, connected);
             }
+            let active = ui.provider == crate::catalog::Provider::YouTube;
+            let saved = crate::session::provider_exists("youtube");
+            let action = if !active && saved {
+                Action::SwitchProvider(crate::catalog::Provider::YouTube)
+            } else if connected && saved {
+                Action::YouTubeLogout
+            } else {
+                Action::YouTubeLogin
+            };
+            cy = provider_card(scene, ui, x, cy + 8, w, "YouTube Music", Action::YouTubeLogo,
+                (active && connected && saved).then_some(name.as_str()), saved, action, None, busy);
             scene.content_height = cy + 40 + ui.scroll;
         }
         2 => {
@@ -2870,7 +2884,7 @@ fn settings(scene: &mut Scene, ui: &Ui, x: i32, y: i32, w: i32, connected: bool,
                 );
                 cy = field_pair(scene, ui, x, cy, w, "Crossfade (seconds)", "Sleep timer");
             }
-            if ui.provider == crate::catalog::Provider::Deezer {
+            if ui.provider != crate::catalog::Provider::Spotify {
                 cy = toggle_row(
                     scene,
                     ui,
@@ -2956,6 +2970,24 @@ fn settings(scene: &mut Scene, ui: &Ui, x: i32, y: i32, w: i32, connected: bool,
                 scene.eq_sliders = Some(Rect::new(x, cy, w, sliders_h));
                 scene.panel(x, cy, w, sliders_h, 13);
                 cy += sliders_h + 20;
+            } else if ui.provider == crate::catalog::Provider::YouTube {
+                for message in [
+                    "YouTube Music uses the Windows default output device when playback opens.",
+"Streams use the best audio format available to your account. Local volume and equalizer do not affect Connect listeners or visualizers. Crossfade and offline downloads are unavailable for this provider.",
+                ] {
+                    for line in wrap_text(ui.t(message), w, 14) {notice(scene, x, cy, w, &line); cy += 22;}
+                    cy += 8;
+                }
+scene.label(x, cy, 220, "EQUALIZER", 9);
+scene.button(Rect::new(x + w - 80, cy - 4, 80, 30), "Reset", "\u{e777}", Action::EqReset, false);
+cy += 36;
+cy = field_pair(scene, ui, x, cy, w, "Equalizer", "Preset");
+scene.eq_graph = Some(Rect::new(x, cy, w, 160));
+scene.panel(x, cy, w, 160, 7);
+cy += 176;
+scene.eq_sliders = Some(Rect::new(x, cy, w, 170));
+scene.panel(x, cy, w, 170, 13);
+cy += 190;
             } else {
                 for message in [
                     "Local Spotify playback follows the Windows default output. Audio reconnects automatically when the default device changes or reconnects. Windows per-app output overrides still apply.",
@@ -3134,6 +3166,7 @@ fn provider_name(ui: &Ui) -> &'static str {
     match ui.provider {
         crate::catalog::Provider::Deezer => "Deezer",
         crate::catalog::Provider::Spotify => "Spotify",
+        crate::catalog::Provider::YouTube => "YouTube Music",
     }
 }
 
@@ -3142,6 +3175,9 @@ fn supports_downloads(ui: &Ui) -> bool {
 }
 
 fn view_title(ui: &Ui, view: View) -> &'static str {
+    if ui.provider == crate::catalog::Provider::YouTube && view == View::Account {
+        return "Sign in to YouTube Music";
+    }
     if ui.provider == crate::catalog::Provider::Spotify {
         match view {
             View::Favorites => "Liked songs",
@@ -3439,6 +3475,7 @@ fn queue_button(
     index: usize,
     rect: Rect,
     current: bool,
+    draggable: bool,
 ) {
     let text_w = queue_text_width(entry, rect.w);
     s.button(rect, "", "", Action::QueueJump(index), current);
@@ -3448,6 +3485,9 @@ fn queue_button(
             if current { "Now playing" } else { "Play next" },
             queue_lines(entry, text_w).join(" ")
         );
+    }
+    if draggable {
+        s.label_sized(rect.x + 5, rect.y + 20, 18, 24, "?", 1);
     }
     // Artwork has its own bounds: button artwork fills the entire button.
     if !entry.artwork.is_empty() && rect.h >= 64 {
@@ -3576,7 +3616,7 @@ fn build_queue_sidebar_contents(s: &mut Scene, ui: &Ui, qx: i32, qw: i32, h: i32
         let end = (row_y + height - 6).min(viewport.y + viewport.h+144);
         if end > top {
             let rect = Rect::new(qx + 12, row_y, qw - 38, height - 6);
-            queue_button(s, entry, idx, rect, idx == cur);
+            queue_button(s, entry, idx, rect, idx == cur, idx > cur);
         }
         row_y += height;
     }
@@ -4385,11 +4425,16 @@ pub fn build(
 ) -> Scene {
     let (w, h) = viewport;
     let mut s = Scene::default();
-    if ui.provider == crate::catalog::Provider::Spotify && ui.spotify_credentials_refreshing {
+    if ui.spotify_credentials_refreshing {
         let width = (w - 64).clamp(1, 600);
         let left = (w - width) / 2;
         let top = (h / 2 - 35).max(30);
-        s.label(left, top, width, "Refreshing Spotify credentials...", 3);
+        let message = match ui.provider {
+            crate::catalog::Provider::YouTube => "Refreshing YouTube credentials...",
+            crate::catalog::Provider::Deezer => "Refreshing Deezer credentials...",
+            _ => "Refreshing Spotify credentials...",
+        };
+        s.label(left, top, width, message, 3);
         s.label(left, top + 42, width, "This may take a moment.", 1);
         translate_scene(&mut s, ui);
         return s;
@@ -4583,6 +4628,15 @@ pub fn build(
             2,
         );
         let caption = match ui.view {
+            View::Home if ui.provider == crate::catalog::Provider::YouTube => {
+                "Recommendations from YouTube Music"
+            }
+            View::Favorites if ui.provider == crate::catalog::Provider::YouTube => {
+                "Your liked songs on YouTube Music"
+            }
+            View::Playlists if ui.provider == crate::catalog::Provider::YouTube => {
+                "Your YouTube Music playlists"
+            }
             View::Home if ui.provider == crate::catalog::Provider::Spotify => {
                 "Personalized recommendations from Spotify"
             }
@@ -4625,22 +4679,20 @@ pub fn build(
         );
         match ui.view {
             View::Flow => {
-                {
-                    s.button(
-                        Rect::new(x + cw - 344, 114, 190, 36),
-                        "Customize Flow",
-                        "\u{e713}",
-                        Action::Go(View::FlowTune),
-                        false,
-                    );
-                    s.button(
-                        Rect::new(x + cw - 344, 158, 190, 36),
-                        "Style Mix",
-                        "\u{e8d6}",
-                        Action::Go(View::StyleMix),
-                        false,
-                    );
-                }
+                s.button(
+                    Rect::new(x + cw - 344, 114, 190, 36),
+                    "Customize Flow",
+                    "\u{e713}",
+                    Action::Go(View::FlowTune),
+                    false,
+                );
+                s.button(
+                    Rect::new(x + cw - 344, 158, 190, 36),
+                    "Style Mix",
+                    "\u{e8d6}",
+                    Action::Go(View::StyleMix),
+                    false,
+                );
                 s.button(
                     Rect::new(x + cw - 144, 114, 144, 36),
                     "Play this Flow",
@@ -4795,7 +4847,11 @@ pub fn build(
         if ui.view == View::Explore {
             let discover = ui.page.as_ref().is_some_and(|page| page.is_discover());
             let filters: &[&str] = if discover {
-                &["All", "Playlists", "Genres", "Moods", "Podcasts"]
+                if ui.provider == crate::catalog::Provider::YouTube {
+                    &["All", "Playlists", "Genres", "Moods"]
+                } else {
+                    &["All", "Playlists", "Genres", "Moods", "Podcasts"]
+                }
             } else {
                 &[
                     "All",
@@ -4848,6 +4904,32 @@ pub fn build(
         match ui.view {
             View::Settings => settings(&mut s, ui, x, 190, cw, connected, busy),
             View::TrackInfo => build_track_info(&mut s, ui, x, top, cw),
+            View::Account if ui.provider == crate::catalog::Provider::YouTube => {
+                s.label(
+                    x,
+                    top + 48,
+                    cw,
+                    "Sign in with your Google account to load your music library.",
+                    3,
+                );
+                s.button(
+                    Rect::new(x, top + 90, 200, 40),
+                    "Sign in to YouTube",
+                    "",
+                    Action::YouTubeLogin,
+                    true,
+                );
+                s.label(x, top + 152, cw, "Or paste the Cookie header from your signed-in music.youtube.com browser session.", 1);
+                s.session = Some(Rect::new(x, top + 186, cw.min(560), 34));
+                s.button(
+                    Rect::new(x, top + 234, 200, 38),
+                    "Connect with cookies",
+                    "",
+                    Action::Connect,
+                    true,
+                );
+                s.content_height = top + 300 + ui.scroll;
+            }
             View::Account if ui.provider == crate::catalog::Provider::Spotify => {
                 let cy = spotify_catalog_card(&mut s, ui, x, top, cw, connected);
                 s.content_height = cy + 40 + ui.scroll;
@@ -5003,7 +5085,7 @@ pub fn build(
                         display,
                         "",
                         Action::FlowChoice(index),
-                        if ui.provider == crate::catalog::Provider::Spotify {
+                        if ui.provider != crate::catalog::Provider::Deezer {
                             crate::spotify::flow::Selection::parse(&ui.flow_id)
                                 .is_ok_and(|selection| selection.mood == *id)
                         } else {
@@ -5015,7 +5097,7 @@ pub fn build(
                 if !ui.flow_options.is_empty() {
                     yy += 54;
                 }
-                if ui.provider == crate::catalog::Provider::Spotify {
+                if ui.provider != crate::catalog::Provider::Deezer {
                     s.label(x, yy, cw, "Search for more genres", 1);
                     yy += 24;
                 }
@@ -5033,7 +5115,7 @@ pub fn build(
                         .replace("{0}", &selected.to_string())
                         .replace(
                             "{1}",
-                            &if ui.provider == crate::catalog::Provider::Spotify {
+                            &if ui.provider != crate::catalog::Provider::Deezer {
                                 ui.genres
                                     .iter()
                                     .filter(|g| {
@@ -5058,7 +5140,7 @@ pub fn build(
                     .iter()
                     .enumerate()
                     .filter(|(_, g)| {
-                        if filter.is_empty() && ui.provider == crate::catalog::Provider::Spotify {
+                        if filter.is_empty() && ui.provider != crate::catalog::Provider::Deezer {
                             g.2 || crate::spotify::flow::BROWSE_GENRES
                                 .iter()
                                 .any(|name| name.eq_ignore_ascii_case(&g.1))
@@ -5067,7 +5149,7 @@ pub fn build(
                         }
                     })
                     .collect();
-                let limit = if ui.provider == crate::catalog::Provider::Spotify {
+                let limit = if ui.provider != crate::catalog::Provider::Deezer {
                     ui.flow_genre_limit
                 } else {
                     usize::MAX
@@ -5112,7 +5194,7 @@ pub fn build(
                 }
                 let mut genre_bottom = yy + ((shown as i32 + cols - 1) / cols) * 42;
                 if shown < visible.len()
-                    || (ui.provider == crate::catalog::Provider::Spotify
+                    || (ui.provider != crate::catalog::Provider::Deezer
                         && filter.is_empty()
                         && ui.flow_genre_limit > 30)
                 {
@@ -5130,7 +5212,7 @@ pub fn build(
                     genre_bottom += 44;
                 }
                 let custom = ui.flow_filter.trim();
-                if ui.provider == crate::catalog::Provider::Spotify
+                if ui.provider != crate::catalog::Provider::Deezer
                     && crate::spotify::flow::valid_genre(custom)
                     && !ui.genres.iter().any(|g| g.1.eq_ignore_ascii_case(custom))
                 {
@@ -5172,57 +5254,49 @@ pub fn build(
                 volume,
             ),
             View::PlaylistEdit => {
-                s.label(x, top, cw, "Playlist name", 0);
-                s.name = Some(Rect::new(x, top + 36, cw.min(540), 34));
-                s.label(x, top + 92, cw, "Description", 0);
-                s.description = Some(Rect::new(x, top + 128, cw.min(540), 84));
-                s.button(
-                    Rect::new(x + 190, top + 242, 150.min((cw - 190).max(1)), 38),
-                    "Clear description",
-                    "",
-                    Action::ClearPlaylistDescription,
-                    false,
-                );
-                s.button(
-                    Rect::new(x, top + 242, 180, 38),
-                    "Choose cover",
-                    "",
-                    Action::Go(View::CoverEdit),
-                    false,
-                );
-                s.button(
-                    Rect::new(x, top + 304, 160, 38),
-                    "Save playlist",
-                    "",
-                    Action::SavePlaylist,
-                    true,
-                );
-                if !ui.playlist_draft.id.is_empty() {
-                    s.button(
-                        Rect::new(x, top + 354, 160, 38),
-                        "Delete playlist",
-                        "",
-                        Action::DeletePlaylist,
-                        false,
-                    );
-                }
-                if ui.playlist_busy {
-                    s.label(x, top + 406, cw, "Saving playlist...", 1);
-                    for button in &mut s.buttons {
-                        if matches!(
-                            button.action,
-                            Action::SavePlaylist
-                                | Action::DeletePlaylist
-                                | Action::ClearPlaylistDescription
-                                | Action::Go(View::CoverEdit)
-                        ) {
-                            button.enabled = false;
-                        }
-                    }
-                }
-                s.content_height = top + 470 + ui.scroll;
+            let width = cw.clamp(1, 650);
+            let left = x + (cw - width) / 2;
+            let inset = 24.min((width / 12).max(4));
+            let inner = (width - inset * 2).max(1);
+            let stacked = inner < 430;
+            let cover = if stacked { inner.min(180) } else { (inner * 37 / 100).min(220) };
+            let fields_x = if stacked { left + inset } else { left + inset + cover + 20 };
+            let fields_y = if stacked { top + 68 + cover + 54 } else { top + 68 };
+            let fields_w = if stacked { inner } else { (inner - cover - 20).max(1) };
+            let cover_y = top + 68;
+            let controls_y = if stacked { fields_y + 210 } else { cover_y + cover + 62 };
+            let panel_height = controls_y - top + if ui.playlist_draft.id.is_empty() { 74 } else { 124 };
+            s.panel(left, top, width, panel_height, 8);
+            s.label(left + inset, top + 18, (inner - 45).max(1), "Edit playlist", 3);
+            s.button(Rect::new(left + width - inset - 36, top + 14, 36, 36), "", "\u{e711}", Action::Back, false);
+            if let Some(button) = s.buttons.last_mut() { button.accessible = "Close".into(); }
+            s.panel(left + inset, cover_y, cover, cover, 2);
+            if !ui.playlist_draft.preview.is_empty() {
+                s.pictures.push((Rect::new(left + inset, cover_y, cover, cover), ui.playlist_draft.preview.clone()));
             }
-            View::CoverEdit => {
+            if ui.provider != crate::catalog::Provider::YouTube {
+                s.button(Rect::new(left + inset, cover_y + cover + 8, cover, 36), "Choose cover", "\u{e70f}", Action::Go(View::CoverEdit), false);
+            } else {
+                s.label(left + inset, cover_y + cover + 8, cover, "Cover editing unavailable", 1);
+            }
+            s.label(fields_x, fields_y, fields_w, "Playlist name", 1);
+            s.name = Some(Rect::new(fields_x, fields_y + 25, fields_w, 40));
+            s.label(fields_x, fields_y + 79, fields_w, "Description", 1);
+            s.description = Some(Rect::new(fields_x, fields_y + 104, fields_w, 106));
+            let save_width = inner.min(150);
+            s.button(Rect::new(left + width - inset - save_width, controls_y, save_width, 42), "Save", "", Action::SavePlaylist, true);
+            if !ui.playlist_draft.id.is_empty() {
+                s.button(Rect::new(left + inset, controls_y + 54, inner.min(170), 38), "Delete playlist", "", Action::DeletePlaylist, false);
+            }
+            if ui.playlist_busy {
+                s.label(left + inset, controls_y + 10, (inner - save_width - 12).max(1), "Saving playlist...", 1);
+                for button in &mut s.buttons {
+                    if matches!(button.action, Action::SavePlaylist | Action::DeletePlaylist | Action::Go(View::CoverEdit) | Action::Back) { button.enabled = false; }
+                }
+            }
+            s.content_height = top + panel_height + 24 + ui.scroll;
+        }
+        View::CoverEdit => {
                 s.label(x, top, cw, "Playlist cover", 3);
                 let side = cw.min(240);
                 s.panel(x, top + 54, side, side, 2);
@@ -5412,6 +5486,15 @@ pub fn build(
                         format!("Sign in to load your {} library.", provider_name(ui)),
                         1,
                     );
+                    if ui.provider == crate::catalog::Provider::YouTube {
+                        s.button(
+                            Rect::new(x, top + 40, 200.min(cw), 40),
+                            "Sign in to YouTube",
+                            "",
+                            Action::YouTubeLogin,
+                            false,
+                        );
+                    }
                 }
             }
         }
@@ -5540,7 +5623,7 @@ fn login_modal(s: &mut Scene, rect: Rect, title: &str, close: Action) {
 fn build_onboarding(s: &mut Scene, ui: &Ui, w: i32, h: i32) {
     use crate::catalog::Provider;
     let width = (w - 40).clamp(1, 420);
-    let height = (h - 40).clamp(1, 320);
+    let height = (h - 40).clamp(1, 376);
     let rect = Rect::new((w - width) / 2, (h - height) / 2, width, height);
     s.auth_modal = Some((rect, s.labels.len(), s.buttons.len()));
     s.search = None;
@@ -5565,9 +5648,13 @@ fn build_onboarding(s: &mut Scene, ui: &Ui, w: i32, h: i32) {
         "Choose a music provider to get started.",
         1,
     );
-    for (index, (name, provider)) in [("Deezer", Provider::Deezer), ("Spotify", Provider::Spotify)]
-        .into_iter()
-        .enumerate()
+    for (index, (name, provider)) in [
+        ("Deezer", Provider::Deezer),
+        ("Spotify", Provider::Spotify),
+        ("YouTube Music", Provider::YouTube),
+    ]
+    .into_iter()
+    .enumerate()
     {
         s.button(
             Rect::new(
@@ -6022,6 +6109,36 @@ fn build_device_menu(s: &mut Scene, ui: &Ui, w: i32, h: i32, _playing: bool) {
 #[cfg(test)]
 mod device_menu_scene_tests {
     use super::*;
+    #[test]
+    fn youtube_flow_selection_survives_switch_and_restart() {
+        use crate::catalog::Provider;
+        let key = crate::spotify::flow::Selection {
+            mood: "focus".into(),
+            genres: vec!["Jazz".into(), "Ambient".into()],
+        }
+        .key();
+        let mut ui = Ui {
+            provider: Provider::YouTube,
+            flow_id: key.clone(),
+            ..Default::default()
+        };
+        ui.switch_flow_provider(Provider::Spotify);
+        ui.provider = Provider::Spotify;
+        assert_eq!(ui.flow_id, "default");
+        ui.flow_id = "party".into();
+        ui.switch_flow_provider(Provider::YouTube);
+        ui.provider = Provider::YouTube;
+        assert_eq!(ui.flow_id, key);
+        let mut restored = Ui {
+            provider: Provider::YouTube,
+            ..Default::default()
+        };
+        let mut preferences = serde_json::json!({});
+        ui.write_flow_preferences(&mut preferences);
+        restored.restore_flow_preferences(&preferences);
+        assert_eq!(restored.flow_id, key);
+        assert_eq!(restored.spotify_flow_id, "party");
+    }
     #[test]
     fn turkish_sidebar_labels_preserve_unicode_and_translate_jam_actions() {
         let mut ui = Ui {
@@ -6785,6 +6902,22 @@ fn live_catalog(
 }
 fn live_catalog_contents(s:&mut Scene,ui:&Ui,page:&crate::catalog::Page,x:i32,top:i32,cw:i32,h:i32) {
     let mut y = top;
+    if ui.view == View::Artist && ui.provider == crate::catalog::Provider::YouTube && !page.subtitle.is_empty() {
+        let lines = wrap_text(&plain_description(&page.subtitle), cw, 14);
+        let artist_id = page.entity.as_ref().map(|entry| entry.id.as_str()).unwrap_or("");
+        let expanded = ui.expanded_podcast_description.as_deref() == Some(artist_id);
+        for line in lines.iter().take(if expanded { lines.len() } else { 3 }) {
+            s.label(x, y, cw, line, 1);
+            y += 22;
+        }
+        if lines.len() > 3 && !artist_id.is_empty() {
+            let label = if expanded { "Read less" } else { "Read more" };
+            s.button(Rect::new(x, y, cw.min(180), 24), label, "", Action::TogglePodcastDescription(artist_id.to_owned()), false);
+            if let Some(button) = s.buttons.last_mut() { button.text_link = true; }
+            y += 32;
+        }
+        y += 18;
+    }
     if let Some(show) = page.entity.as_ref().filter(|entry| entry.kind == "podcast") {
         let description = plain_description(show.raw["description"].as_str().unwrap_or_default());
         let lines = wrap_text(&description, cw, 14);
@@ -7130,6 +7263,9 @@ fn live_catalog_contents(s:&mut Scene,ui:&Ui,page:&crate::catalog::Page,x:i32,to
             .entries
             .iter()
             .filter(|e| {
+                if ui.provider == crate::catalog::Provider::YouTube && discover && ui.filter == 1 {
+                    return e.kind == "playlist";
+                }
                 ui.view != View::Explore
                     || discover
                     || ui.filter == 0
@@ -7220,7 +7356,7 @@ fn live_catalog_contents(s:&mut Scene,ui:&Ui,page:&crate::catalog::Page,x:i32,to
                     staged_cols,
                     page.loading,
                 );
-            } else if tiles_have_more {
+            } else if tiles_have_more || (!staged && discover && ui.filter == 0 && ui.provider == crate::catalog::Provider::YouTube && section.title == "Categories") {
                 discover_show_all(s, ui, x, &mut y, cw, &section.title);
             }
             continue;
@@ -7388,19 +7524,15 @@ fn live_catalog_contents(s:&mut Scene,ui:&Ui,page:&crate::catalog::Page,x:i32,to
             y + 40,
             cw,
             if ui.view == View::Podcasts && !supports_downloads(ui) {
-                ui.t("Your saved podcasts and episodes appear here.")
+                ui.t("Your saved podcasts and episodes appear here.").to_owned()
             } else if ui.view == View::Podcasts {
-                ui.t("Your saved podcasts, favorites and downloaded episodes appear here.")
+                ui.t("Your saved podcasts, favorites and downloaded episodes appear here.").to_owned()
             } else if ui.view == View::StyleMix {
-                ui.t("No playable tracks found in matching playlists. Try another language or genre.")
+                ui.t("No playable tracks found in matching playlists. Try another language or genre.").to_owned()
             } else if ui.view == View::Offline {
-                "Downloaded tracks will appear here."
+                "Downloaded tracks will appear here.".to_owned()
             } else {
-                if ui.provider == crate::catalog::Provider::Spotify {
-                    "No items were returned by Spotify."
-                } else {
-                    "No items were returned by Deezer."
-                }
+                format!("No items were returned by {}.", ui.provider.label())
             },
             1,
         );
@@ -8031,6 +8163,20 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(preferences_base().unwrap());
+    }
+
+    #[test]
+    fn empty_results_message_localizes_each_provider() {
+        let mut ui = Ui::default();
+        for (language, expected) in [("tr", "üzerinden sonuç gelmedi"), ("az", "vasitəsilə nəticə gəlmədi")] {
+            ui.set_language(language);
+            for provider in [crate::catalog::Provider::Deezer, crate::catalog::Provider::Spotify, crate::catalog::Provider::YouTube] {
+                let text = format!("No items were returned by {}.", provider.label());
+                let translated = ui.translated_text(&text);
+                assert!(translated.contains(provider.label()));
+                assert!(translated.contains(expected));
+            }
+        }
     }
 
     #[test]
@@ -8728,116 +8874,121 @@ mod tests {
         assert_eq!(restored.flow_preferences(), ("happy", spotify.as_str()));
     }
     #[test]
-    fn spotify_flow_restores_mood_and_offers_see_more() {
-        let selection = crate::spotify::flow::Selection {
-            mood: "chill".into(),
-            genres: vec!["Jazz".into()],
-        };
-        let mut ui = Ui {
-            provider: crate::catalog::Provider::Spotify,
-            view: View::FlowTune,
-            flow_id: selection.key(),
-            flow_loaded: true,
-            flow_customizable: true,
-            flow_options: crate::spotify::flow::MOODS
-                .iter()
-                .map(|(id, title)| (id.to_string(), title.to_string()))
-                .collect(),
-            genres: crate::spotify::flow::genres()
-                .iter()
-                .map(|g| (g.to_string(), g.to_string(), *g == "Jazz", *g == "Jazz"))
-                .collect(),
-            ..Default::default()
-        };
-        let scene = build(&ui, (1043, 674), true, false, "", false, 40);
-        assert!(scene
-            .buttons
-            .iter()
-            .any(|b| matches!(b.action, Action::FlowChoice(1)) && b.selected));
-        assert!(scene.genre_viewport.unwrap().h >= 42);
-        assert!(scene
-            .labels
-            .iter()
-            .any(|label| label.text == "Search for more genres"));
-        assert_eq!(
-            scene
-                .buttons
-                .iter()
-                .filter(|b| matches!(b.action, Action::Genre(_)))
-                .count(),
-            30
-        );
-        assert!(scene
-            .buttons
-            .iter()
-            .any(|b| matches!(b.action, Action::FlowMoreGenres)));
-        ui.flow_genre_limit = crate::spotify::flow::BROWSE_GENRES.len();
-        let expanded = build(&ui, (1043, 674), true, false, "", false, 40);
-        assert!(
-            expanded
-                .buttons
-                .iter()
-                .filter(|b| matches!(b.action, Action::Genre(_)))
-                .count()
-                < 60
-        );
-        assert!(!expanded
-            .buttons
-            .iter()
-            .any(|b| matches!(b.action, Action::Genre(_)) && b.text == "melodic death metal"));
-        assert!(expanded
-            .buttons
-            .iter()
-            .any(|b| matches!(b.action, Action::FlowMoreGenres) && b.text == "See less"));
-        ui.flow_filter = "arabesk".into();
-        let searched = build(&ui, (1043, 674), true, false, "", false, 40);
-        assert!(searched.buttons.iter().any(
-            |b| matches!(b.action, Action::Genre(_)) && b.text.eq_ignore_ascii_case("arabesk")
-        ));
-        ui.flow_filter = "My emerging subgenre".into();
-        let custom = build(&ui, (1043, 674), true, false, "", false, 40);
-        assert!(custom
-            .buttons
-            .iter()
-            .any(|b| matches!(b.action, Action::FlowAddGenre)));
-        ui.flow_filter.clear();
-        ui.flow_genre_limit = 30;
-        ui.genres
-            .iter_mut()
-            .find(|g| g.1 == "melodic death metal")
-            .unwrap()
-            .2 = true;
-        let collapsed = build(&ui, (1043, 674), true, false, "", false, 40);
-        assert!(collapsed
-            .buttons
-            .iter()
-            .any(|b| matches!(b.action, Action::Genre(_))
-                && b.text == "melodic death metal"
-                && b.selected));
-        assert_eq!(
-            collapsed
-                .buttons
-                .iter()
-                .filter(|b| matches!(b.action, Action::Genre(_)))
-                .count(),
-            31
-        );
-        ui.view = View::Flow;
-        ui.page = Some(std::sync::Arc::new(crate::catalog::Page {
-            rows: vec![crate::catalog::Entry {
-                id: "spotify:track:test".into(),
-                kind: "track".into(),
-                title: "Test".into(),
+    fn playlist_flow_restores_mood_and_offers_see_more() {
+        for provider in [
+            crate::catalog::Provider::Spotify,
+            crate::catalog::Provider::YouTube,
+        ] {
+            let selection = crate::spotify::flow::Selection {
+                mood: "chill".into(),
+                genres: vec!["Jazz".into()],
+            };
+            let mut ui = Ui {
+                provider,
+                view: View::FlowTune,
+                flow_id: selection.key(),
+                flow_loaded: true,
+                flow_customizable: true,
+                flow_options: crate::spotify::flow::MOODS
+                    .iter()
+                    .map(|(id, title)| (id.to_string(), title.to_string()))
+                    .collect(),
+                genres: crate::spotify::flow::genres()
+                    .iter()
+                    .map(|g| (g.to_string(), g.to_string(), *g == "Jazz", *g == "Jazz"))
+                    .collect(),
                 ..Default::default()
-            }],
-            next: "spotify-flow-page:test".into(),
-            ..Default::default()
-        }));
-        let scene = build(&ui, (1043, 674), true, false, "", false, 40);
-        assert!(scene
-            .buttons
-            .iter()
-            .any(|b| matches!(b.action, Action::More) && b.text == "See more"));
+            };
+            let scene = build(&ui, (1043, 674), true, false, "", false, 40);
+            assert!(scene
+                .buttons
+                .iter()
+                .any(|b| matches!(b.action, Action::FlowChoice(1)) && b.selected));
+            assert!(scene.genre_viewport.unwrap().h >= 42);
+            assert!(scene
+                .labels
+                .iter()
+                .any(|label| label.text == "Search for more genres"));
+            assert_eq!(
+                scene
+                    .buttons
+                    .iter()
+                    .filter(|b| matches!(b.action, Action::Genre(_)))
+                    .count(),
+                30
+            );
+            assert!(scene
+                .buttons
+                .iter()
+                .any(|b| matches!(b.action, Action::FlowMoreGenres)));
+            ui.flow_genre_limit = crate::spotify::flow::BROWSE_GENRES.len();
+            let expanded = build(&ui, (1043, 674), true, false, "", false, 40);
+            assert!(
+                expanded
+                    .buttons
+                    .iter()
+                    .filter(|b| matches!(b.action, Action::Genre(_)))
+                    .count()
+                    < 60
+            );
+            assert!(!expanded
+                .buttons
+                .iter()
+                .any(|b| matches!(b.action, Action::Genre(_)) && b.text == "melodic death metal"));
+            assert!(expanded
+                .buttons
+                .iter()
+                .any(|b| matches!(b.action, Action::FlowMoreGenres) && b.text == "See less"));
+            ui.flow_filter = "arabesk".into();
+            let searched = build(&ui, (1043, 674), true, false, "", false, 40);
+            assert!(searched.buttons.iter().any(
+                |b| matches!(b.action, Action::Genre(_)) && b.text.eq_ignore_ascii_case("arabesk")
+            ));
+            ui.flow_filter = "My emerging subgenre".into();
+            let custom = build(&ui, (1043, 674), true, false, "", false, 40);
+            assert!(custom
+                .buttons
+                .iter()
+                .any(|b| matches!(b.action, Action::FlowAddGenre)));
+            ui.flow_filter.clear();
+            ui.flow_genre_limit = 30;
+            ui.genres
+                .iter_mut()
+                .find(|g| g.1 == "melodic death metal")
+                .unwrap()
+                .2 = true;
+            let collapsed = build(&ui, (1043, 674), true, false, "", false, 40);
+            assert!(collapsed
+                .buttons
+                .iter()
+                .any(|b| matches!(b.action, Action::Genre(_))
+                    && b.text == "melodic death metal"
+                    && b.selected));
+            assert_eq!(
+                collapsed
+                    .buttons
+                    .iter()
+                    .filter(|b| matches!(b.action, Action::Genre(_)))
+                    .count(),
+                31
+            );
+            ui.view = View::Flow;
+            ui.page = Some(std::sync::Arc::new(crate::catalog::Page {
+                rows: vec![crate::catalog::Entry {
+                    id: "spotify:track:test".into(),
+                    kind: "track".into(),
+                    title: "Test".into(),
+                    ..Default::default()
+                }],
+                next: "spotify-flow-page:test".into(),
+                ..Default::default()
+            }));
+            let scene = build(&ui, (1043, 674), true, false, "", false, 40);
+            assert!(scene
+                .buttons
+                .iter()
+                .any(|b| matches!(b.action, Action::More) && b.text == "See more"));
+        }
     }
     #[test]
     fn entity_header_has_one_title_and_stays_outside_the_scrolling_rows() {
@@ -9309,6 +9460,17 @@ mod tests {
         }
     }
     #[test]
+    fn queue_drag_handles_appear_only_on_upcoming_rows_for_each_provider() {
+        for provider in [crate::catalog::Provider::Deezer, crate::catalog::Provider::Spotify, crate::catalog::Provider::YouTube] {
+            let mut ui = Ui { provider, queue_sidebar_open: true, ..Default::default() };
+            ui.queue = (0..3).map(|i| crate::catalog::Entry { id: i.to_string(), kind: "track".into(), ..Default::default() }).collect();
+            ui.now = ui.queue[0].clone();
+            let scene = build(&ui, (1200, 800), true, false, "", false, 50);
+            assert_eq!(scene.labels.iter().filter(|label| label.text == "?").count(), 2);
+        }
+    }
+
+    #[test]
     fn queue_scroll_reaches_last_track_without_moving_main_page() {
         let mut ui = Ui {
             queue_sidebar_open: true,
@@ -9561,6 +9723,21 @@ mod tests {
             .iter()
             .any(|l| l.text == "Similar artists" || l.text == "Benzer sanatçýlar"));
     }
+    #[test]
+    fn playlist_editor_layout_keeps_fields_and_save_separate() {
+        let mut ui = Ui::default();
+        ui.view = View::PlaylistEdit;
+        for width in [700, 1200] {
+            let scene = build(&ui, (width, 1000), true, false, "", false, 80);
+            let name = scene.name.unwrap();
+            let description = scene.description.unwrap();
+            let save = scene.buttons.iter().find(|button| matches!(button.action, Action::SavePlaylist)).unwrap();
+            assert!(name.y + name.h <= description.y);
+            assert!(description.y + description.h <= save.rect.y);
+            assert!(scene.buttons.iter().any(|button| matches!(button.action, Action::Go(View::CoverEdit))));
+        }
+    }
+
     #[test]
     fn track_info_view_renders_details() {
         let mut ui = Ui::default();

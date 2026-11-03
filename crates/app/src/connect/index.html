@@ -1659,6 +1659,8 @@ function showLyricsError(message) {
     let browserClock = null;
     let stateRequestPending = false;
     let renderedQueueKey = null;
+    let queueSnapshot = null;
+    let queueRequestPending = false;
     function hostPlaybackPosition() {
       return Math.min(curDuration || Infinity,curPosition+(isPlaying?performance.now()-lastTick:0));
     }
@@ -1704,6 +1706,7 @@ function showLyricsError(message) {
     let streamStartedAt=0;
     let streamProgressAt=0;
     let streamLastMediaTime=0;
+    let lastStreamError=null;
     const mobileAudio=window.matchMedia('(pointer: coarse)').matches;
     function scheduleSeekStreamRecovery(){
       if(!streamWanted)return;
@@ -1716,8 +1719,26 @@ function showLyricsError(message) {
       if(duration>0 && expected>=duration-1500 && position<1500)return false;
       return Math.abs(position-expected)>2000;
     }
+    function streamSourceChanged(previous,data){
+      if(!previous || !previous.connected || !data.connected)return false;
+      const paused=state=>String(state).toLowerCase()==='paused';
+      return previous.provider!==data.provider || previous.id!==data.id || paused(previous.state)!==paused(data.state);
+    }
+    function trimLiveAudioLag(){
+      if(!streamWanted || liveAudio.paused || !liveAudio.buffered?.length || !liveAudio.seekable?.length)return false;
+      const end=liveAudio.buffered.end(liveAudio.buffered.length-1);
+      if(end-liveAudio.currentTime<=5)return false;
+      const target=end-2;
+      for(let i=0;i<liveAudio.seekable.length;i++){
+        if(target>=liveAudio.seekable.start(i) && target<=liveAudio.seekable.end(i)){
+          try { liveAudio.currentTime=target;browserClock=null;return true; } catch(error) {return false;}
+        }
+      }
+      return false;
+    }
     setInterval(()=>{
       if(!streamWanted||streamSeekTimer!==null||streamRetry!==null)return;
+      trimLiveAudioLag();
       const now=performance.now();
       if(Math.abs(liveAudio.currentTime-streamLastMediaTime)>.05){streamLastMediaTime=liveAudio.currentTime;streamProgressAt=now;return;}
       if(now-streamStartedAt>6000 && now-streamProgressAt>3000)retryLiveAudio();
@@ -1761,6 +1782,7 @@ function showLyricsError(message) {
 
     function startLiveAudio(quiet=false,recovery=false) {
       prepareWaveAudio();
+      if(!quiet)lastStreamError=null;
       streamWanted = true; browserClock=null;
       clearTimeout(streamRetry); streamRetry = null;
       clearTimeout(streamSeekTimer);streamSeekTimer=null;
@@ -1770,7 +1792,7 @@ function showLyricsError(message) {
       document.getElementById("header-stream-label").innerText = quiet?"Buffering...":"Connecting...";
       liveAudio.pause();liveAudio.removeAttribute('src');liveAudio.load();
       const bufferMs=mobileAudio?(recovery?1500:1200):(recovery?1000:750);
-      liveAudio.src = "/api/stream?buffer_ms="+bufferMs+"&t=" + Date.now();
+      liveAudio.src = "/api/stream?format=mp3&buffer_ms="+bufferMs+"&t=" + Date.now();
       applyListeningVolume();
       const playPromise = liveAudio.play();
       if (playPromise !== undefined) {
@@ -2047,21 +2069,46 @@ function showLyricsError(message) {
     setInterval(updateProgress, 250);
 
     // State Polling
+    async function refreshQueue(data){
+      if(queueSnapshot?.provider===data.provider && queueSnapshot.queue_revision===data.queue_revision){
+        const key=JSON.stringify([data.provider,data.queue_revision,data.queue_index]);
+        if(key!==renderedQueueKey){renderQueue(queueSnapshot.queue,data.queue_index);renderedQueueKey=key;}
+        return;
+      }
+      if(queueRequestPending)return;
+      queueRequestPending=true;
+      try {
+        const response=await fetch('/api/queue',{cache:'no-store'});
+        if(!response.ok)return;
+        const next=await response.json();
+        // A slow response must not overwrite a newer queue/provider.
+        if(next.provider!==currentState?.provider || next.queue_revision!==currentState?.queue_revision)return;
+        queueSnapshot=next;
+        const key=JSON.stringify([next.provider,next.queue_revision,currentState.queue_index]);
+        renderQueue(next.queue,currentState.queue_index);renderedQueueKey=key;
+      } catch(error) {console.error(error);} finally {queueRequestPending=false;}
+    }
     async function fetchState() {
       if(stateRequestPending) return;
       stateRequestPending=true;
+      const controller=new AbortController();
+      const requestTimeout=setTimeout(()=>controller.abort(),4000);
       const requestedAt=performance.now();
       try {
-        const res = await fetch("/api/state");
+        const res = await fetch("/api/state?queue=0",{cache:'no-store',signal:controller.signal});
         if (!res.ok) return;
         const data = await res.json();
         const seekJump=streamStateJump(currentState,data,hostPlaybackPosition());
+        const sourceChanged=streamSourceChanged(currentState,data);
         currentState = data;
         const streamButton = document.getElementById('header-stream-btn');
         streamButton.disabled = data.stream_available === false;
-        streamButton.title = data.stream_available === false ? 'Live listening is unavailable for the selected host provider' : 'Listen live';
+        streamButton.title = data.stream_error || (data.stream_available === false ? 'Live listening is unavailable for the selected host provider' : 'Listen live');
+        if(streamWanted && data.stream_error && data.stream_error !== lastStreamError){lastStreamError=data.stream_error;showToast(data.stream_error)}
+        if(!data.stream_error)lastStreamError=null;
         if (data.stream_available === false && streamWanted) stopLiveAudio();
-        if(seekJump)scheduleSeekStreamRecovery();
+        if(streamWanted && sourceChanged)startLiveAudio(true,false);
+        else if(seekJump)scheduleSeekStreamRecovery();
         updatePlaybackModes(data);
         JamUI.songChanged(data);
         if (document.getElementById('view-lyrics').classList.contains('active')) loadLyrics();
@@ -2082,11 +2129,11 @@ function showLyricsError(message) {
         const icon = isPlaying ? "⏸" : "▶";
         document.getElementById("mini-play").innerText = icon;
 
-        const queueKey=JSON.stringify([data.queue,data.queue_index]);
-        if(queueKey!==renderedQueueKey) {renderQueue(data.queue,data.queue_index);renderedQueueKey=queueKey;}
+        // Queue downloads must never hold up playback state or labels.
+        void refreshQueue(data);
       } catch (e) {
         console.error(e);
-      } finally { stateRequestPending=false; }
+      } finally { clearTimeout(requestTimeout);stateRequestPending=false; }
     }
     setInterval(()=>{if(!document.hidden || streamWanted) fetchState()},500);
     fetchState();
@@ -2160,7 +2207,7 @@ function showLyricsError(message) {
                ondrop="onQueueDrop(event, ${idx})"
                ondragend="onQueueDragEnd(event)">
             <span class="drag-handle" style="${isUpcoming ? '' : 'opacity:0.2; cursor:default;'}">⋮⋮</span>
-            <img class="queue-thumb" src="${item.artwork || 'https://e-cdns-images.dzcdn.net/images/cover/d41d8cd98f00b204e9800998ecf8427e/56x56-000000-80-0-0.jpg'}">
+            <img class="queue-thumb" loading="lazy" decoding="async" src="${item.artwork || 'https://e-cdns-images.dzcdn.net/images/cover/d41d8cd98f00b204e9800998ecf8427e/56x56-000000-80-0-0.jpg'}">
             <div class="queue-meta" onclick="playQueueIndex(${idx})">
               <div class="queue-title">${escapeHtml(item.title)} ${isCurrent ? '<span style="color:var(--accent); font-size:0.75rem;">(Playing)</span>' : ''}</div>
               <div class="queue-artist">${escapeHtml(item.artist)} • ${formatTime(trackDurationMs(item))}${item.added_by ? ' • Added by ' + escapeHtml(item.added_by) : ''}</div>

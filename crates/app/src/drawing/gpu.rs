@@ -261,6 +261,42 @@ unsafe fn create(hwnd: HWND, width: i32, height: i32, caption: i32) -> Result<Su
         failed: false,
     })
 }
+
+unsafe fn resize_surface(s: &mut Surface, width: i32, height: i32, caption: i32) -> Result<()> {
+    let props = D2D1_BITMAP_PROPERTIES1 {
+        pixelFormat: D2D1_PIXEL_FORMAT {
+            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+        },
+        dpiX: 96.,
+        dpiY: 96.,
+        bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET,
+        ..Default::default()
+    };
+    let size = D2D_SIZE_U { width: width as u32, height: height as u32 };
+    let backing = s.context.CreateBitmap(size, None, 0, &props)?;
+    let base = ID2D1RenderTarget::CreateBitmap(&s.context, size, None, 0, &D2D1_BITMAP_PROPERTIES {
+        pixelFormat: props.pixelFormat,
+        dpiX: 96.,
+        dpiY: 96.,
+    })?;
+    s.context.SetTarget(None::<&ID2D1Image>);
+    s.output = backing.clone();
+    s.swap.ResizeBuffers(0, width as u32, height as u32, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(0))?;
+    let buffer: IDXGISurface = s.swap.GetBuffer(0)?;
+    let output_props = D2D1_BITMAP_PROPERTIES1 {
+        bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+        ..props
+    };
+    s.output = s.context.CreateBitmapFromDxgiSurface(&buffer, Some(&output_props))?;
+    s.backing = backing;
+    s.base = base;
+    s.width = width;
+    s.height = height;
+    s._visual.SetOffsetY2(caption as f32)?;
+    s.retained = retained::Retention::default();
+    Ok(())
+}
 pub(crate) unsafe fn begin(
     hwnd: windows_sys::Win32::Foundation::HWND,
     bits: *const c_void,
@@ -345,10 +381,15 @@ pub(crate) unsafe fn begin_with_region(
     SURFACE.with(|slot| {
         let mut slot = slot.borrow_mut();
         let hwnd = HWND(hwnd);
-        if slot
-            .as_ref()
-            .is_none_or(|s| s.hwnd != hwnd || s.width != width || s.height != height)
-        {
+        if slot.as_ref().is_some_and(|s| s.hwnd == hwnd && (s.width != width || s.height != height)) {
+            if dirty.is_some() {
+                return false;
+            }
+            if resize_surface(slot.as_mut().unwrap(), width, height, caption).is_err() {
+                slot.take();
+            }
+        }
+        if slot.as_ref().is_none_or(|s| s.hwnd != hwnd) {
             slot.take();
             if dirty.is_some() {
                 return false;

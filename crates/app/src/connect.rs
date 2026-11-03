@@ -3,7 +3,7 @@ use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::SyncSender,
         Arc, RwLock,
     },
@@ -11,8 +11,10 @@ use std::{
     time::Duration,
 };
 
+#[path = "connect/mp3.rs"]
+mod mp3;
 #[path = "connect/spectrum.rs"]
-mod spectrum;
+pub(crate) mod spectrum;
 #[path = "connect/spotify_audio.rs"]
 mod spotify_audio;
 pub(crate) use spectrum::{dynamic_level, scene_frequency};
@@ -24,10 +26,12 @@ use std::sync::{Mutex, OnceLock};
 
 static VISUALIZER_SPECTRUM: OnceLock<RwLock<spectrum::Snapshot>> = OnceLock::new();
 pub(crate) fn visualizer_spectrum() -> Option<[f32; 32]> {
+if Provider::active() == Provider::YouTube { return crate::youtube::routing::levels(false); }
     let value = VISUALIZER_SPECTRUM.get()?.read().ok()?;
     value.fresh().then_some(value.levels)
 }
 pub(crate) fn visualizer_trap_spectrum() -> Option<[f32; 32]> {
+if Provider::active() == Provider::YouTube { return crate::youtube::routing::levels(true); }
     let value = VISUALIZER_SPECTRUM.get()?.read().ok()?;
     value.fresh().then_some(value.trap_levels)
 }
@@ -35,17 +39,33 @@ pub struct AudioBroadcaster {
     clients: Mutex<Vec<AudioClient>>,
 }
 struct AudioClient {
-    sender: std::sync::mpsc::SyncSender<Arc<Vec<u8>>>,
+    sender: std::sync::mpsc::Sender<Arc<Vec<u8>>>,
+    queued: Arc<AtomicUsize>,
     listener: std::sync::Weak<()>,
 }
 pub struct AudioSubscription {
     receiver: std::sync::mpsc::Receiver<Arc<Vec<u8>>>,
     _listener: Arc<()>,
+    queued: Arc<AtomicUsize>,
 }
-impl std::ops::Deref for AudioSubscription {
-    type Target = std::sync::mpsc::Receiver<Arc<Vec<u8>>>;
-    fn deref(&self) -> &Self::Target {
-        &self.receiver
+// Three seconds of wire PCM, independent of capture callback size.
+const MAX_QUEUED_PCM: usize = 44100 * 2 * 2 * 3;
+impl AudioSubscription {
+    fn received(&self, pcm: Arc<Vec<u8>>) -> Arc<Vec<u8>> {
+        self.queued.fetch_sub(pcm.len(), Ordering::AcqRel);
+        pcm
+    }
+    fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<Arc<Vec<u8>>, std::sync::mpsc::RecvTimeoutError> {
+        self.receiver
+            .recv_timeout(timeout)
+            .map(|pcm| self.received(pcm))
+    }
+    #[cfg(test)]
+    fn try_recv(&self) -> Result<Arc<Vec<u8>>, std::sync::mpsc::TryRecvError> {
+        self.receiver.try_recv().map(|pcm| self.received(pcm))
     }
 }
 
@@ -59,17 +79,20 @@ pub fn broadcaster() -> &'static AudioBroadcaster {
 
 impl AudioBroadcaster {
     pub fn subscribe(&self) -> AudioSubscription {
-        let (tx, rx) = std::sync::mpsc::sync_channel(128);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let queued = Arc::new(AtomicUsize::new(0));
         let listener = Arc::new(());
         if let Ok(mut clients) = self.clients.lock() {
             clients.push(AudioClient {
                 sender: tx,
+                queued: queued.clone(),
                 listener: Arc::downgrade(&listener),
             });
         }
         AudioSubscription {
             receiver: rx,
             _listener: listener,
+            queued,
         }
     }
     fn has_listeners(&self) -> bool {
@@ -82,10 +105,31 @@ impl AudioBroadcaster {
             .unwrap_or(false)
     }
     fn publish(&self, pcm: Arc<Vec<u8>>) {
+        if pcm.is_empty() {
+            return;
+        }
         if let Ok(mut clients) = self.clients.lock() {
             // Disconnect slow clients rather than dropping timeline samples.
             clients.retain(|c| {
-                c.listener.strong_count() > 0 && c.sender.try_send(pcm.clone()).is_ok()
+                if c.listener.strong_count() == 0 {
+                    return false;
+                }
+                let size = pcm.len();
+                if c.queued
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                        queued
+                            .checked_add(size)
+                            .filter(|total| *total <= MAX_QUEUED_PCM)
+                    })
+                    .is_err()
+                {
+                    return false;
+                }
+                if c.sender.send(pcm.clone()).is_err() {
+                    c.queued.fetch_sub(size, Ordering::AcqRel);
+                    return false;
+                }
+                true
             });
         }
     }
@@ -242,6 +286,7 @@ impl ConnectTrack {
 }
 
 pub struct HubState {
+    queue_revision: u64,
     spotify_audio_error: Option<String>,
     pub spectrum: spectrum::Snapshot,
     pub snapshot: Snapshot,
@@ -275,6 +320,7 @@ impl ConnectHub {
         let _ = listener.set_nonblocking(true);
         let active = Arc::new(AtomicBool::new(true));
         let state = Arc::new(RwLock::new(HubState {
+            queue_revision: 0,
             spotify_audio_error: None,
             spectrum: spectrum::Snapshot::default(),
             snapshot: Snapshot::default(),
@@ -358,7 +404,7 @@ impl ConnectHub {
                         {
                             *latest = spectrum::Snapshot::default();
                         }
-                        if previous_target.is_some() {
+                        if previous_target.is_some() || provider != previous_provider {
                             if let Ok(mut clients) = broadcaster().clients.lock() {
                                 clients.clear();
                             }
@@ -428,6 +474,12 @@ impl ConnectHub {
                                 );
                             }
                         }
+                    }
+                }
+                if provider == Provider::YouTube {
+                    for pcm in crate::youtube::routing::drain() {
+                        publish_pcm(&audio_state, &audio_active, &spectrum_tx,
+                            spectrum_generation, &pcm, Provider::YouTube);
                     }
                 }
                 if provider == Provider::Spotify && broadcaster().has_listeners() {
@@ -575,6 +627,11 @@ impl ConnectHub {
 
     pub fn update(&self, snapshot: &Snapshot) {
         if let Ok(mut st) = self.state.write() {
+            if st.snapshot.provider != snapshot.provider
+                || !Arc::ptr_eq(&st.snapshot.queue, &snapshot.queue)
+            {
+                st.queue_revision = st.queue_revision.wrapping_add(1);
+            }
             if st.snapshot.provider != snapshot.provider {
                 if let Ok(mut clients) = broadcaster().clients.lock() {
                     clients.clear();
@@ -677,8 +734,15 @@ fn handle_client(
     // A captured host provider prevents requests falling through to Deezer
     // catalog calls or public fallbacks while Spotify is selected.
     let host = state.read().unwrap().snapshot.clone();
+if host.provider == Provider::YouTube && path.starts_with("/api/")
+    && !(method == "GET" && matches!(path, "/api/state" | "/api/queue" | "/api/stream" | "/api/spectrum" | "/api/appearance")) {
+        send_error(stream, "YouTube Music remote controls and catalog are unavailable. Use the desktop player.");
+        return;
+    }
     let provider_name = if host.provider == Provider::Spotify {
         "spotify"
+} else if host.provider == Provider::YouTube {
+"youtube"
     } else {
         "deezer"
     };
@@ -723,7 +787,7 @@ fn handle_client(
         ("GET", "/") | ("GET", "/index.html") => {
             let html = include_str!("connect/index.html");
             let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
                 html.len(),
                 html
             );
@@ -757,6 +821,18 @@ fn handle_client(
         }
         ("GET", "/api/appearance") => send_json(stream, &browser_appearance()),
         ("GET", "/api/stream") => {
+            // The default remains WAV for existing/native clients.
+            let mut encoder = if get_query_param(query, "format").as_deref() == Some("mp3") {
+                match mp3::Encoder::new() {
+                    Ok(encoder) => Some(encoder),
+                    Err(error) => {
+                        send_error(stream, &error);
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
             let stream_target = if host.provider == Provider::Spotify {
                 crate::spotify::service::audio_target()
             } else {
@@ -774,6 +850,8 @@ fn handle_client(
             };
             let available = if host.provider == Provider::Spotify {
                 stream_target.is_some()
+} else if host.provider == Provider::YouTube {
+host.playback_connected
             } else {
                 state
                     .read()
@@ -809,7 +887,13 @@ fn handle_client(
             let rx = broadcaster().subscribe();
             let (sample_rate, channels) = (spotify_audio::RATE, spotify_audio::CHANNELS);
             let header = wav_header(sample_rate, channels);
-            let http_head = "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nAccept-Ranges: none\r\nConnection: keep-alive\r\nCache-Control: no-cache, no-store, must-revalidate\r\nPragma: no-cache\r\nExpires: 0\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
+            let compressed = encoder.is_some();
+            let content_type = if compressed {
+                "audio/mpeg"
+            } else {
+                "audio/wav"
+            };
+            let http_head = format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nAccept-Ranges: none\r\nConnection: close\r\nCache-Control: no-cache, no-store, must-revalidate\r\nPragma: no-cache\r\nExpires: 0\r\nAccess-Control-Allow-Origin: *\r\n\r\n");
             // Reserve bounded jitter headroom. Native clients retain the 500 ms
             // default; browsers can request more for mobile links and recovery.
             let buffer_bytes = stream_buffer_bytes(query);
@@ -833,17 +917,52 @@ fn handle_client(
                         send_error(stream, &error);
                         return;
                     }
-                    Err(_) if started.elapsed() > Duration::from_secs(10) => return,
+                    Err(_) if started.elapsed() > Duration::from_secs(10) => {
+                        let error = if host.provider == Provider::Spotify {
+                            "Spotify capture produced insufficient PCM to start listening. Confirm playback is on the host's supervised Soloist device; process capture does not capture other Spotify devices."
+                        } else {
+                            if host.provider == Provider::YouTube {
+                                "YouTube produced insufficient PCM to start listening. Start playback on the desktop player."
+                            } else {
+                                "The Deezer engine produced insufficient PCM to start listening. Check the host audio output and matching playback DLL."
+                            }
+                        };
+                        if host.provider == Provider::Spotify {
+                            if let Ok(mut st) = state.write() {
+                                if st.snapshot.provider == Provider::Spotify {
+                                    st.spotify_audio_error = Some(error.into());
+                                }
+                            }
+                        }
+                        send_error(stream, error);
+                        return;
+                    }
                     Err(_) => continue,
                 }
             }
             if !active.load(Ordering::Relaxed) || !source_current() {
                 return;
             }
-            if stream.write_all(http_head.as_bytes()).is_err()
-                || stream.write_all(&header).is_err()
-                || stream.write_all(&prebuffer).is_err()
-            {
+            // Encode before committing the response so initialization/input errors
+            // can still be reported as HTTP errors instead of corrupt audio.
+            let initial = if let Some(encoder) = &mut encoder {
+                match encoder.encode(&prebuffer) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        send_error(stream, &error);
+                        return;
+                    }
+                }
+            } else {
+                &prebuffer
+            };
+            if stream.write_all(http_head.as_bytes()).is_err() {
+                return;
+            }
+            if !compressed && stream.write_all(&header).is_err() {
+                return;
+            }
+            if stream.write_all(initial).is_err() {
                 return;
             }
             while active.load(Ordering::Relaxed) && source_current() {
@@ -852,7 +971,15 @@ fn handle_client(
                         if !source_current() {
                             break;
                         }
-                        if stream.write_all(&chunk).is_err() {
+                        let bytes = if let Some(encoder) = &mut encoder {
+                            match encoder.encode(&chunk) {
+                                Ok(bytes) => bytes,
+                                Err(_) => break,
+                            }
+                        } else {
+                            &chunk
+                        };
+                        if stream.write_all(bytes).is_err() {
                             break;
                         }
                     }
@@ -907,27 +1034,24 @@ fn handle_client(
                 &serde_json::json!({"levels":levels,"available":available}),
             );
         }
+        ("GET", "/api/queue") => {
+            let (snapshot, revision) = {
+                let st = state.read().unwrap();
+                (st.snapshot.clone(), st.queue_revision)
+            };
+            send_json(
+                stream,
+                &serde_json::json!({
+"provider": if snapshot.provider == Provider::Spotify { "spotify" } else if snapshot.provider == Provider::YouTube { "youtube" } else { "deezer" },
+                    "queue_revision": revision,
+                    "queue": connect_queue(&snapshot),
+                }),
+            );
+        }
         ("GET", "/api/state") => {
             let json = {
                 let st = state.read().unwrap();
                 let snap = &st.snapshot;
-                let queue_json: Vec<_> = snap
-                    .queue
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, e)| {
-                        serde_json::json!({
-                                    "index": idx,
-                                    "id": e.id,
-                                    "kind": e.kind,
-                                    "title": e.title,
-                                    "artist": e.subtitle,
-                                    "artwork": e.artwork,
-                                    "duration": e.duration / 1000, "duration_ms": e.duration,
-                        "added_by": e.raw["added_by"].as_str().unwrap_or(""),
-                                })
-                    })
-                    .collect();
 
                 let album = snap
                     .now
@@ -956,9 +1080,9 @@ fn handle_client(
                 } else {
                     (snap.position, snap.state.to_ascii_lowercase())
                 };
-                serde_json::json!({
-                "provider": if snap.provider == Provider::Spotify { "spotify" } else { "deezer" },
-                "stream_available": if snap.provider == Provider::Spotify { crate::spotify::service::audio_target().is_some() } else { st.engine.is_some() },
+                let mut json = serde_json::json!({
+"provider": if snap.provider == Provider::Spotify { "spotify" } else if snap.provider == Provider::YouTube { "youtube" } else { "deezer" },
+"stream_available": if snap.provider == Provider::Spotify { crate::spotify::service::audio_target().is_some() } else if snap.provider == Provider::YouTube { snap.playback_connected } else { st.engine.is_some() },
                 "stream_error": if snap.provider == Provider::Spotify { st.spotify_audio_error.clone() } else { None },
                 "connected": snap.connected,
                     "state": playback_state,
@@ -970,11 +1094,17 @@ fn handle_client(
                     "position_ms": position,
                     "duration_ms": snap.duration,
                     "queue_index": snap.queue_index,
+                    "queue_revision": st.queue_revision,
                     "repeat": snap.repeat,
                     "shuffle": snap.shuffle,
                     "autoplay": snap.autoplay,
-                    "queue": queue_json,
-                })
+                });
+                // Existing clients keep the full response; browser polls only
+                // fetch the large queue separately when its revision changes.
+                if get_query_param(query, "queue").as_deref() != Some("0") {
+                    json["queue"] = serde_json::json!(connect_queue(snap));
+                }
+                json
             };
             send_json(stream, &json);
         }
@@ -1609,10 +1739,26 @@ fn spotify_guest_request(
     Some(result)
 }
 
+fn connect_queue(snapshot: &Snapshot) -> Vec<serde_json::Value> {
+    snapshot
+        .queue
+        .iter()
+        .enumerate()
+        .map(|(idx, e)| {
+            serde_json::json!({
+                "index": idx, "id": e.id, "kind": e.kind, "title": e.title,
+                "artist": e.subtitle, "artwork": e.artwork,
+                "duration": e.duration / 1000, "duration_ms": e.duration,
+                "added_by": e.raw["added_by"].as_str().unwrap_or(""),
+            })
+        })
+        .collect()
+}
+
 fn send_json(stream: &mut TcpStream, json: &serde_json::Value) {
     let body = json.to_string();
     let resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
         body.len(),
         body
     );
@@ -2172,6 +2318,7 @@ mod tests {
     #[test]
     fn audio_delivery_continues_when_spectrum_worker_is_backlogged() {
         let state = RwLock::new(HubState {
+            queue_revision: 0,
             spotify_audio_error: None,
             spectrum: spectrum::Snapshot::default(),
             snapshot: Snapshot::default(),
@@ -2198,18 +2345,39 @@ mod tests {
         assert!(!broadcaster.has_listeners());
         let listener = broadcaster.subscribe();
         for sample in 0..128u8 {
-            broadcaster.publish(Arc::new(vec![sample; 4]));
+            broadcaster.publish(Arc::new(vec![sample; MAX_QUEUED_PCM / 128]));
         }
-        broadcaster.publish(Arc::new(vec![255; 4]));
+        broadcaster.publish(Arc::new(vec![255; MAX_QUEUED_PCM]));
         assert!(!broadcaster.has_listeners());
         for sample in 0..128u8 {
-            assert_eq!(&**listener.try_recv().unwrap(), &[sample; 4]);
+            assert_eq!(
+                &**listener.try_recv().unwrap(),
+                &vec![sample; MAX_QUEUED_PCM / 128]
+            );
         }
         assert!(matches!(
             listener.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Disconnected)
         ));
     }
+    #[test]
+    fn small_pcm_packets_fill_mobile_prebuffer_and_reuse_budget() {
+        let hub = AudioBroadcaster {
+            clients: Mutex::new(Vec::new()),
+        };
+        let listener = hub.subscribe();
+        for _ in 0..2 {
+            for _ in 0..1500 {
+                hub.publish(Arc::new(vec![7; 176]));
+            }
+            assert!(hub.has_listeners());
+            for _ in 0..1500 {
+                assert_eq!(listener.try_recv().unwrap().len(), 176);
+            }
+            assert_eq!(listener.queued.load(Ordering::Acquire), 0);
+        }
+    }
+
     #[test]
     fn host_payloads_reject_cross_provider_ids_and_stale_collections() {
         use super::*;
@@ -2352,6 +2520,62 @@ mod tests {
                 provider
             );
             assert_eq!(genres[0]["title"], "Pop");
+        }
+    }
+
+    #[test]
+    fn lightweight_state_polls_keep_large_queues_out_of_playback_updates() {
+        fn get(hub: &ConnectHub, path: &str) -> (String, serde_json::Value) {
+            let mut client = TcpStream::connect(("127.0.0.1", hub.port())).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            write!(client, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+            let mut response = String::new();
+            client.read_to_string(&mut response).unwrap();
+            let (head, body) = response.split_once("\r\n\r\n").unwrap();
+            assert!(head.starts_with("HTTP/1.1 200"));
+            assert!(head.contains("Cache-Control: no-store"));
+            (body.into(), serde_json::from_str(body).unwrap())
+        }
+        for provider in [Provider::Deezer, Provider::Spotify] {
+            let (tx, _rx) = std::sync::mpsc::sync_channel(4);
+            let hub = ConnectHub::start(0, tx).unwrap();
+            let mut snapshot = Snapshot {
+                provider,
+                connected: true,
+                queue: Arc::new(
+                    (0..1568)
+                        .map(|i| Entry {
+                            id: i.to_string(),
+                            title: format!("Track {i}"),
+                            artwork: "https://example.invalid/cover.jpg".into(),
+                            ..Entry::default()
+                        })
+                        .collect(),
+                ),
+                ..Snapshot::default()
+            };
+            hub.update(&snapshot);
+            let (body, first) = get(&hub, "/api/state?queue=0");
+            assert!(body.len() < 2048, "playback poll grows with queue size");
+            assert!(first.get("queue").is_none());
+            let revision = first["queue_revision"].clone();
+            snapshot.position = 2000;
+            snapshot.queue_index = 3;
+            hub.update(&snapshot);
+            let (_, next) = get(&hub, "/api/state?queue=0");
+            assert_eq!(next["queue_revision"], revision);
+            assert_eq!(next["queue_index"], 3);
+            let (_, queue) = get(&hub, "/api/queue");
+            assert_eq!(queue["queue_revision"], revision);
+            assert_eq!(queue["queue"].as_array().unwrap().len(), 1568);
+            let (_, legacy) = get(&hub, "/api/state");
+            assert_eq!(legacy["queue"], queue["queue"]);
+            Arc::make_mut(&mut snapshot.queue)[0].title = "Edited".into();
+            hub.update(&snapshot);
+            let (_, changed) = get(&hub, "/api/state?queue=0");
+            assert_ne!(changed["queue_revision"], revision);
         }
     }
 

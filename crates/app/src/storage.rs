@@ -242,6 +242,8 @@ fn copy_tree(
                 || name == "storage-location.json.bak"
                 || name == "storage-location.json.bak.tmp"
                 || name == ".deeznats-migration.json"
+                || name == "youtube-lyrics.dat"
+                || name.to_string_lossy().starts_with("youtube-lyrics.")
                 || name == "page-cache")
         {
             continue;
@@ -371,6 +373,20 @@ mod tests {
         }
         fs::create_dir_all(&root).unwrap();
         root
+    }
+    #[test]
+    fn relocation_does_not_copy_youtube_credentials() {
+        let base = fixture();
+        let source = base.join("DeezNatsRust");
+        let target = base.join("target");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("youtube-lyrics.dat"), b"encrypted").unwrap();
+        fs::write(source.join("youtube-lyrics.123.0.tmp"), b"encrypted").unwrap();
+        copy_tree(&source, &target, &source, &target, None).unwrap();
+        assert!(!target.join("youtube-lyrics.dat").exists());
+        assert!(!target.join("youtube-lyrics.123.0.tmp").exists());
+        assert!(source.join("youtube-lyrics.dat").exists());
+        fs::remove_dir_all(base).unwrap();
     }
     #[test]
     fn migration_commits_after_copy_preserves_originals_and_rewrites_paths() {

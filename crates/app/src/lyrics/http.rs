@@ -292,7 +292,7 @@ fn response_transport(
         })
     }
 }
-pub(super) fn json(url: &str, headers: &[(&str, &str)]) -> Result<serde_json::Value, String> {
+pub(crate) fn json(url: &str, headers: &[(&str, &str)]) -> Result<serde_json::Value, String> {
     serde_json::from_slice(&request("GET", url, headers, &[])?)
         .map_err(|_| "Invalid provider JSON".into())
 }

@@ -234,6 +234,10 @@ mod audio;
 #[cfg(windows)]
 mod catalog;
 #[cfg(windows)]
+mod youtube;
+#[cfg(windows)]
+mod youtube_webview;
+#[cfg(windows)]
 pub(crate) mod connect;
 #[cfg(windows)]
 mod downloads;

@@ -1,3 +1,4 @@
+pub(crate) mod musicbrainz;
 mod cache;
 mod artwork_queue;
 mod artwork_resize;
@@ -60,6 +61,7 @@ pub enum Provider {
     #[default]
     Deezer,
     Spotify,
+    YouTube,
 }
 static ACTIVE_PROVIDER: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn spotify_style_mix(selection: &str) -> Result<Value, String> {
@@ -70,31 +72,42 @@ impl Provider {
         match self {
             Self::Deezer => "Deezer",
             Self::Spotify => "Spotify",
+            Self::YouTube => "YouTube Music",
         }
     }
     pub fn supports_downloads(self) -> bool {
         self == Self::Deezer
     }
     pub fn active() -> Self {
-        if ACTIVE_PROVIDER.load(Ordering::Acquire) == 1 {
-            Self::Spotify
-        } else {
-            Self::Deezer
+        match ACTIVE_PROVIDER.load(Ordering::Acquire) {
+            1 => Self::Spotify,
+            2 => Self::YouTube,
+            _ => Self::Deezer,
         }
     }
     pub fn set_active(self) {
-        ACTIVE_PROVIDER.store(if self == Self::Spotify { 1 } else { 0 }, Ordering::Release);
+        ACTIVE_PROVIDER.store(
+            match self {
+                Self::Deezer => 0,
+                Self::Spotify => 1,
+                Self::YouTube => 2,
+            },
+            Ordering::Release,
+        );
     }
+
     fn invoke(self, engine: &Engine, name: &str, args: &[Value]) -> Result<Value, String> {
         match self {
             Self::Deezer => engine.invoke(name, args),
             Self::Spotify => crate::spotify::catalog_invoke(name, args),
+            Self::YouTube => crate::youtube::invoke(name, args),
         }
     }
     fn next(self, engine: &Engine, cursor: &str) -> Result<Value, String> {
         match self {
             Self::Deezer => public(engine, cursor),
             Self::Spotify => self.invoke(engine, "SPCatalogNextJSON", &[json!(cursor)]),
+            Self::YouTube => crate::youtube::invoke("Next", &[json!(cursor)]),
         }
     }
 }
@@ -1092,12 +1105,12 @@ pub struct Worker {
     pub session: Arc<session::Store>,
 }
 #[derive(Clone)]
-struct EventSender {
+pub(crate) struct EventSender {
     tx: mpsc::SyncSender<Event>,
     session: Arc<session::Store>,
 }
 impl EventSender {
-    fn send(&self, event: Event) -> Result<(), mpsc::SendError<Event>> {
+    pub(crate) fn send(&self, event: Event) -> Result<(), mpsc::SendError<Event>> {
         let event = match event {
             Event::Page(generation, page) => {
                 Event::Page(generation, self.session.apply(generation, page))
@@ -1174,6 +1187,7 @@ impl Worker {
                     _ => continue,
                 };
                 let result = match request.provider {
+                    Provider::YouTube => crate::lyrics::fetch_spotify_lyrics(&track, &id, sources),
                     Provider::Spotify => crate::lyrics::fetch_spotify_lyrics(&track, &id, sources),
                     Provider::Deezer => request
                         .engine
@@ -1350,6 +1364,10 @@ impl Worker {
                             engine,
                             job,
                         });
+                        continue;
+                    }
+                    if provider == Provider::YouTube {
+                        crate::youtube::process(generation, job, &tx, &worker_generation);
                         continue;
                     }
                     if provider == Provider::Spotify {
@@ -1556,7 +1574,8 @@ impl Worker {
                             } else {
                                 Value::Null
                             };
-                            if tx
+                            let meta = musicbrainz::enrich(&track, meta);
+                        if tx
                                 .send(Event::TrackInfo(
                                     generation,
                                     Box::new(track),
@@ -2415,6 +2434,30 @@ fn artwork_url(url: &str, background: bool) -> String {
     display_artwork_url(url, if background { 768 } else { 256 }, false)
 }
 pub fn display_artwork_url(url: &str, size: u32, upscale: bool) -> String {
+    let host = url.strip_prefix("https://").and_then(|rest| rest.split('/').next());
+    if host.is_some_and(|host| matches!(host, "lh3.googleusercontent.com" | "yt3.googleusercontent.com" | "yt3.ggpht.com")) {
+        let (path, query) = url.split_once('?').map_or((url, ""), |(a, b)| (a, b));
+        if let Some((base, options)) = path.rsplit_once('=') {
+            let size = size.clamp(64, 1024);
+            let mut resized = false;
+            let parts: Vec<String> = options.split('-').map(|part| {
+                if let Some((prefix, digits)) = ["w", "h", "s"].iter()
+                    .find_map(|prefix| part.strip_prefix(prefix).map(|digits| (*prefix, digits))) {
+                    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                        if let Ok(original) = digits.parse::<u32>() {
+                        resized = true;
+                        return format!("{prefix}{}", if upscale { size } else { original.min(size) });
+                        }
+                    }
+                }
+                part.to_owned()
+            }).collect();
+            if resized {
+                return format!("{base}={}{}", parts.join("-"), if query.is_empty() { String::new() } else { format!("?{query}") });
+            }
+        }
+        return url.into();
+    }
     if !url.starts_with("https://")
         || !url
             .split('/')
@@ -2611,6 +2654,16 @@ mod tests {
         assert!(compact.to_string().len() * 100 < input.to_string().len());
     }
     use super::*;
+    #[test]
+    fn youtube_artwork_requests_larger_images_for_playback() {
+        let small = "https://lh3.googleusercontent.com/album=w60-h60-l90-rj";
+        assert_eq!(display_artwork_url(small, 1024, true), "https://lh3.googleusercontent.com/album=w1024-h1024-l90-rj");
+        assert_eq!(display_artwork_url(small, 192, false), small);
+        assert_eq!(display_artwork_url("https://yt3.googleusercontent.com/album=w120-h120-l90-rj", 1024, true), "https://yt3.googleusercontent.com/album=w1024-h1024-l90-rj");
+        assert_eq!(display_artwork_url("https://yt3.ggpht.com/image=s500-c-k?x=1", 192, false), "https://yt3.ggpht.com/image=s192-c-k?x=1");
+        assert_eq!(display_artwork_url("https://example.com/image=w60-h60", 1024, true), "https://example.com/image=w60-h60");
+        assert_eq!(display_artwork_url("https://lh3.googleusercontent.com/image=other", 1024, true), "https://lh3.googleusercontent.com/image=other");
+    }
     #[test]
     fn spotify_artwork_selects_largest_valid_image_in_any_order() {
         let images = json!([

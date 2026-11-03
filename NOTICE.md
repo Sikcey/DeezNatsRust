@@ -18,16 +18,23 @@ The application license is retained at [LICENSE](LICENSE).
 
 ## Build and runtime dependencies
 
-The artwork thumbnail resizing routine adapts Sonora's `artwork_frame`, from
-[Sonora](https://github.com/sonorahq/sonora) commit `b525b2a` (0.45.0),
-Copyright (C) 2026 Sonora Contributors, GPL-3.0-or-later. The adapted code is in
-`crates/app/src/catalog/artwork_resize.rs`; changes are documented there.
-Its license is retained in [sonora-GPL-3.0.txt](assets/licenses/sonora-GPL-3.0.txt).
-
 Rust dependency versions are recorded in `Cargo.lock`; each crate retains its own
 license. Windows bindings use the Microsoft windows and windows-sys crates
 (MIT OR Apache-2.0); libloading uses ISC. WebView2 is subject to Microsoft's
 applicable SDK and runtime terms. NSIS builds the Windows installer.
+
+## Connect MP3 streaming
+
+Browser streams use unmodified [LAME 3.100](https://lame.sourceforge.io/),
+statically built by [mp3lame-sys 0.1.11](https://crates.io/crates/mp3lame-sys/0.1.11)
+through [mp3lame-encoder 0.2.5](https://crates.io/crates/mp3lame-encoder/0.2.5).
+The Rust bindings are LGPL-3.0; LAME is LGPL-2.0-or-later. License copies are
+retained in [mp3lame-LGPL-3.0.txt](assets/licenses/mp3lame-LGPL-3.0.txt) and
+[lame-LGPL-2.0.txt](assets/licenses/lame-LGPL-2.0.txt), included in the corresponding
+source archive. The pinned mp3lame-sys source package includes the complete LAME
+source used by its build script. The application's source and Cargo build files
+permit rebuilding/relinking with modified libraries. Decoder regression tests use
+[Symphonia](https://github.com/pdeljanov/Symphonia) (MPL-2.0), a test-only dependency.
 
 ## Binary update patches
 
@@ -58,3 +65,10 @@ distributed under CC0-1.0. SVG sources are retained in `assets/providers`.
 The Deezer mark belongs to its owner.
 
 Dependency licenses are not replaced by this project's license.
+
+## YouTube Music
+
+The YouTube Music adapter and its `ytmusic-rs` dependency are GPL-3.0-or-later.
+The license text is retained in
+[assets/licenses/sonora-GPL-3.0.txt](assets/licenses/sonora-GPL-3.0.txt).
+The private login window is adapted from this application's Deezer login window.

@@ -1371,6 +1371,22 @@ fn adopt_podcasts(app: &mut App, value: &serde_json::Value) {
 }
 
 fn share_link(item: &crate::catalog::Entry) -> Option<String> {
+    if let Some(rest) = item.id.strip_prefix("youtube:") {
+        let (kind, id) = rest.split_once(':')?;
+        if id.is_empty()
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+        {
+            return None;
+        }
+        return match kind {
+            "track" => Some(format!("https://music.youtube.com/watch?v={id}")),
+            "playlist" => Some(format!("https://music.youtube.com/playlist?list={id}")),
+            "artist" | "album" => Some(format!("https://music.youtube.com/browse/{id}")),
+            _ => None,
+        };
+    }
     if let Some(rest) = item.id.strip_prefix("spotify:") {
         let (kind, id) = rest.split_once(':')?;
         if matches!(
@@ -3165,6 +3181,22 @@ fn button_viewport(app: &App, node: &ui::Button, w: i32, h: i32) -> Rect {
         default
     }
 }
+unsafe fn show_link_copied(hwnd: HWND, app: &App) {
+    const TOAST: i32 = 509;
+    let old = GetDlgItem(hwnd, TOAST);
+    if !old.is_null() { DestroyWindow(old); }
+    let mut bounds: RECT = zeroed();
+    GetClientRect(hwnd, &mut bounds);
+    let width = app.px(180);
+    let toast = CreateWindowExW(WS_EX_CLIENTEDGE, wide("STATIC").as_ptr(), wide(app.ui.t("Link copied")).as_ptr(),
+        WS_CHILD | WS_VISIBLE | 0x0001 | 0x0200, (bounds.right - width) / 2,
+        app.px(62), width, app.px(38), hwnd, TOAST as HMENU, GetModuleHandleW(null()), null());
+    if !toast.is_null() {
+        SendMessageW(toast, WM_SETFONT, app.fonts[0] as usize, 1);
+        SetWindowPos(toast, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        SetTimer(hwnd, 91, 2200, None);
+    }
+}
 unsafe fn status_text(app: &App) {
     let message = if app.notice.is_empty() {
         &app.snapshot.message
@@ -3339,6 +3371,18 @@ unsafe fn login(hwnd: HWND, app: &mut App) {
         return;
     }
     let secret = read(app.edits[&SESSION]);
+    if app.ui.provider == crate::catalog::Provider::YouTube {
+        command(
+            app,
+            if secret.trim().is_empty() {
+                Command::LoginSaved
+            } else {
+                Command::Login(secret.trim().to_owned())
+            },
+        );
+        SetWindowTextW(app.edits[&SESSION], wide("").as_ptr());
+        return;
+    }
     let command_value = if secret.trim().is_empty() {
         Command::LoginSaved
     } else {
@@ -3454,7 +3498,7 @@ unsafe fn playlist_export_path(hwnd: HWND) -> Option<PathBuf> {
 }
 
 unsafe fn data_request(app: &mut App, job: crate::catalog::Job) {
-    if app.ui.provider == crate::catalog::Provider::Spotify || app.snapshot.engine.is_some() {
+    if app.ui.provider != crate::catalog::Provider::Deezer || app.snapshot.engine.is_some() {
         let lyrics = matches!(
             job,
             crate::catalog::Job::Lyrics(..) | crate::catalog::Job::LyricsWindow(..)
@@ -3528,6 +3572,8 @@ unsafe fn switch_provider(app: &mut App, provider: crate::catalog::Provider) {
     app.pending = None;
     app.ui.switch_flow_provider(provider);
     app.ui.provider = provider;
+    app.ui.last_provider = Some(provider);
+    app.ui.save_preferences();
     app.ui.device_menu_open = false;
     app.ui.spotify_devices.clear();
     app.ui.spotify_devices_busy = false;
@@ -3595,12 +3641,20 @@ unsafe fn switch_provider(app: &mut App, provider: crate::catalog::Provider) {
         1,
         wide(if provider == crate::catalog::Provider::Spotify {
             "Public Spotify application Client ID"
+        } else if provider == crate::catalog::Provider::YouTube {
+            "YouTube Music Cookie header (stored securely on this PC)"
         } else {
             "Paste ARL, or leave empty to use saved session"
         })
         .as_ptr() as isize,
     );
     command(app, Command::SwitchProvider(provider));
+if provider == crate::catalog::Provider::YouTube {
+    command(app, Command::Volume(app.volume));
+    let eq = serde_json::json!({"enabled": app.ui.value("Equalizer") != 0,
+        "gainsDb": &app.ui.eq[..10], "preampDb": app.ui.eq[10]});
+    command(app, Command::Api("DZSetEQJSON".into(), vec![serde_json::json!(eq.to_string())]));
+}
     if provider == crate::catalog::Provider::Spotify && app.ui.spotify_configured {
         start_spotify(app);
     }
@@ -4635,7 +4689,7 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
                                 kind: "playlist".into(),
                                 title: app.ui.playlist_draft.title.clone(),
                                 artwork: app.ui.playlist_draft.preview.clone(),
-                                raw: serde_json::json!({"description":app.ui.playlist_draft.description}),
+                                raw: serde_json::json!({"description":app.ui.playlist_draft.description, "owned": provider == crate::catalog::Provider::YouTube}),
                                 ..Default::default()
                             };
                             navigate(app, View::Album, Some(entry), String::new());
@@ -4682,6 +4736,14 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
                 dirty = true;
             }
             crate::catalog::Event::Page(generation, page) if generation == app.generation => {
+                if app.ui.provider == crate::catalog::Provider::YouTube
+                    && app.ui.view == View::Favorites
+                    && page.error.is_empty()
+                {
+                    app.ui
+                        .liked_ids
+                        .extend(page.rows.iter().map(|t| t.id.clone()));
+                }
                 if page.error.is_empty() {
                     let key = page_key(app);
                     app.page_cache.retain(|(k, _)| *k != key);
@@ -4871,7 +4933,7 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
                                     )
                                 })
                                 .collect();
-                            if !(app.ui.provider == crate::catalog::Provider::Spotify
+                            if !(app.ui.provider != crate::catalog::Provider::Deezer
                                 && crate::spotify::flow::Selection::parse(&app.ui.flow_id).is_ok())
                                 && !app
                                     .ui
@@ -5579,6 +5641,7 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
                     match provider {
                         crate::catalog::Provider::Deezer => Action::DeezerLogin,
                         crate::catalog::Provider::Spotify => Action::SpotifyLogin,
+                        crate::catalog::Provider::YouTube => Action::YouTubeLogin,
                     },
                 );
             }
@@ -5587,6 +5650,15 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
             switch_provider(app, crate::catalog::Provider::Deezer);
             app.ui.deezer_login_open = true;
             app.ui.deezer_login_advanced = false;
+        }
+        Action::YouTubeLogin => {
+            if app.ui.provider != crate::catalog::Provider::YouTube {
+                switch_provider(app, crate::catalog::Provider::YouTube);
+            }
+            command(app, Command::Login(String::new()));
+        }
+        Action::YouTubeLogout => {
+            command(app, Command::Logout);
         }
         Action::SpotifyLogin => {
             if app.ui.provider != crate::catalog::Provider::Spotify {
@@ -5624,14 +5696,15 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
                 };
             }
         }
-        Action::DeezerLogo | Action::SpotifyLogo => {}
+        Action::DeezerLogo | Action::SpotifyLogo | Action::YouTubeLogo => {}
 
         Action::ShelfAll(title) => {
             let discover_filter = app
                 .ui
                 .page
                 .as_ref()
-                .filter(|page| app.ui.view == View::Explore && page.is_discover())
+                .filter(|page| app.ui.view == View::Explore && page.is_discover()
+                    && !(app.ui.provider == crate::catalog::Provider::YouTube && title == "Categories"))
                 .and_then(|_| match title.as_str() {
                     "Genres" => Some(2),
                     "Categories" => Some(3),
@@ -5649,15 +5722,16 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
                 .and_then(|page| page.sections.iter().find(|s| s.title == title))
                 .cloned()
             {
+                let related = app.ui.page.as_ref().and_then(|page| crate::catalog::catalogue_page(page, &title));
                 navigate(app, View::Album, None, String::new());
                 app.generation += 1;
                 app.catalog.set_generation(app.generation);
 
-                app.ui.page = Some(Arc::new(crate::catalog::Page {
+                app.ui.page = Some(Arc::new(related.unwrap_or_else(|| crate::catalog::Page {
                     title,
                     sections: vec![section],
                     ..Default::default()
-                }));
+                })));
             }
         }
         Action::ShelfMore(title, cols) => {
@@ -5819,7 +5893,7 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
         }
         Action::FlowChoice(index) => {
             if let Some((id, _)) = app.ui.flow_options.get(index) {
-                if app.ui.provider == crate::catalog::Provider::Spotify {
+                if app.ui.provider != crate::catalog::Provider::Deezer {
                     app.ui.flow_id = crate::spotify::flow::Selection {
                         mood: id.clone(),
                         genres: crate::spotify::flow::mood_genres(id),
@@ -5853,7 +5927,7 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
         }
         Action::FlowAddGenre => {
             let genre = app.ui.flow_filter.trim().to_owned();
-            if app.ui.provider == crate::catalog::Provider::Spotify
+            if app.ui.provider != crate::catalog::Provider::Deezer
                 && app.ui.flow_customizable
                 && crate::spotify::flow::valid_genre(&genre)
                 && !app
@@ -5881,7 +5955,7 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
                 rebuild(hwnd, app);
                 return;
             }
-            if app.ui.provider == crate::catalog::Provider::Spotify {
+            if app.ui.provider != crate::catalog::Provider::Deezer {
                 match crate::spotify::flow::Selection::parse(&app.ui.flow_id) {
                     Ok(mut selection) => {
                         selection.genres = app
@@ -6033,7 +6107,7 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
             let item = app.entity.as_ref().unwrap_or(&app.ui.now);
             if let Some(link) = share_link(item) {
                 app.notice = match copy_text(hwnd, &link) {
-                    Ok(()) => "Link copied".into(),
+                    Ok(()) => { show_link_copied(hwnd, app); "Link copied".into() },
                     Err(error) => error,
                 };
             } else {
@@ -7491,27 +7565,6 @@ impl Drop for PaintPalette {
         PAINT_PALETTE.with(|value| value.set(self.0));
     }
 }
-// Debug builds show the rate of application paints, excluding the counter's
-// own once-per-second refresh. An idle window does not continuously repaint.
-#[cfg(debug_assertions)]
-thread_local! {
-    static FPS_COUNTER: std::cell::RefCell<(u32, f64, std::time::Instant, bool)> =
-        std::cell::RefCell::new((0, 0.0, std::time::Instant::now(), false));
-}
-
-#[cfg(debug_assertions)]
-unsafe fn fps_rect(hwnd: HWND) -> RECT {
-    let mut client: RECT = zeroed();
-    GetClientRect(hwnd, &mut client);
-    let top = caption_height(hwnd) + 8;
-    RECT {
-        left: (client.right - 128).max(0),
-        top,
-        right: client.right - 8,
-        bottom: top + 24,
-    }
-}
-
 unsafe fn paint(hwnd: HWND, app: &App) {
     #[cfg(feature = "diagnostics")]
     let _timing = crate::diagnostics::span("ui.paint", app.ui.view.title());
@@ -7539,24 +7592,6 @@ unsafe fn paint(hwnd: HWND, app: &App) {
             }
         }
     }
-    #[cfg(debug_assertions)]
-    {
-        let rect = fps_rect(hwnd);
-        FPS_COUNTER.with(|counter| {
-            let mut counter = counter.borrow_mut();
-            if !counter.3 && SetTimer(hwnd, 90, 1000, None) != 0 {
-                counter.2 = std::time::Instant::now();
-                counter.3 = true;
-            }
-            if ps.rcPaint.left != rect.left
-                || ps.rcPaint.top != rect.top
-                || ps.rcPaint.right != rect.right
-                || ps.rcPaint.bottom != rect.bottom
-            {
-                counter.0 += 1;
-            }
-        });
-    }
     render_region(
         hwnd,
         app,
@@ -7569,23 +7604,6 @@ unsafe fn paint(hwnd: HWND, app: &App) {
         },
     );
     DeleteObject(update_region);
-    #[cfg(debug_assertions)]
-    {
-        let rect = fps_rect(hwnd);
-        let brush = CreateSolidBrush(rgb(24, 24, 24));
-        FillRect(dc, &rect, brush);
-        DeleteObject(brush);
-        FPS_COUNTER.with(|counter| {
-            draw_text(
-                dc,
-                app.fonts[0],
-                &format!("Paint FPS: {:.0}", counter.borrow().1),
-                rect,
-                rgb(255, 255, 255),
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-            );
-        });
-    }
     if crate::drawing::artwork_preparation_pending() {
         start_animation_timer(hwnd, 2);
     }
@@ -9934,6 +9952,10 @@ unsafe fn draw_button(hwnd: HWND, app: &App, draw: &DRAWITEMSTRUCT) {
         crate::drawing::spotify_logo(draw.hDC, r);
         return;
     }
+    if matches!(node.action, Action::YouTubeLogo) {
+        crate::drawing::youtube_logo(draw.hDC, r);
+        return;
+    }
     if matches!(node.action, Action::DeezerLogo) {
         crate::drawing::deezer_logo(draw.hDC, r);
         return;
@@ -11082,9 +11104,23 @@ unsafe fn show_context_menu(hwnd: HWND, app: &mut App, pt: POINT) {
             7,
             wide(app.ui.t(context_menu_favorite_label(&item, liked))).as_ptr(),
         );
+        let mut menu_playlists = Vec::new();
         if item.kind == "track" {
             let sub = CreatePopupMenu();
             AppendMenuW(sub, MF_STRING, 13, wide(app.ui.t("New playlist")).as_ptr());
+            menu_playlists = app.page_cache.iter()
+                .flat_map(|(_, page)| page.sections.iter().flat_map(|section| section.entries.iter()).chain(page.rows.iter()))
+                .filter(|entry| entry.kind == "playlist" && crate::playlist::can_edit(entry, &app.ui.account))
+                .fold(Vec::new(), |mut entries: Vec<crate::catalog::Entry>, entry| {
+                    if !entries.iter().any(|e| e.id == entry.id) { entries.push(entry.clone()); }
+                    entries
+                });
+            if !menu_playlists.is_empty() {
+                AppendMenuW(sub, MF_SEPARATOR, 0, null());
+                for (index, playlist) in menu_playlists.iter().take(100).enumerate() {
+                    AppendMenuW(sub, MF_STRING, 1000 + index, wide(&playlist.title).as_ptr());
+                }
+            }
             AppendMenuW(
                 sub,
                 MF_STRING,
@@ -11135,6 +11171,12 @@ unsafe fn show_context_menu(hwnd: HWND, app: &mut App, pt: POINT) {
         DestroyMenu(menu);
 
         match sel {
+            1000..=1099 => {
+                if let Some(playlist) = menu_playlists.get((sel - 1000) as usize) {
+                    submit_playlist(app, crate::playlist::Mutation::Add(playlist.id.clone(), item.id.clone()));
+                    rebuild(hwnd, app);
+                }
+            }
             1 => activate(hwnd, app, Action::OpenItem(item.clone())),
             3 => {
                 if command(app, Command::QueueAddLast(Box::new(item.clone()))) {
@@ -11193,7 +11235,7 @@ unsafe fn show_context_menu(hwnd: HWND, app: &mut App, pt: POINT) {
             9 => {
                 if let Some(link) = share_link(&item) {
                     app.notice = match copy_text(hwnd, &link) {
-                        Ok(()) => "Link copied".into(),
+                        Ok(()) => { show_link_copied(hwnd, app); "Link copied".into() },
                         Err(error) => error,
                     };
                 }
@@ -11346,12 +11388,14 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
             );
-            if startup_provider(
+            let provider = startup_provider(
+                app.ui.last_provider,
                 crate::session::deezer_saved_exists(),
                 crate::spotify::api_configured(),
-            ) == crate::catalog::Provider::Spotify
-            {
-                switch_provider(app, crate::catalog::Provider::Spotify);
+                crate::session::provider_exists("youtube"),
+            );
+            if provider != app.ui.provider {
+                switch_provider(app, provider);
             } else {
                 load_page(app);
             }
@@ -12148,21 +12192,10 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
             }
             0
         }
-        #[cfg(debug_assertions)]
-        WM_TIMER if wp == 90 => {
-            FPS_COUNTER.with(|counter| {
-                let mut counter = counter.borrow_mut();
-                let now = std::time::Instant::now();
-                let elapsed = now.duration_since(counter.2).as_secs_f64();
-                if elapsed > 0.0 {
-                    counter.1 = counter.0 as f64 / elapsed;
-                }
-                counter.0 = 0;
-                counter.2 = now;
-            });
-            if IsIconic(hwnd) == 0 && IsWindowVisible(hwnd) != 0 {
-                InvalidateRect(hwnd, &fps_rect(hwnd), 0);
-            }
+        WM_TIMER if wp == 91 => {
+            KillTimer(hwnd, 91);
+            let toast = GetDlgItem(hwnd, 509);
+            if !toast.is_null() { DestroyWindow(toast); }
             0
         }
         WM_TIMER if wp == 7 => {
@@ -12565,7 +12598,11 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
             0
         }
         WM_TIMER => {
-            let refreshing = crate::spotify::web::refreshing();
+            let refreshing = match app.ui.provider {
+                crate::catalog::Provider::Spotify => crate::spotify::web::refreshing(),
+                crate::catalog::Provider::YouTube => crate::youtube::refreshing(),
+                _ => false,
+            };
             if app.ui.spotify_credentials_refreshing != refreshing {
                 app.ui.spotify_credentials_refreshing = refreshing;
                 if !app.render_suspended {
@@ -12610,7 +12647,23 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                 let progress_changed = app.snapshot.position != snapshot.position
                     || app.snapshot.duration != snapshot.duration
                     || app.snapshot.message != snapshot.message;
-                let newly_connected = !app.snapshot.connected && snapshot.connected;
+                let youtube_account_changed = snapshot.provider
+                    == crate::catalog::Provider::YouTube
+                    && app.snapshot.account != snapshot.account;
+                let newly_connected =
+                    snapshot.connected && (!app.snapshot.connected || youtube_account_changed);
+                if youtube_account_changed {
+                    app.page_cache.clear();
+                    app.catalog.session.invalidate();
+                    app.ui.liked_ids.clear();
+                    if !snapshot.connected {
+                        app.generation = app.generation.wrapping_add(1);
+                        app.catalog.set_generation(app.generation);
+                        app.ui.page = None;
+                        app.entity = None;
+                        app.library_loaded = false;
+                    }
+                }
                 let queue_data_changed = !Arc::ptr_eq(&app.snapshot.queue, &snapshot.queue);
                 let queue_track_changed = app.snapshot.queue_index != snapshot.queue_index
                     || app.snapshot.now.id != snapshot.now.id;
@@ -12662,7 +12715,19 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                         app.ui.deezer_login_status = snapshot.message.clone();
                     }
                 }
+                let youtube_playback_error = snapshot.provider == crate::catalog::Provider::YouTube
+                    && snapshot.state == "Stopped"
+                    && snapshot.message.starts_with("YouTube playback:")
+                    && (app.snapshot.message != snapshot.message || app.snapshot.state != snapshot.state);
                 app.snapshot = snapshot;
+                if youtube_playback_error {
+                    MessageBoxW(
+                        hwnd,
+                        wide(&app.snapshot.message).as_ptr(),
+                        wide("YouTube playback").as_ptr(),
+                        MB_OK | MB_ICONINFORMATION,
+                    );
+                }
                 if newly_connected && app.ui.provider == crate::catalog::Provider::Deezer {
                     if let Some(engine) = app.snapshot.engine.clone() {
                         for (status, cancel) in app.downloads.resume(engine) {
@@ -12680,6 +12745,7 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                     connect.update(&app.snapshot);
                 }
                 if app.snapshot.connected
+                    && app.ui.provider != crate::catalog::Provider::YouTube
                     && !app.library_loaded
                     && matches!(app.ui.view, View::Show | View::Playlists | View::Podcasts)
                 {
@@ -13106,12 +13172,42 @@ unsafe fn make_fonts(scale: f64) -> [HFONT; 12] {
 
     fonts
 }
-fn startup_provider(deezer_saved: bool, spotify_saved: bool) -> crate::catalog::Provider {
-    if spotify_saved && !deezer_saved {
-        crate::catalog::Provider::Spotify
-    } else {
-        crate::catalog::Provider::Deezer
+fn startup_provider(
+    last: Option<crate::catalog::Provider>,
+    deezer_saved: bool,
+    spotify_saved: bool,
+    youtube_saved: bool,
+) -> crate::catalog::Provider {
+    use crate::catalog::Provider;
+    if let Some(provider) = last {
+        let available = match provider {
+            Provider::Deezer => deezer_saved,
+            Provider::Spotify => spotify_saved,
+            Provider::YouTube => youtube_saved,
+        };
+        if available {
+            return provider;
+        }
     }
+    if deezer_saved {
+        Provider::Deezer
+    } else if spotify_saved {
+        Provider::Spotify
+    } else if youtube_saved {
+        Provider::YouTube
+    } else {
+        Provider::Deezer
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn startup_provider_prefers_available_last_selection() {
+    use crate::catalog::Provider;
+    assert_eq!(startup_provider(Some(Provider::YouTube), true, true, true), Provider::YouTube);
+    assert_eq!(startup_provider(Some(Provider::Spotify), true, true, false), Provider::Spotify);
+    assert_eq!(startup_provider(Some(Provider::YouTube), true, true, false), Provider::Deezer);
+    assert_eq!(startup_provider(None, false, false, true), Provider::YouTube);
 }
 
 pub fn run() -> Result<(), String> {
@@ -13156,7 +13252,8 @@ pub fn run() -> Result<(), String> {
         }
         let mut preferences = Ui::load_preferences();
         preferences.onboarding_open =
-            !crate::session::deezer_saved_exists() && !crate::spotify::api_configured();
+            !crate::session::deezer_saved_exists() && !crate::spotify::api_configured()
+                && !crate::session::provider_exists("youtube");
         if let Some(message) = crate::updater::startup_result() {
             preferences.update.error = message;
         }
@@ -13506,7 +13603,7 @@ mod behavior_tests {
     fn canvas_input_preserves_playlist_cover_drafts_and_filters_flow_live() {
         unsafe {
             let hwnd = CreateWindowExW(0, wide("STATIC").as_ptr(), wide("").as_ptr(),
-                WS_OVERLAPPEDWINDOW, 0, 0, 900, 700, null_mut(), null_mut(),
+                WS_OVERLAPPEDWINDOW, 0, 0, 1200, 1100, null_mut(), null_mut(),
                 GetModuleHandleW(null()), null());
             assert!(!hwnd.is_null());
             let mut app = test_app();
@@ -13547,8 +13644,8 @@ mod behavior_tests {
             let dc = CreateCompatibleDC(null_mut());
             let mut bits = null_mut();
             let info = BITMAPINFO { bmiHeader: BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32, biWidth: 900,
-                biHeight: -700, biPlanes: 1, biBitCount: 32, biCompression: BI_RGB,
+                biSize: size_of::<BITMAPINFOHEADER>() as u32, biWidth: 1200,
+                biHeight: -1100, biPlanes: 1, biBitCount: 32, biCompression: BI_RGB,
                 ..zeroed() }, ..zeroed() };
             let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
             assert!(!bitmap.is_null());
@@ -13556,10 +13653,10 @@ mod behavior_tests {
             let field = app.rect(app.scene.name.unwrap());
             let capture = || {
                 GdiFlush();
-                let pixels = std::slice::from_raw_parts(bits.cast::<u32>(), 900*700);
+                let pixels = std::slice::from_raw_parts(bits.cast::<u32>(), 1200*1100);
                 let caption = caption_height(hwnd);
                 (field.top+caption..field.bottom+caption).flat_map(|y|
-                    pixels[y as usize*900+field.left as usize..y as usize*900+field.right as usize].iter().copied()
+                    pixels[y as usize*1200+field.left as usize..y as usize*1200+field.right as usize].iter().copied()
                 ).collect::<Vec<_>>()
             };
             SetWindowTextW(app.edits[&NAME], wide("iiiiiiiiiiii").as_ptr());

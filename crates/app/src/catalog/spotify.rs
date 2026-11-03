@@ -1596,6 +1596,7 @@ pub(super) fn process(generation: u64, job: Job, tx: &EventSender, current: &Ato
         }
         Job::TrackInfo(track) => {
             let (meta, artist) = track_info(&track, &invoke);
+            let meta = super::musicbrainz::enrich(&track, meta);
             if active() {
                 let _ = tx.send(Event::TrackInfo(generation, Box::new(track), meta, artist));
             }

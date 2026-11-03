@@ -4,6 +4,9 @@ use serde_json::{json, Value};
 use std::{path::Path, sync::Arc};
 
 pub fn can_edit(entry: &Entry, account: &Value) -> bool {
+    if entry.id.starts_with("youtube:playlist:") {
+        return entry.raw["owned"] == true;
+    }
     if entry.kind != "playlist" {
         return false;
     }

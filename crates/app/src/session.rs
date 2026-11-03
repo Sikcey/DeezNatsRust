@@ -64,7 +64,11 @@ fn remove_if_present(path: &std::path::Path) -> Result<(), String> {
     }
 }
 fn save_file(file: &str, session: &str) -> Result<(), String> {
-    let directory = crate::storage::data_dir()?;
+    let directory = if file == "youtube-lyrics.dat" {
+        youtube_session_dir()?
+    } else {
+        crate::storage::data_dir()?
+    };
     std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
     let mut bytes = session.as_bytes().to_vec();
     let input = CRYPT_INTEGER_BLOB {
@@ -89,7 +93,7 @@ fn save_file(file: &str, session: &str) -> Result<(), String> {
             return Err("Windows could not protect the session".into());
         }
         let protected = std::slice::from_raw_parts(output.pbData, output.cbData as usize);
-        let result = if file.starts_with("spotify") {
+        let result = if file.starts_with("spotify") || file == "youtube-lyrics.dat" {
             atomic_write(&directory.join(file), protected)
         } else {
             std::fs::write(directory.join(file), protected).map_err(|e| e.to_string())
@@ -138,11 +142,20 @@ fn read(path: PathBuf) -> Result<String, String> {
 fn provider_path(name: &str) -> Result<PathBuf, String> {
     if !matches!(
         name,
-        "musixmatch" | "spotify" | "spotify-soloist" | "spotify-web" | "spotify-web-api"
+        "musixmatch" | "spotify" | "spotify-soloist" | "spotify-web" | "spotify-web-api" | "youtube"
     ) {
         return Err("Unknown credential provider".into());
     }
-    Ok(crate::storage::data_dir()?.join(format!("{name}-lyrics.dat")))
+    let directory = if name == "youtube" {
+        youtube_session_dir()?
+    } else {
+        crate::storage::data_dir()?
+    };
+    Ok(directory.join(format!("{name}-lyrics.dat")))
+}
+fn youtube_session_dir() -> Result<PathBuf, String> {
+    Ok(PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("User data directory unavailable")?)
+        .join("DeezNatsRust"))
 }
 pub(crate) fn provider_exists(name: &str) -> bool {
     provider_path(name).is_ok_and(|path| path.is_file())
@@ -167,7 +180,7 @@ pub fn provider_remove(name: &str) -> Result<(), String> {
     }
 }
 
-// Replace protected Spotify credentials only after the complete new file reaches disk.
+// Replace protected credentials only after the complete new file reaches disk.
 fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
     use std::{
         io::Write,
@@ -183,14 +196,14 @@ fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
         .create_new(true)
         .write(true)
         .open(&temporary)
-        .map_err(|_| "Could not stage protected Spotify credentials")?;
+        .map_err(|_| "Could not stage protected credentials")?;
     let result = (|| {
         file.write_all(bytes)
             .and_then(|_| file.sync_all())
-            .map_err(|_| "Could not write protected Spotify credentials")?;
+            .map_err(|_| "Could not write protected credentials")?;
         drop(file);
         std::fs::rename(&temporary, path)
-            .map_err(|_| "Could not replace protected Spotify credentials".to_owned())
+            .map_err(|_| "Could not replace protected credentials".to_owned())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);

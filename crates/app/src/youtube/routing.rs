@@ -383,10 +383,7 @@ mod tests {
         for (path, expected) in [
             ("/api/state", "\"provider\":\"youtube\""),
             ("/api/queue", "\"provider\":\"youtube\""),
-            (
-                "/api/search?q=test",
-                "remote controls and catalog are unavailable",
-            ),
+            ("/api/search?q=", "\"provider\":\"youtube\""),
         ] {
             let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
             stream

@@ -102,6 +102,7 @@ fn ttml_time(text: &str) -> Option<u64> {
     }
     let fields: Vec<_> = text.split(':').collect();
     match fields.as_slice() {
+        [seconds] => seconds_to_ms(seconds),
         [minutes, seconds] => minutes
             .parse::<u64>()
             .ok()?
@@ -227,6 +228,21 @@ pub(super) fn ttml(text: &str) -> Vec<LyricLine> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ttml_accepts_apple_bare_seconds_before_minute_boundary() {
+        let lines = ttml(
+            r#"<tt><body><p begin="15.967" end="17.119"><span begin="15.967" end="17.119">First</span></p><p begin="58.045" end="59.167">Later</p><p begin="1:00.151" end="1:01.367">Next</p></body></tt>"#,
+        );
+        assert_eq!(
+            lines.iter().map(|line| line.start_ms).collect::<Vec<_>>(),
+            [15967, 58045, 60151]
+        );
+        assert_eq!(lines[0].syllables[0].end_ms, 17119);
+        assert_eq!(lines[2].end_ms, 61367);
+        assert_eq!(ttml_time("-1"), None);
+        assert_eq!(ttml_time("NaN"), None);
+    }
     #[test]
     fn word_formats_keep_real_word_times() {
         let yaml = "version: '1.0'\nlines:\n- text: Hello world\n  start_ms: 1000\n  end_ms: 2500\n  words:\n  - {text: 'Hello ', start_ms: 1000, end_ms: 1500}\n  - {text: world, start_ms: 1600, end_ms: 2500}\n";

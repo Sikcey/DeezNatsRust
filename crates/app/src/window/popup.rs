@@ -5,6 +5,38 @@ use std::sync::mpsc::Receiver;
 
 type PlaylistResult = Result<Vec<crate::catalog::Entry>, String>;
 
+thread_local! {
+    static ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(super) fn active() -> bool {
+    ACTIVE.get()
+}
+
+struct ModalSurface {
+    owner: HWND,
+    previous: bool,
+}
+
+impl ModalSurface {
+    unsafe fn new(owner: HWND) -> Self {
+        let previous = ACTIVE.replace(true);
+        gpu::invalidate_layers();
+        InvalidateRect(owner, null(), 0);
+        Self { owner, previous }
+    }
+}
+
+impl Drop for ModalSurface {
+    fn drop(&mut self) {
+        ACTIVE.set(self.previous);
+        gpu::invalidate_layers();
+        unsafe {
+            InvalidateRect(self.owner, null(), 0);
+        }
+    }
+}
+
 struct Item {
     title: String,
     id: i32,
@@ -112,6 +144,21 @@ impl Popup {
     fn row_height(&self, row: &Item) -> i32 {
         self.px(if row.separator { 13 } else { 36 })
     }
+    fn max_playlist_offset(&self, available: i32) -> usize {
+        let Some(branch) = self.branch else {
+            return 0;
+        };
+        let visible = self.visible();
+        let rows = &self.rows[branch].children;
+        let mut height = 0;
+        for (position, index) in visible.iter().enumerate().rev() {
+            height += self.row_height(&rows[*index]);
+            if height > available {
+                return (position + 1).min(visible.len().saturating_sub(1));
+            }
+        }
+        0
+    }
     unsafe fn reveal(&mut self, child: bool, index: usize) {
         let indices = if child {
             self.visible()
@@ -140,9 +187,7 @@ impl Popup {
             offset += 1;
         }
         if child {
-            self.offset = offset;
-        } else {
-            self.root_offset = offset;
+            self.offset = offset.min(self.max_playlist_offset(available));
         }
     }
     unsafe fn close_child(&mut self) {
@@ -240,6 +285,7 @@ unsafe fn create(owner: HWND, state: &mut Popup, mut x: i32, mut y: i32, child: 
                 .iter()
                 .map(|r| state.row_height(r))
                 .sum::<i32>()
+                .min(state.px(12 * 36))
     } else {
         state.px(6) + state.rows.iter().map(|r| state.row_height(r)).sum::<i32>()
     };
@@ -262,7 +308,7 @@ unsafe fn create(owner: HWND, state: &mut Popup, mut x: i32, mut y: i32, child: 
     y = y.min(work.bottom - height).max(work.top);
     let hwnd = CreateWindowExW(
         // Shell tray overflow is topmost; transient menus must appear above it.
-        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | if child { WS_EX_NOACTIVATE } else { 0 },
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED,
         class.as_ptr(),
         wide("").as_ptr(),
         WS_POPUP,
@@ -277,6 +323,8 @@ unsafe fn create(owner: HWND, state: &mut Popup, mut x: i32, mut y: i32, child: 
     );
     let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, state.px(18), state.px(18));
     SetWindowRgn(hwnd, region, 0);
+    // Fixed 65% opacity uses compositor blending with the fast GDI painter.
+    SetLayeredWindowAttributes(hwnd, 0, 166, LWA_ALPHA);
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     hwnd
 }
@@ -449,7 +497,7 @@ unsafe fn paint_surface(hwnd: HWND, state: &Popup) {
         let rows = &state.rows[state.branch.unwrap()].children;
         let total: i32 = visible.iter().map(|i| state.row_height(&rows[*i])).sum();
         let top = state.px(50);
-        let available = rect.bottom - top - state.px(8);
+        let available = rect.bottom - top - state.px(6);
         if total > available && available > 0 {
             let height = (available * available / total).max(state.px(20));
             let before: i32 = visible
@@ -457,7 +505,13 @@ unsafe fn paint_surface(hwnd: HWND, state: &Popup) {
                 .take(state.offset)
                 .map(|i| state.row_height(&rows[*i]))
                 .sum();
-            let y = top + ((available - height) * before / total).min(available - height);
+            let max_before: i32 = visible
+                .iter()
+                .take(state.max_playlist_offset(available))
+                .map(|i| state.row_height(&rows[*i]))
+                .sum();
+            let y =
+                top + ((available - height) * before / max_before.max(1)).min(available - height);
             let thumb = RECT {
                 left: rect.right - state.px(5),
                 top: y,
@@ -493,8 +547,7 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
             0
         }
         WM_ERASEBKGND => 1,
-        // Keep keyboard focus and mouse capture on the root while interacting
-        // with its owned submenu (including the search field).
+        // The owner keeps activation; the modal loop routes keyboard input here.
         WM_MOUSEACTIVATE => MA_NOACTIVATE as isize,
         WM_MOUSEMOVE => {
             let mut p: POINT = zeroed();
@@ -543,32 +596,19 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                 PtInRect(&rect, point) != 0
             };
             if !child {
-                GetWindowRect(state.root, &mut rect);
-                if PtInRect(&rect, point) == 0 {
-                    return 0;
-                }
+                return 0;
             }
             {
-                let count = if child {
-                    state.visible().len()
-                } else {
-                    state.rows.len()
-                };
-                let offset = if child {
-                    &mut state.offset
-                } else {
-                    &mut state.root_offset
-                };
+                GetClientRect(state.child, &mut rect);
+                let maximum = state.max_playlist_offset(rect.bottom - state.px(56));
+                let offset = &mut state.offset;
                 if (wp >> 16) as i16 > 0 {
                     *offset = offset.saturating_sub(3);
                 } else {
-                    *offset = (*offset + 3).min(count.saturating_sub(1));
+                    *offset = (*offset + 3).min(maximum);
                 }
                 state.hover = None;
-                if !child {
-                    state.close_child();
-                }
-                InvalidateRect(if child { state.child } else { state.root }, null(), 0);
+                InvalidateRect(state.child, null(), 0);
             }
             0
         }
@@ -708,19 +748,14 @@ pub(super) unsafe fn show(
             app.ui.t("No matching playlists").into(),
         ],
     });
-    let previous_focus = GetFocus();
+    let _modal = ModalSurface::new(owner);
     state.root = create(owner, &mut state, x, y, false);
     if state.root.is_null() {
         return (0, Vec::new());
     }
-    // A custom popup needs the same input isolation as a native modal menu.
-    // Capture alone does not stop wheel messages or focus on owner controls.
-    let owner_enabled = IsWindowEnabled(owner) != 0;
-    if owner_enabled {
-        EnableWindow(owner, 0);
-    }
-    SetForegroundWindow(state.root);
-    SetFocus(state.root);
+    // Keep the owner's acrylic surface and focus stable. Disabling the owner
+    // and activating the popup causes activation paints and a full rebuild on
+    // dismissal. Capture and input routing provide modal isolation instead.
     SetCapture(state.root);
     SetTimer(state.root, 1, 50, None);
     let mut message: MSG = zeroed();
@@ -770,14 +805,26 @@ pub(super) unsafe fn show(
                 }
             }
         }
-        if (WM_MOUSEFIRST..=WM_MOUSELAST).contains(&message.message) {
+        if (message.message == WM_ACTIVATE
+            && message.hwnd == owner
+            && message.wParam & 0xffff == WA_INACTIVE as usize)
+            || (message.message == WM_ACTIVATEAPP && message.wParam == 0)
+        {
+            state.done = true;
+        }
+        if (WM_MOUSEFIRST..=WM_MOUSELAST).contains(&message.message)
+            || (WM_KEYFIRST..=WM_KEYLAST).contains(&message.message)
+        {
             // Windows can target wheel input at the window under the pointer,
-            // even while the popup has capture. Route all mouse input here.
+            // even while the popup has capture. Keyboard focus stays on the
+            // owner, so route its keyboard messages to the popup as well.
             message.hwnd = state.root;
         } else if message.hwnd != state.root
             && message.hwnd != state.child
-            && ((WM_KEYFIRST..=WM_KEYLAST).contains(&message.message)
-                || matches!(message.message, WM_MOUSEHOVER | WM_MOUSELEAVE))
+            && matches!(
+                message.message,
+                WM_MOUSEHOVER | WM_MOUSELEAVE | WM_NCMOUSEMOVE | WM_NCMOUSEHOVER | WM_NCMOUSELEAVE
+            )
         {
             continue;
         }
@@ -788,12 +835,6 @@ pub(super) unsafe fn show(
     ReleaseCapture();
     state.close_child();
     DestroyWindow(state.root);
-    if owner_enabled {
-        EnableWindow(owner, 1);
-    }
-    if IsWindow(previous_focus) != 0 {
-        SetFocus(previous_focus);
-    }
     (state.selected, std::mem::take(&mut state.playlists))
 }
 
@@ -843,6 +884,18 @@ mod tests {
                 "No matching playlists".into(),
             ],
         }
+    }
+
+    #[test]
+    fn playlist_scroll_stops_when_last_page_is_full() {
+        let mut popup = fixture();
+        popup.branch = Some(0);
+        popup.rows[0].children = (0..10).map(|i| row(1000 + i, "Playlist")).collect();
+        assert_eq!(popup.max_playlist_offset(144), 6);
+        assert_eq!(popup.max_playlist_offset(150), 6);
+        assert_eq!(popup.max_playlist_offset(360), 0);
+        popup.query = "missing".into();
+        assert_eq!(popup.max_playlist_offset(144), 0);
     }
 
     #[test]

@@ -5,8 +5,8 @@ mod playback;
 mod potoken;
 mod potoken_webview;
 pub(crate) use catalog::{
-    collection_tracks, edit as edit_playlist, invoke, menu_playlists, playlist_privacy, process,
-    saved_library_entries,
+    collection_tracks, connect_catalog, connect_station, edit as edit_playlist, invoke,
+    menu_playlists, playlist_privacy, process, saved_library_entries,
 };
 pub(crate) use playback::Player;
 use serde_json::{json, Value};

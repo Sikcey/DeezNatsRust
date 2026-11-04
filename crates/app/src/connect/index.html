@@ -2344,6 +2344,7 @@ function showLyricsError(message) {
       try {
         const res = await fetch("/api/discover");
         const data = await res.json();
+        if (data.error) throw new Error(data.error);
         discoverLoaded = true;
 
         if (!data.sections || data.sections.length === 0) {
@@ -2361,6 +2362,7 @@ function showLyricsError(message) {
                      data-id="${escapeHtml(item.id)}"
                      data-title="${escapeHtml(item.title)}"
                      data-art="${escapeHtml(item.artwork)}"
+                     data-track="${escapeHtml(JSON.stringify(item))}"
                      onclick="onShelfCardClick(this)">
                   <img class="shelf-cover" src="${item.artwork || 'https://e-cdns-images.dzcdn.net/images/cover/d41d8cd98f00b204e9800998ecf8427e/250x250-000000-80-0-0.jpg'}">
                   <div class="shelf-title">${escapeHtml(item.title)}</div>
@@ -2380,6 +2382,10 @@ function showLyricsError(message) {
       const id = el.dataset.id || "";
       const title = el.dataset.title || "Collection";
       const artwork = el.dataset.art || "";
+      if (kind === 'track' || kind === 'episode') {
+        playNow(JSON.parse(el.dataset.track));
+        return;
+      }
       openCollection(kind, id, title, artwork);
     }
 
@@ -2404,6 +2410,18 @@ function showLyricsError(message) {
         currentModalTracks = data.tracks || [];
 
         if (data.error) { list.textContent = data.error; return; }
+        if (kind === 'channel') {
+          list.replaceChildren();
+          for (const section of data.sections || []) {
+            const heading = document.createElement('h3'); heading.className='section-title'; heading.textContent=section.title; list.append(heading);
+            for (const item of section.items || []) {
+              const button = document.createElement('button'); button.className='shelf-card'; button.textContent=item.title;
+              button.dataset.kind=item.kind; button.dataset.id=item.id; button.dataset.title=item.title; button.dataset.art=item.artwork || ''; button.dataset.track=JSON.stringify(item);
+              button.onclick=()=>onShelfCardClick(button); list.append(button);
+            }
+          }
+          return;
+        }
         if (kind === 'artist') {
           list.replaceChildren();
           for (const [key,label] of [['tracks','Popular tracks'],['albums','Albums'],['artists','Similar artists']]) {
@@ -2595,7 +2613,7 @@ function showLyricsError(message) {
 
       if (btn1) btn1.innerHTML = "<span>⏳ Saving...</span>";
       if (btn2) btn2.innerHTML = "<span>⏳ Saving...</span>";
-      if (statusMsg) statusMsg.innerText = "Saving your Deezer Flow preferences...";
+      if (statusMsg) statusMsg.innerText = "Saving your Flow preferences...";
 
       try {
         const edits = flowTunerGenres
@@ -2627,9 +2645,10 @@ function showLyricsError(message) {
 
         const data = await res.json();
         if (res.ok && !data.error) {
+          if (data.id) currentFlowId = data.id;
           flowTunerGenres.forEach(g => { g.originalEnabled = g.isEnabled; });
           showToast("✓ Flow preferences saved!");
-          if (statusMsg) statusMsg.innerText = data.verified === false ? "Saved. Could not refresh the selection." : "Saved to Deezer.";
+          if (statusMsg) statusMsg.innerText = data.verified === false ? "Saved. Could not refresh the selection." : "Flow preferences saved.";
           if (data.tuner && data.tuner.genres) {
             flowTunerGenres = data.tuner.genres.map(g => ({
               id: String(g.id || g.clusterId),

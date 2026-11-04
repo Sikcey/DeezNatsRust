@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.5
+
+- Add YouTube Music search, full discovery shelves, collection browsing, playback controls and queue editing to Connect.
+- Connect YouTube Flow, genre tuning and Style Mix to the host's radio generators.
+- Improve YouTube seeking and mood/genre radio recommendations.
+- Fix early Apple TTML lyric timestamps, playlist menu scrolling and input isolation.
+- Improve Style Mix search, catalog layout, hover rendering and playlist membership checks.
+
 ## 0.1.4
 
 - Add staggered lyric scrolling, fading viewport edges and clear lyrics during manual scrolling.

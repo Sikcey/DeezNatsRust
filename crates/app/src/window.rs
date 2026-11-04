@@ -2856,7 +2856,7 @@ unsafe fn scroll_to(hwnd: HWND, app: &mut App, position: i32) {
             )
             && (position - app.layout_scroll).abs() < ui::SCROLL_OVERSCAN - 32);
     if !reuse {
-        if flow_tune {
+        if flow_tune || app.ui.view == View::StyleMix {
             rebuild(hwnd, app);
             return;
         }
@@ -2893,6 +2893,10 @@ unsafe fn scroll_to(hwnd: HWND, app: &mut App, position: i32) {
             return;
         }
     } else {
+        if app.ui.view == View::StyleMix {
+            rebuild(hwnd, app);
+            return;
+        }
         if flow_tune {
             for button in &mut app.scene.buttons {
                 if matches!(
@@ -3029,13 +3033,17 @@ unsafe fn rebuild(hwnd: HWND, app: &mut App) {
     if let Some(control) = app.edits.get(&SEARCH) {
         let hint = app
             .ui
-            .t(if app.ui.view == View::FlowTune {
-                "Search genres and subgenres\u{2026}"
-            } else if app.ui.view == View::Podcasts {
-                "Search podcasts\u{2026}"
-            } else {
-                "Search songs, artists, albums, playlists or podcasts\u{2026}"
-            })
+            .t(
+                if app.ui.view == View::StyleMix && app.ui.mix_region == usize::MAX {
+                    "Search languages\u{2026}"
+                } else if matches!(app.ui.view, View::FlowTune | View::StyleMix) {
+                    "Search genres and subgenres\u{2026}"
+                } else if app.ui.view == View::Podcasts {
+                    "Search podcasts\u{2026}"
+                } else {
+                    "Search songs, artists, albums, playlists or podcasts\u{2026}"
+                },
+            )
             .to_owned();
         if hint != app.search_hint {
             SendMessageW(*control, EM_SETCUEBANNER, 1, wide(&hint).as_ptr() as isize);
@@ -3212,7 +3220,8 @@ unsafe fn rebuild(hwnd: HWND, app: &mut App) {
                 control,
                 r.unwrap_or(Rect::new(0, 0, 1, 1)),
                 r.is_some_and(|r| {
-                    matches!(id, SEARCH | SEEK | VOLUME)
+                    (matches!(id, SEARCH | SEEK | VOLUME)
+                        && !(id == SEARCH && app.ui.view == View::StyleMix))
                         || (r.y >= app.scene.content_top && r.y + r.h <= content_bottom(app, h))
                 }),
             );
@@ -8579,7 +8588,7 @@ unsafe fn draw_caption_controls(
         GetCursorPos(&mut cursor);
         ScreenToClient(hwnd, &mut cursor);
         for (i, rect) in rects.into_iter().enumerate() {
-            let hover = PtInRect(&rect, cursor) != 0;
+            let hover = !popup::active() && PtInRect(&rect, cursor) != 0;
             if ui.traffic_lights {
                 let diameter = (height * 14 / 31).max(10);
                 let cx = (rect.left + rect.right) / 2;
@@ -8724,7 +8733,7 @@ unsafe fn paint_caption(
     let mut cursor: POINT = zeroed();
     GetCursorPos(&mut cursor);
     ScreenToClient(hwnd, &mut cursor);
-    let collapse_hover = PtInRect(&collapse_rect, cursor) != 0;
+    let collapse_hover = !popup::active() && PtInRect(&collapse_rect, cursor) != 0;
     if collapse_hover {
         crate::drawing::fill(
             memory,
@@ -9245,6 +9254,13 @@ unsafe fn render_region(
         GetCursorPos(&mut cursor);
         screen_to_content(hwnd, &mut cursor);
         let argb = crate::drawing::argb;
+        // Paint-time hit tests must respect the popup's modal input boundary.
+        if popup::active() {
+            cursor = POINT {
+                x: i32::MIN / 2,
+                y: i32::MIN / 2,
+            };
+        }
         let accent = app.accent();
 
         if app.ui.view == View::Lyrics && app.ui.lyrics_visualizer {
@@ -10517,11 +10533,14 @@ unsafe fn render_region(
                     app.px(viewport.y + viewport.h),
                 );
             }
-            let test_rect = if let Some(group) = node.artist_credit_group {
-                app.rect(group)
-            } else {
-                app.rect(node.rect)
-            };
+            let test_rect =
+                if matches!(&node.action, Action::OpenItem(_)) && !node.artwork.is_empty() {
+                    card_glow_rect(app, node)
+                } else if let Some(group) = node.artist_credit_group {
+                    app.rect(group)
+                } else {
+                    app.rect(node.rect)
+                };
             if RectVisible(memory, &test_rect) == 0 {
                 RestoreDC(memory, saved);
                 continue;
@@ -10974,6 +10993,28 @@ fn lerp_argb(c1: u32, c2: u32, t: f32) -> u32 {
 
     (a << 24) | (r << 16) | (g << 8) | b
 }
+fn card_glow_rect(app: &App, node: &ui::Button) -> RECT {
+    let mut glow = app.rect(node.rect);
+    glow.left += 2;
+    glow.top += 2;
+    glow.right -= 3;
+    glow.bottom -= 3;
+    if let Some(label) = app.scene.buttons.iter().find(|label| {
+        label.text_link
+            && label.rect.y == node.rect.y + node.rect.h + 12
+            && label.rect.x + label.rect.w / 2 == node.rect.x + node.rect.w / 2
+    }) {
+        let label_rect = app.rect(label.rect);
+        glow.left = glow.left.min(label_rect.left);
+        glow.right = glow.right.max(label_rect.right);
+    }
+    glow.left -= app.px(6);
+    glow.top -= app.px(8);
+    glow.right += app.px(6);
+    glow.bottom += app.px(64);
+    glow
+}
+
 unsafe fn draw_button(hwnd: HWND, app: &App, draw: &DRAWITEMSTRUCT) {
     let _surface = crate::drawing::SurfaceOpacity::set(app.ui.surface_opacity);
     let index = (draw.CtlID as usize).saturating_sub(1000);
@@ -10982,7 +11023,7 @@ unsafe fn draw_button(hwnd: HWND, app: &App, draw: &DRAWITEMSTRUCT) {
     };
     let palette = app.palette();
     let active = draw.itemState & ODS_SELECTED != 0;
-    let hover = draw.itemState & ODS_HOTLIGHT != 0;
+    let hover = !popup::active() && draw.itemState & ODS_HOTLIGHT != 0;
     let disabled = draw.itemState & ODS_DISABLED != 0;
     let mut r = draw.rcItem;
     r.left += 2;
@@ -11915,22 +11956,12 @@ unsafe fn draw_button(hwnd: HWND, app: &App, draw: &DRAWITEMSTRUCT) {
     }
 
     if card && hover {
-        let mut glow = r;
-        // Include the full metadata width, with clearance inside each shelf cell.
-        if let Some(label) = app.scene.buttons.iter().find(|label| {
-            label.text_link
-                && label.rect.y == node.rect.y + node.rect.h + 12
-                && label.rect.x + label.rect.w / 2 == node.rect.x + node.rect.w / 2
-        }) {
-            let label_rect = app.rect(label.rect);
-            glow.left = glow.left.min(label_rect.left);
-            glow.right = glow.right.max(label_rect.right);
-        }
-        glow.left -= app.px(6);
-        glow.top -= app.px(8);
-        glow.right += app.px(6);
-        glow.bottom += app.px(64);
-        crate::drawing::fill(draw.hDC, glow, argb(accent, 38), app.corner(12) as f32);
+        crate::drawing::fill(
+            draw.hDC,
+            card_glow_rect(app, node),
+            argb(accent, 38),
+            app.corner(12) as f32,
+        );
     }
 
     if !card && !track && (!minimal || hover || active || node.selected) {
@@ -12190,6 +12221,42 @@ unsafe fn restrict_batch_menu(menu: HMENU) {
     }
 }
 
+fn cached_playlist_contains_all(page: &crate::catalog::Page, track_ids: &[&str]) -> bool {
+    if track_ids.is_empty() || track_ids.iter().any(|id| id.is_empty()) {
+        return false;
+    }
+    let present: std::collections::HashSet<&str> = page
+        .rows
+        .iter()
+        .filter(|entry| entry.kind == "track")
+        .map(|entry| entry.id.as_str())
+        .collect();
+    track_ids.iter().all(|id| present.contains(id))
+}
+
+#[cfg(test)]
+mod playlist_menu_membership_tests {
+    use super::*;
+
+    #[test]
+    fn hides_only_confirmed_complete_selection_membership() {
+        let page = crate::catalog::Page {
+            rows: vec![crate::catalog::Entry {
+                kind: "track".into(),
+                id: "one".into(),
+                ..Default::default()
+            }],
+            // Even a partial page can prove presence, never absence.
+            next: "more".into(),
+            ..Default::default()
+        };
+        assert!(cached_playlist_contains_all(&page, &["one"]));
+        assert!(!cached_playlist_contains_all(&page, &["one", "two"]));
+        assert!(!cached_playlist_contains_all(&page, &[]));
+        assert!(!cached_playlist_contains_all(&page, &[""]));
+    }
+}
+
 unsafe fn show_context_menu(hwnd: HWND, app: &mut App, pt: POINT, quick: bool) {
     let (w, h) = size(hwnd, app);
     let hit = app.scene.buttons.iter().find(|b| {
@@ -12281,6 +12348,27 @@ unsafe fn show_context_menu(hwnd: HWND, app: &mut App, pt: POINT, quick: bool) {
         } else {
             item.clone()
         };
+        // Use only confirmed cached membership: never fetch every playlist just
+        // to open a menu. A batch destination is redundant only if all tracks
+        // are already present; partially populated destinations remain usable.
+        let track_ids: Vec<&str> = if batch {
+            selected.iter().map(|entry| entry.id.as_str()).collect()
+        } else if item.kind == "track" {
+            vec![item.id.as_str()]
+        } else {
+            Vec::new()
+        };
+        let excluded_playlists: std::collections::HashSet<String> = app
+            .ui
+            .page
+            .iter()
+            .chain(app.page_cache.iter().map(|(_, page)| page))
+            .filter_map(|page| {
+                let entity = page.entity.as_ref()?;
+                (entity.kind == "playlist" && cached_playlist_contains_all(page, &track_ids))
+                    .then(|| entity.id.clone())
+            })
+            .collect();
         let menu = CreatePopupMenu();
         let removable = app.ui.view == View::Offline
             && ((item.kind == "offline_collection" && !item.id.starts_with("__"))
@@ -12364,7 +12452,9 @@ unsafe fn show_context_menu(hwnd: HWND, app: &mut App, pt: POINT, quick: bool) {
                         .chain(page.rows.iter())
                 })
                 .filter(|entry| {
-                    entry.kind == "playlist" && crate::playlist::can_edit(entry, &app.ui.account)
+                    entry.kind == "playlist"
+                        && crate::playlist::can_edit(entry, &app.ui.account)
+                        && !excluded_playlists.contains(&entry.id)
                 })
                 .fold(
                     Vec::new(),
@@ -12443,11 +12533,13 @@ unsafe fn show_context_menu(hwnd: HWND, app: &mut App, pt: POINT, quick: bool) {
             let account = app.ui.account.clone();
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
-                let _ = tx.send(crate::catalog::editable_menu_playlists(
-                    engine.as_deref(),
-                    provider,
-                    &account,
-                ));
+                let result =
+                    crate::catalog::editable_menu_playlists(engine.as_deref(), provider, &account)
+                        .map(|mut playlists| {
+                            playlists.retain(|playlist| !excluded_playlists.contains(&playlist.id));
+                            playlists
+                        });
+                let _ = tx.send(result);
             });
             Some(rx)
         } else {

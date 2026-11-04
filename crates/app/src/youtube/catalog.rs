@@ -570,7 +570,7 @@ async fn load(
                 .into();
             } else {
                 (page.rows, page.next) = tuned_flow(api, &query, 0).await?;
-                page.subtitle = "YouTube Music playlists for your mood and genres".into();
+                page.subtitle = "YouTube Music radio for your mood and genres".into();
             }
         }
         View::StyleMix => {
@@ -578,33 +578,7 @@ async fn load(
                 let selection =
                     crate::style_mix::Selection::parse(&query).map_err(anyhow::Error::msg)?;
                 page.title = selection.title();
-                let playlists = api.search_playlists(&page.title).await?;
-                let mut seen = std::collections::HashSet::new();
-                for p in playlists.into_iter().take(3) {
-                    if let Ok(detail) = api.playlist_page(&p.id).await {
-                        page.rows.extend(
-                            detail
-                                .tracks
-                                .into_iter()
-                                .filter(|t| {
-                                    mix_song(t)
-                                        && t.video_id
-                                            .as_ref()
-                                            .is_some_and(|id| seen.insert(id.clone()))
-                                })
-                                .map(track),
-                        );
-                    }
-                }
-                if page.rows.is_empty() {
-                    page.rows = api
-                        .search_songs(&page.title)
-                        .await?
-                        .into_iter()
-                        .filter(mix_song)
-                        .map(track)
-                        .collect();
-                }
+                page.rows = mix_lane(api, &page.title, 0).await?;
                 for t in &mut page.rows {
                     t.raw[crate::style_mix::MARKER] = json!(selection.key());
                 }
@@ -619,7 +593,7 @@ async fn load(
     Ok(page)
 }
 // Bound each batch while rotating through every selected genre and deeper playlists.
-// Playlist search is used because YouTube genre radio is not implemented.
+// Seeds are selected from matching playlists and expanded with YouTube radio.
 pub(super) async fn continue_flow(
     api: &YtMusic,
     key: &str,
@@ -671,42 +645,13 @@ async fn tuned_flow_batch(
     let mut lanes = Vec::new();
     let mut last_error = String::new();
     for (query, rank) in flow_query_plan(&queries, offset) {
-        let mut rows = Vec::new();
-        match api.search_playlists(&query).await {
-            Ok(playlists) => {
-                for playlist in playlists.into_iter().skip(rank).take(2) {
-                    match api.playlist_page(&playlist.id).await {
-                        Ok(page) => {
-                            rows = page
-                                .tracks
-                                .into_iter()
-                                .filter(mix_song)
-                                .map(track)
-                                .take(20)
-                                .collect();
-                            if !rows.is_empty() {
-                                break;
-                            }
-                        }
-                        Err(error) => last_error = error.to_string(),
-                    }
-                }
+        let rows = match mix_lane(api, &query, rank).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                last_error = error.to_string();
+                Vec::new()
             }
-            Err(error) => last_error = error.to_string(),
-        }
-        if rows.is_empty() {
-            match api.search_songs(&query).await {
-                Ok(tracks) => {
-                    rows = tracks
-                        .into_iter()
-                        .filter(mix_song)
-                        .map(track)
-                        .take(20)
-                        .collect()
-                }
-                Err(error) => last_error = error.to_string(),
-            }
-        }
+        };
         lanes.push(rows);
     }
     let next_offset = offset.saturating_add(queries.len().min(4));
@@ -719,6 +664,47 @@ async fn tuned_flow_batch(
         row.raw["_youtube_flow_offset"] = json!(next_offset);
     }
     Ok((rows, json!({"flow":key,"offset":next_offset}).to_string()))
+}
+
+// Search supplies a genre-relevant seed; YouTube's automix supplies the station.
+async fn mix_lane(api: &YtMusic, query: &str, rank: usize) -> anyhow::Result<Vec<Entry>> {
+    let mut seeds = Vec::new();
+    if let Ok(playlists) = api.search_playlists(query).await {
+        for playlist in playlists.into_iter().skip(rank).take(2) {
+            if let Ok(page) = api.playlist_page(&playlist.id).await {
+                seeds.extend(page.tracks.into_iter().filter(mix_song));
+                if !seeds.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+    if seeds.is_empty() {
+        seeds = api
+            .search_songs(query)
+            .await?
+            .into_iter()
+            .filter(mix_song)
+            .collect();
+    }
+    if seeds.is_empty() {
+        return Ok(Vec::new());
+    }
+    let seed = &seeds[rank % seeds.len()];
+    if let Some(video) = seed.video_id.as_deref() {
+        if let Ok(radio) = api.track_radio(video).await {
+            let rows: Vec<_> = radio
+                .into_iter()
+                .filter(mix_song)
+                .map(track)
+                .take(20)
+                .collect();
+            if !rows.is_empty() {
+                return Ok(rows);
+            }
+        }
+    }
+    Ok(seeds.into_iter().map(track).take(20).collect())
 }
 
 fn flow_query_plan(queries: &[String], offset: usize) -> Vec<(String, usize)> {
@@ -849,6 +835,131 @@ pub(crate) fn process(generation: u64, job: Job, tx: &EventSender, current: &Ato
         let _ = tx.send(Event::Page(generation, Arc::new(page)));
     }
 }
+// Reuse the desktop adapter so Connect uses the host account and provider IDs.
+pub(crate) fn connect_station(style: bool, key: &str) -> Result<Vec<Entry>, String> {
+    if style {
+        crate::style_mix::Selection::parse(key)?;
+    } else {
+        crate::spotify::flow::Selection::parse(key)?;
+    }
+    let api = super::api()?;
+    super::runtime()
+        .block_on(load(
+            &api,
+            if style { View::StyleMix } else { View::Flow },
+            None,
+            key.into(),
+        ))
+        .map(|page| page.rows)
+        .map_err(|e| e.to_string())
+}
+
+pub(crate) fn connect_catalog(
+    action: &str,
+    query: &str,
+    collection_id: &str,
+) -> Result<Value, String> {
+    if action == "search" && query.trim().is_empty() {
+        return Ok(
+            json!({"tracks":[],"albums":[],"playlists":[],"artists":[],"podcasts":[],"provider":"youtube"}),
+        );
+    }
+    let (view, entity, search) = match action {
+        "search" => (View::Home, None, query.to_owned()),
+        "discover" => (View::Explore, None, String::new()),
+        "collection" => {
+            if !matches!(query, "album" | "playlist" | "artist" | "channel")
+                || !collection_id.starts_with(&format!("youtube:{query}:"))
+                || bare(collection_id).is_empty()
+            {
+                return Err("Refresh the host catalog before opening this YouTube item".into());
+            }
+            (
+                View::Album,
+                Some(Entry {
+                    id: collection_id.into(),
+                    kind: query.into(),
+                    raw: if query == "channel" {
+                        json!({"browse_id":"FEmusic_moods_and_genres_category","params":bare(collection_id)})
+                    } else {
+                        json!({})
+                    },
+                    ..Default::default()
+                }),
+                String::new(),
+            )
+        }
+        _ => return Err("Unsupported YouTube catalog request".into()),
+    };
+    let api = super::api()?;
+    let page = super::runtime()
+        .block_on(async {
+            let mut page = load(&api, view, entity, search).await?;
+            if action == "collection" || action == "discover" {
+                let mut cursors = std::collections::HashSet::new();
+                while !page.next.is_empty() && cursors.insert(page.next.clone()) {
+                    more(&api, &mut page).await?;
+                }
+            }
+            Ok::<_, anyhow::Error>(page)
+        })
+        .map_err(|e| e.to_string())?;
+    let items = |entries: &[Entry]| {
+        entries
+            .iter()
+            .map(|e| {
+                json!({
+                    "id":e.id,"kind":e.kind,"title":e.title,"artist":e.subtitle,
+                    "subtitle":e.subtitle,"album":e.album,"artwork":e.artwork,
+                    "duration":e.duration / 1000,"duration_ms":e.duration,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut result = json!({"provider":"youtube"});
+    result["sections"] = json!(page
+        .sections
+        .iter()
+        .map(|section| json!({"title":section.title,"items":items(&section.entries)}))
+        .collect::<Vec<_>>());
+    match action {
+        "search" | "collection" => {
+            result["tracks"] = json!(items(&page.rows));
+            for (key, kind) in [
+                ("albums", "album"),
+                ("playlists", "playlist"),
+                ("artists", "artist"),
+            ] {
+                let entries: Vec<_> = page
+                    .sections
+                    .iter()
+                    .flat_map(|s| &s.entries)
+                    .filter(|e| e.kind == kind)
+                    .cloned()
+                    .collect();
+                result[key] = json!(items(&entries));
+            }
+            result["podcasts"] = json!([]);
+            if action == "collection" {
+                result["id"] = json!(collection_id);
+                result["kind"] = json!(query);
+            }
+        }
+        _ => {
+            result["sections"] = json!(page
+                .sections
+                .iter()
+                .filter_map(|section| {
+                    let entries: Vec<_> = section.entries.iter().cloned().collect();
+                    (!entries.is_empty())
+                        .then(|| json!({"title":section.title,"items":items(&entries)}))
+                })
+                .collect::<Vec<_>>());
+        }
+    }
+    Ok(result)
+}
+
 pub(crate) fn invoke(name: &str, args: &[Value]) -> Result<Value, String> {
     if name.ends_with("StyleMixGenres") || name == "StyleMixGenres" {
         return crate::style_mix::genre_options(

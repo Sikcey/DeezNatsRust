@@ -762,21 +762,6 @@ fn handle_client(
     // A captured host provider prevents requests falling through to Deezer
     // catalog calls or public fallbacks while Spotify is selected.
     let host = state.read().unwrap().snapshot.clone();
-    if host.provider == Provider::YouTube
-        && path.starts_with("/api/")
-        && path != "/api/presence"
-        && !(method == "GET"
-            && matches!(
-                path,
-                "/api/state" | "/api/queue" | "/api/stream" | "/api/spectrum" | "/api/appearance"
-            ))
-    {
-        send_error(
-            stream,
-            "YouTube Music remote controls and catalog are unavailable. Use the desktop player.",
-        );
-        return;
-    }
     if method == "POST" && path == "/api/presence" {
         let payload = serde_json::from_str::<serde_json::Value>(body_slice).unwrap_or_default();
         let id = payload["id"].as_str().unwrap_or("");
@@ -828,7 +813,7 @@ fn handle_client(
         state,
         provider: host.provider,
     };
-    if host.provider == Provider::Spotify {
+    if matches!(host.provider, Provider::Spotify | Provider::YouTube) {
         if let Some(result) =
             spotify_station_request(method, path, query, body_slice, &host, &command_tx)
         {
@@ -838,7 +823,19 @@ fn handle_client(
             }
             return;
         }
-        if let Some(result) = spotify_guest_request(method, path, query, &host) {
+        if let Some(result) = (host.provider == Provider::Spotify)
+            .then(|| spotify_guest_request(method, path, query, &host))
+            .flatten()
+        {
+            match result {
+                Ok(value) => send_json(stream, &value),
+                Err(error) => send_error(stream, &error),
+            }
+            return;
+        }
+    }
+    if host.provider == Provider::YouTube {
+        if let Some(result) = youtube_guest_request(method, path, query) {
             match result {
                 Ok(value) => send_json(stream, &value),
                 Err(error) => send_error(stream, &error),
@@ -1620,6 +1617,8 @@ impl HostCommands<'_> {
 fn valid_host_payload(provider: Provider, value: &serde_json::Value) -> bool {
     let name = if provider == Provider::Spotify {
         "spotify"
+    } else if provider == Provider::YouTube {
+        "youtube"
     } else {
         "deezer"
     };
@@ -1627,7 +1626,10 @@ fn valid_host_payload(provider: Provider, value: &serde_json::Value) -> bool {
         return false;
     }
     if let Some(id) = value["id"].as_str() {
-        if !id.is_empty() && (id.starts_with("spotify:") != (provider == Provider::Spotify)) {
+        if !id.is_empty()
+            && (id.starts_with("spotify:") != (provider == Provider::Spotify)
+                || id.starts_with("youtube:") != (provider == Provider::YouTube))
+        {
             return false;
         }
     }
@@ -1636,8 +1638,6 @@ fn valid_host_payload(provider: Provider, value: &serde_json::Value) -> bool {
             if !track.is_object() {
                 return false;
             }
-            let mut track = track.clone();
-            track["provider"] = serde_json::json!(name);
             valid_host_payload(provider, &track)
         })
     })
@@ -1655,16 +1655,27 @@ fn spotify_station_request(
     if !path.starts_with("/api/flow") && !path.starts_with("/api/style-mix") {
         return None;
     }
-    let invoke = |name: &str, args: &[Value]| crate::spotify::catalog_invoke(name, args);
+    let youtube = _host.provider == Provider::YouTube;
+    let invoke = |name: &str, args: &[Value]| {
+        if youtube {
+            crate::youtube::invoke(name, args)
+        } else {
+            crate::spotify::catalog_invoke(name, args)
+        }
+    };
     let payload: Value = serde_json::from_str(body).unwrap_or_default();
     Some((|| match (method, path) {
         ("GET", "/api/flow") => {
             let config = get_query_param(query, "config").unwrap_or_else(|| "default".into());
             let options = invoke("DZFlowConfigsJSON", &[])?;
-            let tracks = invoke("DZFlowForConfigJSON", &[json!(config)])?;
+            let tracks = if youtube {
+                crate::youtube::connect_station(false, &config)?
+            } else {
+                crate::catalog::entries(&invoke("DZFlowForConfigJSON", &[json!(config)])?, "track")
+            };
             let tuner = invoke("DZFlowTunerJSON", &[json!(config)])?;
             Ok(
-                json!({"options":options["options"],"tracks":crate::catalog::entries(&tracks,"track").iter().map(style_mix_track).collect::<Vec<_>>(),"config":config,"customizable":tuner["customizable"]}),
+                json!({"options":options["options"],"tracks":tracks.iter().map(style_mix_track).collect::<Vec<_>>(),"config":config,"customizable":tuner["customizable"]}),
             )
         }
         ("GET", "/api/flow/tuner") => invoke(
@@ -1678,7 +1689,7 @@ fn spotify_station_request(
                 return Err("Select at least one genre".into());
             }
             let id = payload["flow_id"].as_str().unwrap_or("default");
-            let edits: Vec<_> = payload["genres"].as_array().into_iter().flatten().map(|genre| json!({"clusterId":genre["id"],"isEnabled":genre["enabled"].as_bool().unwrap_or(false),"isEditedByUser":true})).collect();
+            let edits: Vec<_> = payload["genres"].as_array().into_iter().flatten().map(|genre| json!({"clusterId":genre["id"],"isEnabled":genre["isEnabled"].as_bool().or_else(|| genre["enabled"].as_bool()).unwrap_or(false),"isEditedByUser":true})).collect();
             invoke(
                 "DZSaveFlowTunerJSON",
                 &[json!(id), json!(json!(edits).to_string())],
@@ -1716,12 +1727,17 @@ fn spotify_station_request(
                     None,
                 )
             };
-            let value = if style {
-                crate::catalog::spotify_style_mix(&selection.as_ref().unwrap().key())?
+            let entries = if youtube {
+                crate::youtube::connect_station(style, args[0].as_str().unwrap_or("default"))?
+            } else if style {
+                crate::catalog::entries(
+                    &crate::catalog::spotify_style_mix(&selection.as_ref().unwrap().key())?,
+                    "track",
+                )
             } else {
-                invoke(name, &args)?
+                crate::catalog::entries(&invoke(name, &args)?, "track")
             };
-            let tracks: Vec<_> = crate::catalog::entries(&value, "track")
+            let tracks: Vec<_> = entries
                 .into_iter()
                 .map(|entry| {
                     let mut entry = entry;
@@ -1729,7 +1745,9 @@ fn spotify_station_request(
                         entry.raw[crate::style_mix::MARKER] = json!(selection.key());
                         entry.raw["style_mix_title"] = json!(selection.title());
                     }
-                    entry.raw["spotify_station"] = json!({"name":name,"args":args});
+                    if !youtube {
+                        entry.raw["spotify_station"] = json!({"name":name,"args":args});
+                    }
                     attribute_entry(entry, &payload)
                 })
                 .collect();
@@ -1800,6 +1818,33 @@ fn spotify_guest_request(
         _ => return None,
     };
     Some(result)
+}
+
+fn youtube_guest_request(
+    method: &str,
+    path: &str,
+    query: &str,
+) -> Option<Result<serde_json::Value, String>> {
+    let request = match (method, path) {
+        ("GET", "/api/search") => (
+            "search",
+            get_query_param(query, "q").unwrap_or_default(),
+            String::new(),
+        ),
+        ("GET", "/api/discover") => ("discover", String::new(), String::new()),
+        ("GET", "/api/collection") => (
+            "collection",
+            get_query_param(query, "kind").unwrap_or_default(),
+            get_query_param(query, "id").unwrap_or_default(),
+        ),
+        (_, "/api/lyrics") => {
+            return Some(Err("Use the desktop player for YouTube Music lyrics".into()));
+        }
+        _ => return None,
+    };
+    Some(crate::youtube::connect_catalog(
+        request.0, &request.1, &request.2,
+    ))
 }
 
 fn connect_queue(snapshot: &Snapshot) -> Vec<serde_json::Value> {
@@ -2529,6 +2574,112 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(empty["tracks"].as_array().unwrap().is_empty());
+    }
+    #[test]
+    fn youtube_catalog_routes_and_payloads_stay_on_host_provider() {
+        use super::*;
+        use serde_json::json;
+        let empty = youtube_guest_request("GET", "/api/search", "q=")
+            .unwrap()
+            .unwrap();
+        assert_eq!(empty["provider"], "youtube");
+        assert!(empty["tracks"].as_array().unwrap().is_empty());
+        let (tx, _rx) = std::sync::mpsc::sync_channel(4);
+        let hub = ConnectHub::start(0, tx.clone()).unwrap();
+        hub.update(&Snapshot {
+            provider: Provider::YouTube,
+            ..Default::default()
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", hub.port())).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        write!(
+            client,
+            "GET /api/search?q=&host_provider=youtube HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).unwrap(),
+            empty
+        );
+        for query in [
+            "kind=album&id=123",
+            "kind=playlist&id=spotify:playlist:abc",
+            "kind=album&id=youtube:playlist:abc",
+        ] {
+            assert!(youtube_guest_request("GET", "/api/collection", query)
+                .unwrap()
+                .is_err());
+        }
+        assert!(youtube_guest_request("POST", "/api/play", "").is_none());
+        assert!(youtube_guest_request("GET", "/api/flow", "").is_none());
+        let host = Snapshot {
+            provider: Provider::YouTube,
+            ..Default::default()
+        };
+        let commands = HostCommands {
+            tx: &tx,
+            state: &hub.state,
+            provider: Provider::YouTube,
+        };
+        let options = spotify_station_request("GET", "/api/style-mix", "", "", &host, &commands)
+            .unwrap()
+            .unwrap();
+        assert_eq!(options, crate::style_mix::options());
+        assert!(spotify_station_request(
+            "GET",
+            "/api/flow/tuner",
+            "id=chill",
+            "",
+            &host,
+            &commands
+        )
+        .unwrap()
+        .is_ok());
+        let saved = spotify_station_request(
+            "POST",
+            "/api/flow/tuner/save",
+            "",
+            r#"{"flow_id":"chill","genres":[{"id":"Jazz","isEnabled":true}]}"#,
+            &host,
+            &commands,
+        )
+        .unwrap()
+        .unwrap();
+        let restored =
+            crate::spotify::flow::Selection::parse(saved["id"].as_str().unwrap()).unwrap();
+        assert!(restored.genres.iter().any(|genre| genre == "Jazz"));
+        assert!(spotify_station_request(
+            "GET",
+            "/api/style-mix",
+            "selection=invalid",
+            "",
+            &host,
+            &commands
+        )
+        .unwrap()
+        .is_err());
+        assert!(valid_host_payload(
+            Provider::YouTube,
+            &json!({"provider":"youtube","tracks":[{"id":"youtube:track:abc"}]})
+        ));
+        for provider in [Provider::Deezer, Provider::Spotify] {
+            assert!(!valid_host_payload(
+                provider,
+                &json!({"id":"youtube:track:abc"})
+            ));
+        }
+        for payload in [
+            json!({"id":"123"}),
+            json!({"id":"spotify:track:abc"}),
+            json!({"tracks":[{"provider":"deezer","id":"youtube:track:abc"}]}),
+        ] {
+            assert!(!valid_host_payload(Provider::YouTube, &payload));
+        }
     }
     #[test]
     fn queue_attribution_is_bounded_and_removes_control_characters() {

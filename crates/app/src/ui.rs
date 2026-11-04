@@ -396,6 +396,19 @@ impl Rect {
         Self { x, y, w, h }
     }
 }
+
+fn keep_content_controls_visible(scene: &mut Scene, left: i32) {
+    for button in &mut scene.buttons[scene.content_buttons.clone()] {
+        let shift = (left - button.rect.x).max(0);
+        button.rect.x += shift;
+        if let Some(group) = &mut button.artist_credit_group {
+            group.x += shift;
+        }
+    }
+    for label in &mut scene.labels[scene.content_labels.clone()] {
+        label.rect.x = label.rect.x.max(left);
+    }
+}
 pub struct Button {
     pub rect: Rect,
     pub text: String,
@@ -4258,7 +4271,7 @@ pub fn build(
             }
             View::Home => "Personalized recommendations from Deezer",
             View::Explore => "Discover music, genres and new releases",
-            View::StyleMix => "Choose a language to see its available genres.",
+            View::StyleMix => "Combine the language and music you want to hear.",
             View::Favorites if ui.provider == crate::catalog::Provider::Spotify => {
                 "Your liked songs on Spotify"
             }
@@ -4275,7 +4288,12 @@ pub fn build(
             View::CustomColors => "Customize colors for buttons, text and panels",
             _ => "",
         };
-        let subtitle_str = if let Some(ent) = entity {
+        let subtitle_str = if ui.view == View::Flow {
+            ui.translated_text(&format!(
+                "Get genre based recommendations from {}",
+                ui.provider.label()
+            ))
+        } else if let Some(ent) = entity {
             entity_caption(ent, ui.page.as_deref(), &ent.subtitle, ui)
         } else if !caption.is_empty() {
             ui.t(caption).to_owned()
@@ -5227,6 +5245,9 @@ pub fn build(
             );
             download_progress(&mut s, ui, x, progress_y, cw, h - player_height(ui, w));
         }
+    }
+    if ui.view != View::Lyrics {
+        keep_content_controls_visible(&mut s, ui.content_left());
     }
     let extent = s.buttons[s.content_buttons.clone()]
         .iter()
@@ -7913,6 +7934,24 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(preferences_base().unwrap());
+    }
+
+    #[test]
+    fn content_controls_are_kept_inside_left_boundary() {
+        let mut scene = Scene::default();
+        scene.button(Rect::new(40, 0, 80, 30), "Outside", "", Action::More, false);
+        scene.button(Rect::new(50, 0, 80, 30), "Content", "", Action::More, false);
+        scene.buttons[1].artist_credit_group = Some(Rect::new(45, 0, 100, 30));
+        scene.label(30, 0, 100, "Error", 1);
+        scene.content_buttons = 1..2;
+        scene.content_labels = 0..1;
+
+        keep_content_controls_visible(&mut scene, 70);
+
+        assert_eq!(scene.buttons[0].rect.x, 40);
+        assert_eq!(scene.buttons[1].rect, Rect::new(70, 0, 80, 30));
+        assert_eq!(scene.buttons[1].artist_credit_group.unwrap().x, 65);
+        assert_eq!(scene.labels[0].rect.x, 70);
     }
 
     #[test]

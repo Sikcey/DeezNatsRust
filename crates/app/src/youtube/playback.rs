@@ -279,7 +279,10 @@ impl Player {
                 snapshot.state = "Stopped".into();
                 snapshot.position = 0;
             }
-            Command::Seek(p) => self.seek(*p as u64 * 1000, snapshot),
+            Command::Seek(p) => self.seek(
+                snapshot.duration.saturating_mul((*p).min(100) as u64) / 100,
+                snapshot,
+            ),
             Command::SeekMs(p) => self.seek(*p, snapshot),
             Command::Volume(v) => {
                 self.volume = (*v).min(100) as f32 / 100.;
@@ -342,8 +345,13 @@ impl Player {
         }
     }
     fn seek(&mut self, ms: u64, snapshot: &mut Snapshot) {
-        if let Some(s) = &self.sink {
-            match s.try_seek(Duration::from_millis(ms)) {
+        if let Some(bytes) = self.audio_bytes.clone().filter(|_| self.sink.is_some()) {
+            let ms = if snapshot.duration > 0 {
+                ms.min(snapshot.duration)
+            } else {
+                ms
+            };
+            match self.reopen_output(bytes, Duration::from_millis(ms)) {
                 Ok(()) => snapshot.position = ms,
                 Err(e) => snapshot.message = format!("YouTube seek: {e}"),
             }

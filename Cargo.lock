@@ -385,11 +385,11 @@ checksum = "0c87e182de0887fd5361989c677c4e8f5000cd9491d6d563161a8f3a5519fc7f"
 
 [[package]]
 name = "deeznats-core"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "deeznats-prototype"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -424,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "deeznats-updater"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "qbsdiff",
  "semver",

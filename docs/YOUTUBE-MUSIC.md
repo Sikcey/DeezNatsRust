@@ -30,25 +30,20 @@ search, additional genres and custom genre names. Apply saves a YouTube-specific
 selection that survives provider changes and app restarts. Spotify and Deezer
 selections remain separate. Effects are not provided.
 
-Flow searches YouTube playlists for each selected mood/genre combination (genre
-radio is not implemented), interleaves playable songs, and removes duplicate IDs.
-If playlist lookup fails or returns no playable songs, song search uses the same
-mood/genre query. Each batch processes up to four genres and rotates through all
-selected genres and deeper playlist results on continuation. Playback near the
-queue's end retains the selection rather than switching to an unrelated station.
-Continuation skips already queued tracks, tries up to three batches, and reports
-an error if no new tracks are found. Requests have time limits; partial successful
-genres remain playable when another genre fails. YouTube search ranking and
-playlist metadata determine relevance; strict genre membership is not guaranteed.
-An explicitly opened song radio continues to use YouTube automix.
-
-Both mixes require available songs with artist and album metadata and a duration
-between 30 seconds and 15 minutes. This excludes many unrelated videos and long
-compilations, but can also omit legitimate songs with incomplete metadata.
-Style Mix uses the selected region/language and genre to search playlists
-and combine their songs, with song search as a fallback. This follows YouTube's
-search ranking; it cannot guarantee the language of every result.
-
+Flow searches YouTube playlists for each selected mood/genre combination and
+uses a matching song to start YouTube Music radio. Song search supplies a seed
+when no playlist matches; matching search results are used if radio fails. Each
+batch processes up to four genres, interleaves tracks, removes duplicate IDs, and
+rotates genres and seeds on continuation. Playback retains the Flow selection,
+skips queued tracks, and tries up to three batches for new tracks. Requests have
+time limits. Search ranking and YouTube's song-based recommendations affect
+relevance; strict genre membership is not guaranteed. YouTube does not expose a
+separate genre radio through this integration. An explicitly opened song radio
+also uses YouTube automix.
+Both mixes require songs with artist and album metadata and a duration between
+30 seconds and 15 minutes. This can omit legitimate songs with incomplete metadata.
+Style Mix uses the selected region/language and genre to find a seed for YouTube
+radio, with the same search fallback. Language is not guaranteed.
 Playback supports pause/resume, seek, volume, next/previous, repeat, shuffle,
 explicit queue insertion/reordering, Windows media controls and shared lyrics
 lookup. The resolver uses the pinned ytmusic-rs client, including signature
@@ -63,7 +58,10 @@ Offline downloads and crossfade are unavailable. Decoded audio is converted to
 Connect WAV/MP3 listening and visualizers consume that pre-volume PCM even at
 zero host volume. Visualizers also run with Connect disabled. No Windows endpoint
 or unrelated application is recorded. YouTube Connect supports listening, state
-and queue display; remote catalog and controls remain unavailable.
+and queue display, host-account search, the full Explore discovery feed,
+album/playlist/artist and category browsing, playback controls and queue editing.
+Flow, its genre tuner, and Style Mix use the host's YouTube radio generators.
+Lyrics use the desktop player.
 The audio output follows Windows' default device
 when the output stream is opened.
 

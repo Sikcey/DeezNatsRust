@@ -6,12 +6,11 @@ Service names, content and artwork remain the property of their respective owner
 ## DeezNats and OpenDeezer
 
 The Rust edition adapts the interface, localization catalogs and playback behavior of
-[DeezNats](https://github.com/Sikcey/DeezNats), licensed under AGPL-3.0.
+DeezNats, licensed under AGPL-3.0.
 The external Go playback engine derives from
 [Cycl0o0/OpenDeezer](https://github.com/Cycl0o0/OpenDeezer), upstream commit
 `8c86ea179ac622c4ac03fc41e6dcacd228fdc492` (v3.1.4), with local modifications.
-Engine provenance, source and licenses remain in the original project's
-[vendor/opendeezer](https://github.com/Sikcey/DeezNats/tree/main/vendor/opendeezer).
+Engine provenance, source and licenses remain in the engine source checkout.
 The engine is not vendored here. Distributors must provide the corresponding
 modified engine source and preserve its notices when shipping its DLL.
 The application license is retained at [LICENSE](LICENSE).

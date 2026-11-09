@@ -16,7 +16,6 @@ licenses and the engine's retained notices continue to apply.
 Project repositories:
 
 - https://github.com/Sikcey/DeezNatsRust
-- https://github.com/Sikcey/DeezNats
 
 User profiles, credentials, downloaded media, and private development files are
 not included in the source archive.

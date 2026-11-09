@@ -28,7 +28,7 @@ Create a Spotify Web API application and register this exact redirect URI:
 Set `DEEZNATS_SPOTIFY_CLIENT_ID` locally to its public client ID, then run:
 
 ```powershell
-cargo run -p deeznats-prototype -- --spotify login
+cargo run -p deeznats -- --spotify login
 ```
 
 A private WebView2 window handles API authorization with PKCE and simultaneously
@@ -132,7 +132,7 @@ playback or invite participants.
 
 ## Catalog commands
 
-Prefix each command below with `cargo run -p deeznats-prototype -- --spotify`:
+Prefix each command below with `cargo run -p deeznats -- --spotify`:
 
 - `profile`
 - `search "search words" track` (also album, artist, playlist, or episode)
@@ -229,7 +229,7 @@ the environment variables afterward. An explicitly empty key is rejected.
 `--spotify forget-soloist-config` removes this saved configuration only.
 
 ```powershell
-cargo run -p deeznats-prototype -- --spotify run
+cargo run -p deeznats -- --spotify run
 ```
 
 The app starts Soloist hidden, with the WebSocket interface bound to `127.0.0.1`
@@ -282,7 +282,7 @@ again. A failed event connection is bounded rather than leaving setup busy forev
 
 ## Local installation and update automation
 
-Prefix these commands with `cargo run -p deeznats-prototype -- --spotify`:
+Prefix these commands with `cargo run -p deeznats -- --spotify`:
 
 1. `soloist-open-downloads` opens Spotify's official download instructions in your
    default browser. Download the Windows x64 ZIP yourself.
@@ -380,7 +380,7 @@ No UI files need to change to test these backends.
 - Live API access, combined browser sign-in, actual Soloist event compatibility,
   pairing, and audible playback still need your registration/account/key/build.
 
-Run backend checks with `cargo test --locked -p deeznats-prototype spotify`.
+Run backend checks with `cargo test --locked -p deeznats spotify`.
 The lifecycle fixture requires the Rust toolchain already used to build the app.
 See [Soloist CLI](https://developer.spotify.com/documentation/soloist/reference/command-line),
 [control commands](https://developer.spotify.com/documentation/soloist/reference/soloist-ctl),

@@ -13,7 +13,7 @@ $target = if ($TargetDirectory) {
     if ([IO.Path]::IsPathRooted($TargetDirectory)) { [IO.Path]::GetFullPath($TargetDirectory) }
     else { [IO.Path]::GetFullPath((Join-Path $root $TargetDirectory)) }
 } else { Join-Path $root 'target\diagnostics' }
-& cargo build --locked --release --package deeznats-prototype --features diagnostics --target-dir $target
+& cargo build --locked --release --package deeznats --features diagnostics --target-dir $target
 if ($LASTEXITCODE -ne 0) { throw 'Diagnostics build failed.' }
 $bin = Join-Path $target 'release'
 if (!$EnginePath) { $EnginePath = Join-Path $root 'target\release\libdeezercore.dll' }
@@ -34,7 +34,7 @@ try {
     $env:DEEZNATS_ARTWORK_METRICS = Join-Path $OutputDirectory 'render-memory.jsonl'
     $env:DEEZNATS_TIMING_LOG = Join-Path $OutputDirectory 'timings.jsonl'
     $env:DEEZNATS_GO_MEMORY_LOG = Join-Path $OutputDirectory 'go-memory.jsonl'
-    $app = Start-Process -FilePath (Join-Path $bin 'deeznats-prototype.exe') -WorkingDirectory $root -PassThru
+    $app = Start-Process -FilePath (Join-Path $bin 'deeznats.exe') -WorkingDirectory $root -PassThru
 } finally {
     foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $old[$name], 'Process') }
 }

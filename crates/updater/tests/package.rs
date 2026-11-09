@@ -29,8 +29,8 @@ fn generated_release_patches_only_changed_binary_and_preserves_other_files() {
         .collect();
     let mut after = before.clone();
     after[1000..1012].copy_from_slice(b"patch change");
-    fs::write(old.join("deeznats-prototype.exe"), &before).unwrap();
-    fs::write(new.join("deeznats-prototype.exe"), &after).unwrap();
+    fs::write(old.join("deeznats.exe"), &before).unwrap();
+    fs::write(new.join("deeznats.exe"), &after).unwrap();
     for dir in [&old, &new] {
         fs::write(dir.join("libdeezercore.dll"), b"unchanged engine").unwrap();
     }
@@ -77,7 +77,7 @@ fn generated_release_patches_only_changed_binary_and_preserves_other_files() {
         }],
     };
     commit(&plan, &stage).unwrap();
-    assert_eq!(fs::read(old.join("deeznats-prototype.exe")).unwrap(), after);
+    assert_eq!(fs::read(old.join("deeznats.exe")).unwrap(), after);
     assert_eq!(
         fs::metadata(old.join("libdeezercore.dll"))
             .unwrap()

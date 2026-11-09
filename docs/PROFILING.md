@@ -60,13 +60,13 @@ rendering. Compare identical workloads to measure scrolling performance.
 Device failures discard the GPU surface, redraw through the software renderer,
 and defer another creation attempt for five seconds.
 
-Run `cargo test -p deeznats-prototype gpu_ -- --ignored --nocapture` for the
+Run `cargo test -p deeznats gpu_ -- --ignored --nocapture` for the
 hardware pixel and provider-page tests. These require a Windows GPU session;
 the normal test suite exercises the software renderer.
 
 GPU rendering still requires CPU layout and command submission. For a debug
 executable with symbols and assertions but less CPU overhead, use
-`cargo rustc -p deeznats-prototype --bin deeznats-prototype -- -C opt-level=1`.
+`cargo rustc -p deeznats --bin deeznats -- -C opt-level=1`.
 Instrumented render timings measure CPU submission and presentation calls,
 not GPU execution time.
 

@@ -15,6 +15,12 @@ if ($Release) { $buildArgs += '--release'; $profile = 'release' }
 if ($LASTEXITCODE -ne 0) { throw 'Rust build failed' }
 $output = Join-Path $PWD "target\$profile"
 $outputEngine = Join-Path $output 'libdeezercore.dll'
+$installedEngine = Join-Path $env:LOCALAPPDATA 'Programs/DeezNats/libdeezercore.dll'
+# Debug builds should use the installed engine rather than silently retaining
+# an old DLL copied into target by a previous build.
+if (!$EnginePath -and !$Release -and (Test-Path -LiteralPath $installedEngine)) {
+    $EnginePath = $installedEngine
+}
 if (!$EnginePath -and !(Test-Path -LiteralPath $outputEngine)) {
     $EnginePath = 'E:\DeezerNative\windows\DeezNats\native\libdeezercore.dll'
 }
@@ -22,6 +28,7 @@ if ($EnginePath -and (Test-Path -LiteralPath $EnginePath)) {
     if ((Resolve-Path -LiteralPath $EnginePath).Path -ne $outputEngine) {
         Copy-Item -LiteralPath $EnginePath -Destination $outputEngine -Force
     }
+    Write-Host "Deezer engine: $EnginePath"
 } elseif (!(Test-Path -LiteralPath $outputEngine)) {
     Write-Warning 'Deezer engine DLL unavailable. Account playback requires the Deezer engine.'
 }
@@ -29,6 +36,6 @@ Copy-Item -LiteralPath (Join-Path $PWD 'assets\DeezNats.ico') -Destination (Join
 if (-not $BuildOnly) {
     # This is the interactive window the user is launching.
     if($AppearanceProfile){
-        Start-Process -FilePath (Join-Path $output 'deeznats-prototype.exe') -ArgumentList @('--appearance-profile',('"'+$AppearanceProfile+'"'))
-    }else{Start-Process -FilePath (Join-Path $output 'deeznats-prototype.exe')}
+        Start-Process -FilePath (Join-Path $output 'deeznats.exe') -ArgumentList @('--appearance-profile',('"'+$AppearanceProfile+'"'))
+    }else{Start-Process -FilePath (Join-Path $output 'deeznats.exe')}
 }

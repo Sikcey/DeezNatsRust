@@ -28,8 +28,7 @@ account setup, supported features and provider limitations.
 
 Full playback and available quality depend on your account's entitlements.
 Saved sessions are encrypted for the current Windows user with DPAPI.
-Some features are still in development; download completion and full feature
-parity with the original application are not yet verified.
+Availability and functionality vary by provider and account.
 
 ## Requirements
 
@@ -46,9 +45,7 @@ cargo build --release --locked --workspace
 ```
 
 The Rust source builds without a bundled engine. Playback requires the external
-DLL, which is staged beside the executable by the launcher. The engine derives
-from the [original DeezNats project](https://github.com/Sikcey/DeezNats).
-See [building and testing](docs/BUILDING.md) for engine and installer instructions.
+DLL, which is staged beside the executable by the launcher. See [building and testing](docs/BUILDING.md) for engine and installer instructions.
 
 ## Data and compatibility
 

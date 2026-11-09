@@ -12,13 +12,12 @@ cargo build --release --locked --workspace
 ```
 
 Use `-BuildOnly` to build and stage without opening the window. The main binary
-is `target/release/deeznats-prototype.exe`.
+is `target/release/deeznats.exe`.
 
 ## Playback engine
 
-Engine source is maintained in the [original repository](https://github.com/Sikcey/DeezNats),
-under `vendor/opendeezer`. It is not vendored in this Rust repository.
-Clone that project to a separate checkout. Install Go as required by its `go.mod`
+The modified engine source is not vendored here. Obtain a compatible engine
+source checkout containing `vendor/opendeezer`. Install Go as required by its `go.mod`
 and a Go-compatible x64 C compiler such as MinGW-w64 GCC or LLVM-MinGW.
 
 ```powershell
@@ -75,6 +74,8 @@ replacement restores earlier files from backups. Settings, sessions, downloads,
 and unknown files are outside the update allowlist and are preserved. The engine
 DLL is updated together with the executable when both change.
 
+Builds using the former executable name must be upgraded with the installer or
+installed manually; their updater cannot apply the renamed executable.
 Existing releases without update assets cannot deliver in-app updates. The first
 updater-enabled build must be installed normally. Updates do not create a listener
 or enable Connect.
@@ -96,7 +97,7 @@ Artwork cache diagnostics can be enabled for a single launch in PowerShell:
 
 ```powershell
 $env:DEEZNATS_ARTWORK_METRICS = Join-Path $env:TEMP 'deeznats-artwork-metrics.jsonl'
-.\target\release\deeznats-prototype.exe
+.\target\release\deeznats.exe
 Remove-Item Env:DEEZNATS_ARTWORK_METRICS
 ```
 

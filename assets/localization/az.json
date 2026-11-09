@@ -1,4 +1,5 @@
 {
+  "Session expired. Sign in again.": "Sessiyanın vaxtı bitib. Yenidən daxil olun.",
   "Switch": "Keçid et",
   "Log in to Spotify": "Spotify-a daxil ol",
   "Sign-in data saved": "Giriş məlumatları saxlanılıb",
@@ -1139,6 +1140,9 @@
   "Or paste the Cookie header from your signed-in music.youtube.com browser session.": "Və ya daxil olduğunuz music.youtube.com brauzer sessiyasından Cookie başlığını yapışdırın.",
   "Connect with cookies": "Kukilərlə qoşul",
   "Search for more genres": "Daha çox janr axtar",
+  "Show more": "Daha çox göstər",
+  "Showing up to 40 genres. Search all provider genres and subgenres.": "Ən çox 40 janr göstərilir. Provayderin bütün janr və alt janrlarını axtara bilərsiniz.",
+  "Search all provider genres and subgenres…": "Provayderin bütün janr və alt janrlarında axtar…",
   "Welcome to DeezNats": "DeezNats-a xoş gəlmisiniz",
   "Choose a music provider to get started.": "Başlamaq üçün musiqi provayderi seçin.",
   "Control unavailable": "İdarəetmə mövcud deyil",
@@ -1212,5 +1216,10 @@
   "Redo": "Təkrar et",
   "Cut": "Kəs",
   "Copy": "Kopyala",
-  "Paste": "Yapışdır"
+  "Paste": "Yapışdır",
+  "Refresh mix": "Qarışığı yenilə",
+  "What would you like to listen to in {language}?": "{language} dilində hansı janrı dinləmək istəyirsən?",
+  "From matching {provider} playlists": "Uyğun {provider} pleylistlərindən",
+  "Loading lyrics...": "Mahn\u0131 s\u00f6zl\u0259ri y\u00fckl\u0259nir...",
+  "This song is instrumental.": "Bu mahn\u0131 instrumentald\u0131r."
 }

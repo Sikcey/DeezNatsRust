@@ -74,7 +74,7 @@ fn commit_inner(plan: &ApplyPlan, stage: &Path, backup: &Path) -> Result<(), Str
     let mut completed: Vec<(&ApplyFile, bool)> = Vec::new();
     // Replace the application last, after its engine/resources are ready.
     let mut files: Vec<_> = plan.files.iter().collect();
-    files.sort_by_key(|file| file.name == "deeznats-prototype.exe");
+    files.sort_by_key(|file| file.name == "deeznats.exe");
     for file in files {
         let target = plan.directory.join(&file.name);
         let incoming = backup.join(format!("{}.new", file.name));

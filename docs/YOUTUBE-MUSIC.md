@@ -67,11 +67,11 @@ when the output stream is opened.
 
 ## Verification
 
-Run `cargo check -p deeznats-prototype` and `cargo test --workspace`. The explicit
+Run `cargo check -p deeznats` and `cargo test --workspace`. The explicit
 network check is:
 
 ```powershell
-cargo test -p deeznats-prototype youtube::catalog::tests::live_authenticated_catalog_and_audio -- --ignored --exact
+cargo test -p deeznats youtube::catalog::tests::live_authenticated_catalog_and_audio -- --ignored --exact
 ```
 
 That check uses a saved signed-in session, loads Home/Explore/search/radio, opens an audio
@@ -82,9 +82,9 @@ attestation on a flagged network, audible device output, or interactive UI.
 Flow-specific checks:
 
 ```powershell
-cargo test -p deeznats-prototype flow
-cargo test -p deeznats-prototype youtube::catalog::tests::live_tuned_flow -- --ignored --exact
-cargo build -p deeznats-prototype
+cargo test -p deeznats flow
+cargo test -p deeznats youtube::catalog::tests::live_tuned_flow -- --ignored --exact
+cargo build -p deeznats
 ```
 
 The offline tests cover tuning options, invalid edits, mood/genre query generation,

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.6
+
+- Reorganize application source and assets, improve localization and update packaging.
+
 ## 0.1.5
 
 - Add YouTube Music search, full discovery shelves, collection browsing, playback controls and queue editing to Connect.
@@ -41,6 +45,3 @@
 - Add catalog navigation, queue playback, lyrics, themes and session persistence.
 - Integrate the existing OpenDeezer-based playback engine through its C ABI.
 - Include Connect hosting and a standalone native Connect client.
-
-Earlier Windows Forms releases are documented in the
-[original project changelog](https://github.com/Sikcey/DeezNats/blob/main/CHANGELOG.md).

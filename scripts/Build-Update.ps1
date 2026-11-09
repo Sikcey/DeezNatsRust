@@ -9,7 +9,7 @@ $project = Split-Path $PSScriptRoot -Parent
 if (!$AppDirectory) { $AppDirectory = Join-Path $project 'target/release' }
 if (!$OutputDirectory) { $OutputDirectory = Join-Path $project 'artifacts/update' }
 $AppDirectory = (Resolve-Path -LiteralPath $AppDirectory).Path
-$binaryVersion = (Get-Item -LiteralPath (Join-Path $AppDirectory 'deeznats-prototype.exe')).VersionInfo.ProductVersion
+$binaryVersion = (Get-Item -LiteralPath (Join-Path $AppDirectory 'deeznats.exe')).VersionInfo.ProductVersion
 if ($binaryVersion -ne $Version) { throw "Application version $binaryVersion does not match requested update version $Version." }
 Copy-Item -LiteralPath (Join-Path $project 'assets/licenses/qbsdiff.txt') -Destination (Join-Path $AppDirectory 'qbsdiff.LICENSE') -Force
 $arguments = @('run', '--locked', '--release', '-p', 'deeznats-updater', '--bin', 'deeznats-update-pack', '--', '--current', $AppDirectory, '--version', $Version, '--output', $OutputDirectory)

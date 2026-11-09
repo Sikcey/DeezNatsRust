@@ -384,12 +384,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c87e182de0887fd5361989c677c4e8f5000cd9491d6d563161a8f3a5519fc7f"
 
 [[package]]
-name = "deeznats-core"
-version = "0.1.5"
-
-[[package]]
-name = "deeznats-prototype"
-version = "0.1.5"
+name = "deeznats"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -423,8 +419,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "deeznats-core"
+version = "0.1.6"
+
+[[package]]
 name = "deeznats-updater"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "qbsdiff",
  "semver",

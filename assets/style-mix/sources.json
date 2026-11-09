@@ -1,0 +1,877 @@
+{
+  "files": [
+    {
+      "file": "flag-tr.webp",
+      "source": "https://flagcdn.com/w320/tr.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 788,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-jp.webp",
+      "source": "https://flagcdn.com/w320/jp.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 700,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-kr.webp",
+      "source": "https://flagcdn.com/w320/kr.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 1974,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-fr.webp",
+      "source": "https://flagcdn.com/w320/fr.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 108,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-arab.webp",
+      "source": "https://thumb.wikimedia.org/wikipedia/commons/thumb/2/2b/Flag_of_the_Arab_League.svg/330px-Flag_of_the_Arab_League.svg.png?utm_source=commons.wikimedia.org&utm_campaign=imageinfo&utm_content=thumbnail",
+      "width": 320,
+      "height": 213,
+      "bytes": 27706,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-br.webp",
+      "source": "https://flagcdn.com/w320/br.png",
+      "width": 320,
+      "height": 224,
+      "bytes": 2300,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-es.webp",
+      "source": "https://flagcdn.com/w320/es.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 2828,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-pt.webp",
+      "source": "https://flagcdn.com/w320/pt.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 4486,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-de.webp",
+      "source": "https://flagcdn.com/w320/de.png",
+      "width": 320,
+      "height": 192,
+      "bytes": 62,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-it.webp",
+      "source": "https://flagcdn.com/w320/it.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 106,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-in.webp",
+      "source": "https://flagcdn.com/w320/in.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 1004,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-ir.webp",
+      "source": "https://flagcdn.com/w320/ir.png",
+      "width": 320,
+      "height": 183,
+      "bytes": 1688,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-gr.webp",
+      "source": "https://flagcdn.com/w320/gr.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 164,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-ru.webp",
+      "source": "https://flagcdn.com/w320/ru.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 76,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-cn.webp",
+      "source": "https://flagcdn.com/w320/cn.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 804,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-id.webp",
+      "source": "https://flagcdn.com/w320/id.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 70,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-th.webp",
+      "source": "https://flagcdn.com/w320/th.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 88,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-pl.webp",
+      "source": "https://flagcdn.com/w320/pl.png",
+      "width": 320,
+      "height": 200,
+      "bytes": 50,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-nl.webp",
+      "source": "https://flagcdn.com/w320/nl.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 76,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-se.webp",
+      "source": "https://flagcdn.com/w320/se.png",
+      "width": 320,
+      "height": 200,
+      "bytes": 72,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-no.webp",
+      "source": "https://flagcdn.com/w320/no.png",
+      "width": 320,
+      "height": 233,
+      "bytes": 174,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-fi.webp",
+      "source": "https://flagcdn.com/w320/fi.png",
+      "width": 320,
+      "height": 196,
+      "bytes": 120,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-dk.webp",
+      "source": "https://flagcdn.com/w320/dk.png",
+      "width": 317,
+      "height": 240,
+      "bytes": 234,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-ua.webp",
+      "source": "https://flagcdn.com/w320/ua.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 78,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-ro.webp",
+      "source": "https://flagcdn.com/w320/ro.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 106,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-hu.webp",
+      "source": "https://flagcdn.com/w320/hu.png",
+      "width": 320,
+      "height": 160,
+      "bytes": 100,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-cz.webp",
+      "source": "https://flagcdn.com/w320/cz.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 634,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-rs.webp",
+      "source": "https://flagcdn.com/w320/rs.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 5900,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-hr.webp",
+      "source": "https://flagcdn.com/w320/hr.png",
+      "width": 320,
+      "height": 160,
+      "bytes": 1512,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-al.webp",
+      "source": "https://flagcdn.com/w320/al.png",
+      "width": 320,
+      "height": 229,
+      "bytes": 2600,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-bd.webp",
+      "source": "https://flagcdn.com/w320/bd.png",
+      "width": 320,
+      "height": 192,
+      "bytes": 586,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-pk.webp",
+      "source": "https://flagcdn.com/w320/pk.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 926,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-vn.webp",
+      "source": "https://flagcdn.com/w320/vn.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 668,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-ph.webp",
+      "source": "https://flagcdn.com/w320/ph.png",
+      "width": 320,
+      "height": 160,
+      "bytes": 1428,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-my.webp",
+      "source": "https://flagcdn.com/w320/my.png",
+      "width": 320,
+      "height": 160,
+      "bytes": 952,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-np.webp",
+      "source": "https://flagcdn.com/w320/np.png",
+      "width": 197,
+      "height": 240,
+      "bytes": 9404,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-il.webp",
+      "source": "https://flagcdn.com/w320/il.png",
+      "width": 320,
+      "height": 233,
+      "bytes": 732,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-az.webp",
+      "source": "https://flagcdn.com/w320/az.png",
+      "width": 320,
+      "height": 160,
+      "bytes": 560,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-ge.webp",
+      "source": "https://flagcdn.com/w320/ge.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 744,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-am.webp",
+      "source": "https://flagcdn.com/w320/am.png",
+      "width": 320,
+      "height": 160,
+      "bytes": 102,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-kurd.webp",
+      "source": "https://thumb.wikimedia.org/wikipedia/commons/thumb/3/35/Flag_of_Kurdistan.svg/330px-Flag_of_Kurdistan.svg.png?utm_source=commons.wikimedia.org&utm_campaign=imageinfo&utm_content=thumbnail",
+      "width": 320,
+      "height": 213,
+      "bytes": 7140,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-tz.webp",
+      "source": "https://flagcdn.com/w320/tz.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 912,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-et.webp",
+      "source": "https://flagcdn.com/w320/et.png",
+      "width": 320,
+      "height": 160,
+      "bytes": 1474,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-mx.webp",
+      "source": "https://flagcdn.com/w320/mx.png",
+      "width": 320,
+      "height": 183,
+      "bytes": 2948,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-ar.webp",
+      "source": "https://flagcdn.com/w320/ar.png",
+      "width": 320,
+      "height": 200,
+      "bytes": 1222,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-co.webp",
+      "source": "https://flagcdn.com/w320/co.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 104,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-cl.webp",
+      "source": "https://flagcdn.com/w320/cl.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 362,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-pe.webp",
+      "source": "https://flagcdn.com/w320/pe.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 86,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-cu.webp",
+      "source": "https://flagcdn.com/w320/cu.png",
+      "width": 320,
+      "height": 160,
+      "bytes": 876,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-do.webp",
+      "source": "https://flagcdn.com/w320/do.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 1238,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-pr.webp",
+      "source": "https://flagcdn.com/w320/pr.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 1124,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-jm.webp",
+      "source": "https://flagcdn.com/w320/jm.png",
+      "width": 320,
+      "height": 160,
+      "bytes": 560,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-ng.webp",
+      "source": "https://flagcdn.com/w320/ng.png",
+      "width": 320,
+      "height": 160,
+      "bytes": 84,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-gh.webp",
+      "source": "https://flagcdn.com/w320/gh.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 468,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-za.webp",
+      "source": "https://flagcdn.com/w320/za.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 858,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-ma.webp",
+      "source": "https://flagcdn.com/w320/ma.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 814,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-dz.webp",
+      "source": "https://flagcdn.com/w320/dz.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 784,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-tn.webp",
+      "source": "https://flagcdn.com/w320/tn.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 998,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-eg.webp",
+      "source": "https://flagcdn.com/w320/eg.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 968,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-lb.webp",
+      "source": "https://flagcdn.com/w320/lb.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 1236,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-is.webp",
+      "source": "https://flagcdn.com/w320/is.png",
+      "width": 320,
+      "height": 230,
+      "bytes": 174,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-sk.webp",
+      "source": "https://flagcdn.com/w320/sk.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 1074,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-si.webp",
+      "source": "https://flagcdn.com/w320/si.png",
+      "width": 320,
+      "height": 160,
+      "bytes": 696,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-bg.webp",
+      "source": "https://flagcdn.com/w320/bg.png",
+      "width": 320,
+      "height": 192,
+      "bytes": 78,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-lt.webp",
+      "source": "https://flagcdn.com/w320/lt.png",
+      "width": 320,
+      "height": 192,
+      "bytes": 82,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-lv.webp",
+      "source": "https://flagcdn.com/w320/lv.png",
+      "width": 320,
+      "height": 160,
+      "bytes": 52,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-ee.webp",
+      "source": "https://flagcdn.com/w320/ee.png",
+      "width": 320,
+      "height": 204,
+      "bytes": 72,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-ie.webp",
+      "source": "https://flagcdn.com/w320/ie.png",
+      "width": 320,
+      "height": 160,
+      "bytes": 100,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-gb-sct.webp",
+      "source": "https://flagcdn.com/w320/gb-sct.png",
+      "width": 320,
+      "height": 192,
+      "bytes": 968,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-gb-wls.webp",
+      "source": "https://flagcdn.com/w320/gb-wls.png",
+      "width": 320,
+      "height": 192,
+      "bytes": 7418,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-basque.webp",
+      "source": "https://thumb.wikimedia.org/wikipedia/commons/thumb/2/2d/Flag_of_the_Basque_Country.svg/330px-Flag_of_the_Basque_Country.svg.png?utm_source=commons.wikimedia.org&utm_campaign=imageinfo&utm_content=thumbnail",
+      "width": 320,
+      "height": 179,
+      "bytes": 8722,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-catalan.webp",
+      "source": "https://thumb.wikimedia.org/wikipedia/commons/thumb/c/ce/Flag_of_Catalonia.svg/330px-Flag_of_Catalonia.svg.png?utm_source=commons.wikimedia.org&utm_campaign=imageinfo&utm_content=thumbnail",
+      "width": 320,
+      "height": 213,
+      "bytes": 226,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-gb-eng.webp",
+      "source": "https://flagcdn.com/w320/gb-eng.png",
+      "width": 320,
+      "height": 192,
+      "bytes": 126,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-us.webp",
+      "source": "https://flagcdn.com/w320/us.png",
+      "width": 320,
+      "height": 168,
+      "bytes": 960,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-gb.webp",
+      "source": "https://flagcdn.com/w320/gb.png",
+      "width": 320,
+      "height": 160,
+      "bytes": 716,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-ca.webp",
+      "source": "https://flagcdn.com/w320/ca.png",
+      "width": 320,
+      "height": 160,
+      "bytes": 1024,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-au.webp",
+      "source": "https://flagcdn.com/w320/au.png",
+      "width": 320,
+      "height": 160,
+      "bytes": 1404,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-nz.webp",
+      "source": "https://flagcdn.com/w320/nz.png",
+      "width": 320,
+      "height": 160,
+      "bytes": 1186,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-at.webp",
+      "source": "https://flagcdn.com/w320/at.png",
+      "width": 320,
+      "height": 213,
+      "bytes": 52,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-ch.webp",
+      "source": "https://flagcdn.com/w320/ch.png",
+      "width": 240,
+      "height": 240,
+      "bytes": 240,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "flag-be.webp",
+      "source": "https://flagcdn.com/w320/be.png",
+      "width": 277,
+      "height": 240,
+      "bytes": 136,
+      "license": "Public domain flag"
+    },
+    {
+      "file": "concert.webp",
+      "source": "https://images.unsplash.com/photo-1493225457124-a3eb161ffa5f?w=480&h=300&fit=crop&auto=format&q=75",
+      "width": 320,
+      "height": 200,
+      "bytes": 4446,
+      "license": "Unsplash License"
+    },
+    {
+      "file": "studio.webp",
+      "source": "https://images.unsplash.com/photo-1511379938547-c1f69419868d?w=480&h=300&fit=crop&auto=format&q=75",
+      "width": 320,
+      "height": 200,
+      "bytes": 6632,
+      "license": "Unsplash License"
+    },
+    {
+      "file": "guitar.webp",
+      "source": "https://images.unsplash.com/photo-1510915361894-db8b60106cb1?w=480&h=300&fit=crop&auto=format&q=75",
+      "width": 320,
+      "height": 200,
+      "bytes": 2714,
+      "license": "Unsplash License"
+    },
+    {
+      "file": "piano.webp",
+      "source": "https://images.unsplash.com/photo-1520523839897-bd0b52f945a0?w=480&h=300&fit=crop&auto=format&q=75",
+      "width": 320,
+      "height": 200,
+      "bytes": 3082,
+      "license": "Unsplash License"
+    },
+    {
+      "file": "jazz.webp",
+      "source": "https://images.unsplash.com/photo-1511192336575-5a79af67a629?w=480&h=300&fit=crop&auto=format&q=75",
+      "width": 320,
+      "height": 200,
+      "bytes": 5064,
+      "license": "Unsplash License"
+    },
+    {
+      "file": "vinyl.webp",
+      "source": "https://images.unsplash.com/photo-1539375665275-f9de415ef9ac?w=480&h=300&fit=crop&auto=format&q=75",
+      "width": 320,
+      "height": 200,
+      "bytes": 2378,
+      "license": "Unsplash License"
+    },
+    {
+      "file": "electronic.webp",
+      "source": "https://images.unsplash.com/photo-1470229722913-7c0e2dbbafd3?w=480&h=300&fit=crop&auto=format&q=75",
+      "width": 320,
+      "height": 200,
+      "bytes": 3942,
+      "license": "Unsplash License"
+    }
+  ],
+  "mapping": {
+    "regions": {
+      "Turkish": "flag-tr.webp",
+      "Japanese": "flag-jp.webp",
+      "Korean": "flag-kr.webp",
+      "French": "flag-fr.webp",
+      "Arabic": "flag-arab.webp",
+      "Brazilian": "flag-br.webp",
+      "Spanish": "flag-es.webp",
+      "Portuguese": "flag-pt.webp",
+      "German": "flag-de.webp",
+      "Italian": "flag-it.webp",
+      "Hindi": "flag-in.webp",
+      "Punjabi": "flag-in.webp",
+      "Persian": "flag-ir.webp",
+      "Greek": "flag-gr.webp",
+      "Russian": "flag-ru.webp",
+      "Chinese": "flag-cn.webp",
+      "Indonesian": "flag-id.webp",
+      "Thai": "flag-th.webp",
+      "Polish": "flag-pl.webp",
+      "Dutch": "flag-nl.webp",
+      "Swedish": "flag-se.webp",
+      "Norwegian": "flag-no.webp",
+      "Finnish": "flag-fi.webp",
+      "Danish": "flag-dk.webp",
+      "Ukrainian": "flag-ua.webp",
+      "Romanian": "flag-ro.webp",
+      "Hungarian": "flag-hu.webp",
+      "Czech": "flag-cz.webp",
+      "Serbian": "flag-rs.webp",
+      "Croatian": "flag-hr.webp",
+      "Albanian": "flag-al.webp",
+      "Bengali": "flag-bd.webp",
+      "Tamil": "flag-in.webp",
+      "Telugu": "flag-in.webp",
+      "Urdu": "flag-pk.webp",
+      "Vietnamese": "flag-vn.webp",
+      "Filipino / Tagalog": "flag-ph.webp",
+      "Malay": "flag-my.webp",
+      "Nepali": "flag-np.webp",
+      "Hebrew": "flag-il.webp",
+      "Azerbaijani": "flag-az.webp",
+      "Georgian": "flag-ge.webp",
+      "Armenian": "flag-am.webp",
+      "Kurdish": "flag-kurd.webp",
+      "Swahili": "flag-tz.webp",
+      "Amharic": "flag-et.webp",
+      "Mexican": "flag-mx.webp",
+      "Argentinian": "flag-ar.webp",
+      "Colombian": "flag-co.webp",
+      "Chilean": "flag-cl.webp",
+      "Peruvian": "flag-pe.webp",
+      "Cuban": "flag-cu.webp",
+      "Dominican": "flag-do.webp",
+      "Puerto Rican": "flag-pr.webp",
+      "Jamaican": "flag-jm.webp",
+      "Nigerian": "flag-ng.webp",
+      "Ghanaian": "flag-gh.webp",
+      "South African": "flag-za.webp",
+      "Moroccan": "flag-ma.webp",
+      "Algerian": "flag-dz.webp",
+      "Tunisian": "flag-tn.webp",
+      "Egyptian": "flag-eg.webp",
+      "Lebanese": "flag-lb.webp",
+      "Icelandic": "flag-is.webp",
+      "Slovak": "flag-sk.webp",
+      "Slovenian": "flag-si.webp",
+      "Bulgarian": "flag-bg.webp",
+      "Lithuanian": "flag-lt.webp",
+      "Latvian": "flag-lv.webp",
+      "Estonian": "flag-ee.webp",
+      "Irish": "flag-ie.webp",
+      "Scottish": "flag-gb-sct.webp",
+      "Welsh": "flag-gb-wls.webp",
+      "Basque": "flag-basque.webp",
+      "Catalan": "flag-catalan.webp",
+      "English": "flag-gb-eng.webp",
+      "American": "flag-us.webp",
+      "British": "flag-gb.webp",
+      "Canadian": "flag-ca.webp",
+      "Australian": "flag-au.webp",
+      "New Zealand": "flag-nz.webp",
+      "Austrian": "flag-at.webp",
+      "Swiss": "flag-ch.webp",
+      "Belgian": "flag-be.webp"
+    },
+    "genres": {
+      "Pop": "studio.webp",
+      "Rock": "concert.webp",
+      "Hip-hop": "vinyl.webp",
+      "Metal": "concert.webp",
+      "Jazz": "jazz.webp",
+      "Electronic": "electronic.webp",
+      "R&B": "jazz.webp",
+      "Indie": "concert.webp",
+      "Folk": "guitar.webp",
+      "Classical": "piano.webp",
+      "Blues": "jazz.webp",
+      "Soul": "jazz.webp",
+      "Funk": "jazz.webp",
+      "Disco": "electronic.webp",
+      "Punk": "concert.webp",
+      "Alternative": "concert.webp",
+      "Reggae": "vinyl.webp",
+      "Reggaeton": "vinyl.webp",
+      "House": "electronic.webp",
+      "Techno": "electronic.webp",
+      "Trance": "electronic.webp",
+      "Drum & Bass": "electronic.webp",
+      "Acoustic": "guitar.webp",
+      "Synthwave": "electronic.webp",
+      "Indie Rock": "concert.webp",
+      "Indie Pop": "concert.webp",
+      "Hard Rock": "concert.webp",
+      "Heavy Metal": "concert.webp",
+      "Dance Pop": "studio.webp",
+      "Country": "guitar.webp",
+      "Bluegrass": "guitar.webp",
+      "Ambient": "electronic.webp",
+      "Chillout": "electronic.webp",
+      "Lo-fi": "vinyl.webp",
+      "Trip-hop": "studio.webp",
+      "Deep House": "electronic.webp",
+      "Tech House": "electronic.webp",
+      "Dubstep": "electronic.webp",
+      "Hardstyle": "electronic.webp",
+      "Synthpop": "electronic.webp",
+      "Electropop": "electronic.webp",
+      "Dream Pop": "studio.webp",
+      "Pop Punk": "concert.webp",
+      "Post-punk": "concert.webp",
+      "New Wave": "electronic.webp",
+      "Progressive Rock": "concert.webp",
+      "Psychedelic Rock": "concert.webp",
+      "Shoegaze": "concert.webp",
+      "Metalcore": "concert.webp",
+      "Death Metal": "concert.webp",
+      "Black Metal": "concert.webp",
+      "Trap": "vinyl.webp",
+      "Drill": "vinyl.webp",
+      "Neo Soul": "jazz.webp",
+      "Latin Pop": "studio.webp",
+      "Salsa": "studio.webp",
+      "Bachata": "studio.webp",
+      "Afrobeats": "studio.webp",
+      "Amapiano": "piano.webp",
+      "Dancehall": "vinyl.webp",
+      "Dub": "vinyl.webp",
+      "Ska": "studio.webp",
+      "Bossa Nova": "jazz.webp",
+      "Samba": "studio.webp",
+      "Tango": "studio.webp",
+      "Flamenco": "guitar.webp",
+      "Fado": "guitar.webp",
+      "Traditional": "guitar.webp",
+      "Soundtrack": "piano.webp",
+      "Instrumental": "piano.webp",
+      "Gospel": "piano.webp",
+      "Opera": "piano.webp",
+      "Cumbia": "studio.webp",
+      "Merengue": "studio.webp",
+      "Bolero": "guitar.webp",
+      "Afropop": "studio.webp",
+      "Highlife": "jazz.webp",
+      "Zouk": "studio.webp"
+    }
+  },
+  "processing": "Photos center-cropped to 320x200, WebP quality 52. Flags retain original proportions, max 320x240, lossless WebP."
+}

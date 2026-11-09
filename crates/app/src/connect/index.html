@@ -1085,7 +1085,9 @@
         <section id="style-mix-language-section">
           <h3>Country / language</h3>
           <div id="style-mix-region" class="style-mix-choices"></div>
-          <button id="style-mix-region-more" class="btn-act style-mix-more" onclick="toggleStyleMixChoices('region')" hidden>See more</button>
+          <nav id="style-mix-region-pager" class="style-mix-pager" aria-label="region pages" hidden>
+            <button id="style-mix-region-more" class="btn-act" onclick="pageStyleMixChoices('region',1)">See more</button>
+          </nav>
         </section>
         <div id="style-mix-language-selected" hidden>
           <button class="btn-act" onclick="showStyleMixLanguages()">Change language</button>
@@ -1095,7 +1097,9 @@
         <section id="style-mix-genre-section" hidden>
           <h3>Genres</h3>
           <div id="style-mix-genre" class="style-mix-choices"></div>
-          <button id="style-mix-genre-more" class="btn-act style-mix-more" onclick="toggleStyleMixChoices('genre')" hidden>See more</button>
+          <nav id="style-mix-genre-pager" class="style-mix-pager" aria-label="genre pages" hidden>
+            <button id="style-mix-genre-more" class="btn-act" onclick="pageStyleMixChoices('genre',1)">See more</button>
+          </nav>
         </section>
         <button id="style-mix-play" class="btn-act" onclick="startStyleMix()" hidden disabled>Play mix</button>
         <div id="style-mix-tracks" style="display:grid; gap:8px;"></div>
@@ -1907,21 +1911,25 @@ function showLyricsError(message) {
     let styleMixRegions = [];
     let styleMixGenre = null;
     let styleMixGenresRequest;
-    const styleMixExpanded = {region:false,genre:false};
+    const styleMixPages = {region:0,genre:0};
     function updateStyleMixChoices(kind) {
       const grid = document.getElementById('style-mix-'+kind);
       if (!grid.offsetWidth) return;
       const columns = getComputedStyle(grid).gridTemplateColumns.split(' ').length;
       const limit = columns*2;
-      Array.from(grid.children).forEach((button,index)=>button.hidden=!styleMixExpanded[kind] && index>=limit);
-      const more = document.getElementById('style-mix-'+kind+'-more');
-      more.hidden = grid.children.length<=limit;
-      more.textContent = tr(styleMixExpanded[kind]?'See less':'See more');
-      more.setAttribute('aria-expanded',String(styleMixExpanded[kind]));
+      const pages = Math.ceil(grid.children.length/limit);
+      const page = styleMixPages[kind] = Math.min(styleMixPages[kind],Math.max(0,pages-1));
+      Array.from(grid.children).forEach((button,index)=>button.hidden=index>=(page+1)*limit);
+      document.getElementById('style-mix-'+kind+'-pager').hidden = page+1>=pages;
     }
-    function toggleStyleMixChoices(kind) {
-      styleMixExpanded[kind]=!styleMixExpanded[kind];
+    function pageStyleMixChoices(kind,direction) {
+      const grid = document.getElementById('style-mix-'+kind);
+      styleMixPages[kind]=Math.max(0,styleMixPages[kind]+direction);
       updateStyleMixChoices(kind);
+      // Moving pages must not leave keyboard focus on a newly hidden card.
+      if (grid.contains(document.activeElement) && document.activeElement.hidden) {
+        Array.from(grid.children).find(button=>!button.hidden)?.focus();
+      }
     }
     window.addEventListener('resize',()=>{
       updateStyleMixChoices('region'); updateStyleMixChoices('genre');
@@ -1946,7 +1954,8 @@ function showLyricsError(message) {
         styleMixRegions = data.regions;
         document.getElementById('style-mix-region').replaceChildren(...data.regions.map((name,index) => {
           const button = document.createElement('button');
-          button.className = 'btn-act'; button.textContent = tr(name);
+          button.className = 'btn-act style-mix-flag'; button.textContent = tr(name);
+          const flag = document.createElement('img'); flag.src='/style-mix/region/'+index+'.webp'; flag.alt=''; flag.loading='lazy'; flag.decoding='async'; button.prepend(flag);
           button.dataset.region = String(index); button.setAttribute('aria-pressed','false');
           button.onclick = () => loadStyleMixGenres(index);
           return button;
@@ -1973,7 +1982,7 @@ function showLyricsError(message) {
       styleMixGenresRequest?.abort();
       styleMixGenresRequest = new AbortController();
       styleMixRegion = region;
-      styleMixExpanded.genre = false;
+      styleMixPages.genre = 0;
       styleMixGenre = null;
       clearStyleMix();
       document.getElementById('style-mix-language-section').hidden = true;
@@ -1995,7 +2004,8 @@ function showLyricsError(message) {
         if (!response.ok || data.error) throw new Error(data.error || 'Could not check genres. Please try again.');
         choices.replaceChildren(...data.genres.map(genre => {
           const button = document.createElement('button');
-          button.className='btn-act'; button.textContent=tr(genre.title);
+          button.className='btn-act style-mix-photo'; button.textContent=tr(genre.title);
+          const photo = document.createElement('img'); photo.src='/style-mix/genre/'+genre.id+'.webp'; photo.alt=''; photo.loading='lazy'; photo.decoding='async'; button.prepend(photo);
           button.dataset.genre=String(genre.id); button.setAttribute('aria-pressed','false');
           button.onclick=()=>buildStyleMix(genre.id);
           return button;

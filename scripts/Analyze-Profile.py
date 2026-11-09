@@ -75,18 +75,18 @@ def report(directory):
         worst = max(stage_names, key=lambda name: sum(groups[name]))
         lines.append(f"- Largest measured stage by accumulated time: `{worst}` ({sum(groups[worst])/1000:.2f} s across {len(groups[worst])} samples). Compare p95 and per-view rows below before deciding what to change.")
         targets = {
-            "rebuild.scene": "Inspect `ui::build` and visible-row construction in `crates/app/src/ui.rs`.",
-            "rebuild.text": "Inspect `expand_media_text` and `fit_text_links` in `crates/app/src/window.rs`.",
-            "rebuild.controls": "Inspect native button and edit-control synchronization in `rebuild` in `crates/app/src/window.rs`.",
-            "rebuild.artwork": "Inspect `request_art` and `trim_artwork` in `crates/app/src/window.rs`.",
-            "render.labels": "Inspect the label drawing section of `render` in `crates/app/src/window.rs`.",
-            "render.composite": "Inspect the pixel compositing loop in `render` in `crates/app/src/window.rs`.",
-            "render.pictures": "Inspect image and artwork rendering in `render` in `crates/app/src/window.rs`.",
-            "render.panels": "Inspect panel drawing in `render` in `crates/app/src/window.rs`.",
+            "rebuild.scene": "Inspect `ui::build` and visible-row construction in `crates/app/src/ui/mod.rs`.",
+            "rebuild.text": "Inspect `expand_media_text` and `fit_text_links` in `crates/app/src/ui/window.rs`.",
+            "rebuild.controls": "Inspect native button and edit-control synchronization in `rebuild` in `crates/app/src/ui/window.rs`.",
+            "rebuild.artwork": "Inspect `request_art` and `trim_artwork` in `crates/app/src/ui/window.rs`.",
+            "render.labels": "Inspect the label drawing section of `render` in `crates/app/src/ui/window.rs`.",
+            "render.composite": "Inspect the pixel compositing loop in `render` in `crates/app/src/ui/window.rs`.",
+            "render.pictures": "Inspect image and artwork rendering in `render` in `crates/app/src/ui/window.rs`.",
+            "render.panels": "Inspect panel drawing in `render` in `crates/app/src/ui/window.rs`.",
         }
         if worst in targets:
             if worst == "render.labels" and not has_composite:
-                lines.append("- Inspect label drawing and the pixel compositing loop in `render` in `crates/app/src/window.rs`; this older timing combines both.")
+                lines.append("- Inspect label drawing and the pixel compositing loop in `render` in `crates/app/src/ui/window.rs`; this older timing combines both.")
             else:
                 lines.append("- Suggested starting point: " + targets[worst])
     if not has_composite and groups.get("render.labels"):

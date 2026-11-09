@@ -37,7 +37,7 @@ fn manifest(app: &[u8], engine: &[u8]) -> Manifest {
         schema: 1,
         version: "0.2.0".into(),
         files: vec![
-            entry("deeznats-prototype.exe", app),
+            entry("deeznats.exe", app),
             entry("libdeezercore.dll", engine),
         ],
     }
@@ -46,13 +46,13 @@ fn manifest(app: &[u8], engine: &[u8]) -> Manifest {
 fn unchanged_files_are_skipped_and_unknown_versions_use_full_files() {
     let f = Fixture::new();
     let installed = f.dir("installed");
-    fs::write(installed.join("deeznats-prototype.exe"), b"old").unwrap();
+    fs::write(installed.join("deeznats.exe"), b"old").unwrap();
     fs::write(installed.join("libdeezercore.dll"), b"same engine").unwrap();
     let changes = manifest(b"new app", b"same engine")
         .changes(&installed)
         .unwrap();
     assert_eq!(changes.len(), 1);
-    assert_eq!(changes[0].file.name, "deeznats-prototype.exe");
+    assert_eq!(changes[0].file.name, "deeznats.exe");
     assert!(matches!(changes[0].transfer, Transfer::Full));
     assert!(manifest(b"new app", b"same engine")
         .newer_than("0.1.9")
@@ -74,7 +74,7 @@ fn real_binary_delta_reconstructs_exact_bytes_and_rejects_damage() {
         .collect();
     let mut new = old.clone();
     new[50_000..50_012].copy_from_slice(b"new behavior");
-    let source = installed.join("deeznats-prototype.exe");
+    let source = installed.join("deeznats.exe");
     fs::write(&source, &old).unwrap();
     fs::write(installed.join("libdeezercore.dll"), b"engine").unwrap();
     let mut data = Vec::new();
@@ -126,30 +126,24 @@ fn staged_install_preserves_settings_and_refuses_unverified_files() {
     let installed = f.dir("installed");
     let stage = f.dir("stage");
     fs::write(installed.join("ui.json"), b"private settings").unwrap();
-    fs::write(installed.join("deeznats-prototype.exe"), b"old").unwrap();
-    fs::write(stage.join("deeznats-prototype.exe"), b"new").unwrap();
+    fs::write(installed.join("deeznats.exe"), b"old").unwrap();
+    fs::write(stage.join("deeznats.exe"), b"new").unwrap();
     let plan = ApplyPlan {
         directory: installed.clone(),
         parent_pid: 0,
         version: "0.2.0".into(),
         files: vec![ApplyFile {
-            name: "deeznats-prototype.exe".into(),
+            name: "deeznats.exe".into(),
             size: 3,
             sha256: hash(b"new"),
         }],
     };
-    fs::write(stage.join("deeznats-prototype.exe"), b"bad").unwrap();
+    fs::write(stage.join("deeznats.exe"), b"bad").unwrap();
     assert!(commit(&plan, &stage).is_err());
-    assert_eq!(
-        fs::read(installed.join("deeznats-prototype.exe")).unwrap(),
-        b"old"
-    );
-    fs::write(stage.join("deeznats-prototype.exe"), b"new").unwrap();
+    assert_eq!(fs::read(installed.join("deeznats.exe")).unwrap(), b"old");
+    fs::write(stage.join("deeznats.exe"), b"new").unwrap();
     commit(&plan, &stage).unwrap();
-    assert_eq!(
-        fs::read(installed.join("deeznats-prototype.exe")).unwrap(),
-        b"new"
-    );
+    assert_eq!(fs::read(installed.join("deeznats.exe")).unwrap(), b"new");
     assert_eq!(
         fs::read(installed.join("ui.json")).unwrap(),
         b"private settings"
@@ -164,7 +158,7 @@ fn locked_second_file_rolls_back_first_file() {
     let installed = f.dir("installed");
     let stage = f.dir("stage");
     let mut files = Vec::new();
-    for name in ["libdeezercore.dll", "deeznats-prototype.exe"] {
+    for name in ["libdeezercore.dll", "deeznats.exe"] {
         fs::write(installed.join(name), b"old").unwrap();
         fs::write(stage.join(name), b"new").unwrap();
         files.push(ApplyFile {
@@ -176,7 +170,7 @@ fn locked_second_file_rolls_back_first_file() {
     let _locked = fs::OpenOptions::new()
         .read(true)
         .share_mode(0)
-        .open(installed.join("deeznats-prototype.exe"))
+        .open(installed.join("deeznats.exe"))
         .unwrap();
     let plan = ApplyPlan {
         directory: installed.clone(),

@@ -8,12 +8,12 @@ $ErrorActionPreference = 'Stop'
 $project = Split-Path $PSScriptRoot -Parent
 $metadata = (& cargo metadata --manifest-path (Join-Path $project 'Cargo.toml') --no-deps --format-version 1 | ConvertFrom-Json)
 if ($LASTEXITCODE -ne 0) { throw 'Could not read the application version.' }
-$appVersion = ($metadata.packages | Where-Object { $_.name -eq 'deeznats-prototype' }).version
+$appVersion = ($metadata.packages | Where-Object { $_.name -eq 'deeznats' }).version
 $productVersion = ([version]$appVersion).ToString(3) + '.0'
 if (!$AppDirectory) { $AppDirectory = Join-Path $project 'target/release' }
 if (!$OutputDirectory) { $OutputDirectory = Join-Path $project 'artifacts/installer' }
 if (!$Compiler) { $Compiler = Join-Path $project '.local/installer-tools/nsis-3.11/makensis.exe' }
-foreach ($required in @($Compiler, (Join-Path $AppDirectory 'deeznats-prototype.exe'), (Join-Path $AppDirectory 'libdeezercore.dll'), (Join-Path $EngineRoot 'vendor/opendeezer/go.mod'))) {
+foreach ($required in @($Compiler, (Join-Path $AppDirectory 'deeznats.exe'), (Join-Path $AppDirectory 'libdeezercore.dll'), (Join-Path $EngineRoot 'vendor/opendeezer/go.mod'))) {
     if (!(Test-Path -LiteralPath $required -PathType Leaf)) { throw "Missing build input: $required" }
 }
 New-Item -ItemType Directory -Force $OutputDirectory | Out-Null
@@ -51,7 +51,7 @@ try {
 } finally { $archive.Dispose(); $stream.Dispose() }
 & $Compiler /V2 "/DPROJECT=$project" "/DPAYLOAD=$AppDirectory" "/DOUTPUT=$OutputDirectory" "/DAPPVERSION=$appVersion" "/DPRODUCTVERSION=$productVersion" (Join-Path $project 'installer/DeezNats.nsi')
 if ($LASTEXITCODE -ne 0) { throw 'Installer compilation failed.' }
-@((Join-Path $OutputDirectory 'DeezNats-Setup.exe'), $archivePath, (Join-Path $AppDirectory 'deeznats-prototype.exe'), (Join-Path $AppDirectory 'libdeezercore.dll')) |
+@((Join-Path $OutputDirectory 'DeezNats-Setup.exe'), $archivePath, (Join-Path $AppDirectory 'deeznats.exe'), (Join-Path $AppDirectory 'libdeezercore.dll')) |
     ForEach-Object { Get-FileHash -LiteralPath $_ -Algorithm SHA256 } | ForEach-Object { $_.Hash + '  ' + [IO.Path]::GetFileName($_.Path) } |
     Set-Content -LiteralPath (Join-Path $OutputDirectory 'SHA256SUMS.txt') -Encoding ASCII
 Get-Item (Join-Path $OutputDirectory 'DeezNats-Setup.exe'), $archivePath | Select-Object FullName, Length

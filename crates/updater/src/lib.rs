@@ -12,7 +12,7 @@ use std::{
 pub const MANIFEST_ASSET: &str = "deeznats-update.json";
 pub const MAX_FILE_SIZE: u64 = 256 * 1024 * 1024;
 pub const ALLOWED: &[&str] = &[
-    "deeznats-prototype.exe",
+    "deeznats.exe",
     "libdeezercore.dll",
     "DeezNats.ico",
     "LICENSE",
@@ -129,7 +129,7 @@ impl Manifest {
                 }
             }
         }
-        if !["deeznats-prototype.exe", "libdeezercore.dll"]
+        if !["deeznats.exe", "libdeezercore.dll"]
             .iter()
             .all(|name| self.files.iter().any(|f| &f.name == name))
         {

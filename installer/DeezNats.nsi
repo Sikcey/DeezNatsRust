@@ -47,7 +47,7 @@ Section "DeezNats"
   SetShellVarContext current
   SetOutPath "$INSTDIR"
   ; This installer uses no MSI, restore-point API, service, or restore plugin.
-  File "${PAYLOAD}\deeznats-prototype.exe"
+  File "${PAYLOAD}\deeznats.exe"
   File "${PAYLOAD}\libdeezercore.dll"
   File "${PROJECT}\assets\DeezNats.ico"
   File "${PROJECT}\LICENSE"
@@ -66,7 +66,7 @@ Section "DeezNats"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\DeezNats" "QuietUninstallString" '$\"$INSTDIR\Uninstall.exe$\" /S'
   WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\DeezNats" "NoModify" 1
   WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\DeezNats" "NoRepair" 1
-  CreateShortcut "$SMPROGRAMS\DeezNats.lnk" "$INSTDIR\deeznats-prototype.exe" "" "$INSTDIR\DeezNats.ico"
+  CreateShortcut "$SMPROGRAMS\DeezNats.lnk" "$INSTDIR\deeznats.exe" "" "$INSTDIR\DeezNats.ico"
   Goto install_done
   test_install:
   FileOpen $0 "$INSTDIR\.installer-test" w
@@ -78,7 +78,7 @@ Section "Uninstall"
   SetShellVarContext current
   IfFileExists "$INSTDIR\.installer-test" skip_registration
   ; The app owns the Soloist process and terminates it when it exits.
-  nsExec::ExecToStack 'taskkill /IM deeznats-prototype.exe /T /F'
+  nsExec::ExecToStack 'taskkill /IM deeznats.exe /T /F'
   Pop $0
   Pop $1
   InitPluginsDir
@@ -94,7 +94,7 @@ Section "Uninstall"
   DeleteRegKey HKCU "Software\DeezNats"
   skip_registration:
   ; Delete installed files while preserving unknown files in the install directory.
-  Delete "$INSTDIR\deeznats-prototype.exe"
+  Delete "$INSTDIR\deeznats.exe"
   Delete "$INSTDIR\libdeezercore.dll"
   Delete "$INSTDIR\DeezNats.ico"
   Delete "$INSTDIR\LICENSE"

@@ -1,5 +1,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 #[cfg(all(windows, feature = "diagnostics"))]
+#[path = "runtime/diagnostics.rs"]
 mod diagnostics;
 #[cfg(all(windows, feature = "memory-profile"))]
 mod memory_profile {
@@ -228,59 +229,77 @@ mod memory_profile {
 #[global_allocator]
 static GLOBAL_ALLOCATOR: memory_profile::ProfilingAllocator = memory_profile::ProfilingAllocator;
 #[cfg(windows)]
-mod appearance;
+pub(crate) use ui::appearance;
 #[cfg(windows)]
+#[path = "playback/audio.rs"]
 mod audio;
 #[cfg(windows)]
+#[path = "library/catalog.rs"]
 mod catalog;
 #[cfg(windows)]
 pub(crate) mod connect;
 #[cfg(windows)]
+#[path = "library/downloads.rs"]
 mod downloads;
 #[cfg(windows)]
-mod drawing;
+pub(crate) use ui::drawing;
 #[cfg(windows)]
+#[path = "runtime/engine.rs"]
 mod engine;
 #[cfg(windows)]
+#[path = "runtime/integration.rs"]
 mod integration;
 #[cfg(windows)]
+#[path = "playback/media_controls.rs"]
 mod media_controls;
 #[cfg(windows)]
+#[path = "ui/shortcuts.rs"]
 mod shortcuts;
 #[cfg(windows)]
+#[path = "playback/style_mix.rs"]
 mod style_mix;
 #[cfg(windows)]
+#[path = "runtime/updater.rs"]
 mod updater;
 #[cfg(windows)]
+#[path = "providers/youtube.rs"]
 mod youtube;
 #[cfg(windows)]
-mod youtube_webview;
+pub(crate) use youtube::youtube_webview;
 
 #[cfg(windows)]
+#[path = "providers/deezer.rs"]
 mod deezer_webview;
 #[cfg(windows)]
+#[path = "playback/lyrics.rs"]
 mod lyrics;
 #[cfg(windows)]
+#[path = "storage/session.rs"]
 mod session;
 #[cfg(windows)]
+#[path = "providers/spotify.rs"]
 mod spotify;
+#[path = "providers/spotify_diagnostics.rs"]
 mod spotify_diagnostics;
 #[cfg(windows)]
-mod spotify_webview;
+pub(crate) use spotify::spotify_webview;
 #[cfg(windows)]
 mod storage;
 
 #[cfg(windows)]
+#[path = "runtime/instance.rs"]
 mod instance;
 #[cfg(windows)]
+#[path = "library/playlist.rs"]
 mod playlist;
 #[cfg(windows)]
-mod theme;
+pub(crate) use ui::theme;
 #[cfg(windows)]
 mod ui;
 #[cfg(windows)]
-mod visualizer;
+pub(crate) use ui::visualizer;
 #[cfg(windows)]
+#[path = "ui/window.rs"]
 mod window;
 
 fn main() {
@@ -324,5 +343,5 @@ fn main() {
         }
     }
     #[cfg(not(windows))]
-    println!("This native prototype requires Windows.");
+    println!("DeezNats requires Windows.");
 }

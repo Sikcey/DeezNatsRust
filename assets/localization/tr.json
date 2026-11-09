@@ -1,4 +1,5 @@
 {
+  "Session expired. Sign in again.": "Oturumun süresi doldu. Yeniden giriş yapın.",
   "Switch": "Geçiş yap",
   "Log in to Spotify": "Spotify'a giriş yap",
   "Sign-in data saved": "Giriş bilgileri kaydedildi",
@@ -135,7 +136,7 @@
   "Genre": "Tür",
   "Build mix": "Karma oluştur",
   "Choose a country and genre, then build your mix.": "Bir ülke ve tür seç, ardından karmanı oluştur.",
-  "Play mix": "Karmayı çal",
+  "Play mix": "Karmayı Çal",
   "Choose a country and genre. Music comes from matching Deezer playlists.": "Bir ülke ve tür seç. Müzikler, bu ikisine uyan Deezer çalma listelerinden alınır.",
   "Japanese": "Japonca",
   "Korean": "Korece",
@@ -1139,6 +1140,9 @@
   "Or paste the Cookie header from your signed-in music.youtube.com browser session.": "Veya giriş yapılmış music.youtube.com tarayıcı oturumundan Cookie başlığını yapıştır.",
   "Connect with cookies": "Çerezlerle bağlan",
   "Search for more genres": "Daha fazla tür ara",
+  "Show more": "Daha fazla göster",
+  "Showing up to 40 genres. Search all provider genres and subgenres.": "En fazla 40 tür gösterilir. Sağlayıcının tüm tür ve alt türlerini arayabilirsiniz.",
+  "Search all provider genres and subgenres…": "Sağlayıcının tüm tür ve alt türlerinde ara…",
   "Welcome to DeezNats": "DeezNats’a hoş geldin",
   "Choose a music provider to get started.": "Başlamak için bir müzik sağlayıcısı seç.",
   "Control unavailable": "Kontrol kullanılamıyor",
@@ -1212,5 +1216,10 @@
   "Redo": "Yinele",
   "Cut": "Kes",
   "Copy": "Kopyala",
-  "Paste": "Yapıştır"
+  "Paste": "Yapıştır",
+  "Refresh mix": "Karmayı Yenile",
+  "What would you like to listen to in {language}?": "{language} dilinde ne tür dinlemek istersin?",
+  "From matching {provider} playlists": "Eşleşen {provider} çalma listelerinden",
+  "Loading lyrics...": "\u015eark\u0131 s\u00f6zleri y\u00fckleniyor...",
+  "This song is instrumental.": "Bu \u015fark\u0131 enstr\u00fcmantal."
 }

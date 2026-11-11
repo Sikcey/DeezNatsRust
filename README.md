@@ -6,18 +6,16 @@ an unofficial project and is not affiliated with those services.
 
 ## Features
 
-- Browse personalized home shelves, discovery, search, artists, albums and playlists across Deezer, Spotify and YouTube Music.
-- Play favorites and saved collections, manage the queue, and use provider-specific Flow and Style Mix selections. Spotify and YouTube Music offer a searchable genre picker; Spotify includes the bundled Every Noise index.
-- View synchronized lyrics and use Windows media controls, keyboard media keys and optional global shortcuts.
+- Use provider-specific Flow and Style Mix selections. Spotify and YouTube Music offer a searchable genre picker; Spotify includes the bundled Every Noise index.
+- View synchronized lyrics and configure optional global shortcuts.
 - Customize the interface with acrylic, artwork backgrounds, images, gradients and importable [themes](THEMES.md). The interface supports English, Turkish and Azerbaijani, with optional Discord presence.
 - Host a browser client with [Connect audio](docs/CONNECT-AUDIO.md), browse and control supported providers, and stream audio where supported.
-- Install in-app updates when release update assets are available.
 
 Provider support differs:
 
 - **Deezer:** Playback uses a modified OpenDeezer engine. Downloads support persistent jobs, retries and offline playback; downloaded music is encrypted in the active data folder and is not exported as MP3 or FLAC. Podcast episodes use the engine download folder. Equalizer, ReplayGain, gapless playback and crossfade are available through the Deezer engine.
-- **Spotify:** Browse and manage music through Spotify's web integration and play through a paired Soloist device. Local Flow uses Spotify playlists and the bundled Every Noise genre radio links. Offline downloads and Deezer's audio effects are unavailable for Soloist playback.
-- **YouTube Music:** Browse, search, manage supported library and playlist actions, and play music through the native client. Flow and Style Mix use YouTube Music recommendations. Offline downloads and crossfade are unavailable.
+- **Spotify:** Play through a paired Soloist device using Spotify's web integration. Local Flow uses Spotify playlists and the bundled Every Noise genre radio links. Offline downloads and Deezer's audio effects are unavailable for Soloist playback.
+- **YouTube Music:** Flow and Style Mix use YouTube Music recommendations. Offline downloads and crossfade are unavailable.
 
 See [Spotify](docs/SPOTIFY.md) and [YouTube Music](docs/YOUTUBE-MUSIC.md) for setup, account requirements and provider limitations. Full playback and available quality depend on your account's entitlements. Saved sessions are encrypted for the current Windows user with DPAPI.
 

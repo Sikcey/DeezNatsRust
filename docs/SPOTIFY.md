@@ -70,7 +70,7 @@ sign-in. Genre selections with All moods also use the corresponding Every Noise
 genre radio playlists; no matching readable sources produce an explicit error.
 The bundled genre names and radio links come from the
 [Every Noise genre index](https://everynoise.com/everynoise1d.html), retrieved
-2026-10-28, in `assets/spotify-flow-genres.tsv`. This is a snapshot; playlist
+2026-11-11, in `assets/spotify-flow-genres.tsv`. This is a snapshot; playlist
 availability depends on Spotify and the listener's region.
 
 Style Mix (Tarz Karması) follows the same country/language-first selector as
@@ -353,9 +353,9 @@ No UI files need to change to test these backends.
 - Soloist builds expire after 90 days. Exit code 10 reports an expired build;
   install a new official build manually.
 - Soloist renders through Windows WASAPI, outside the Deezer audio pipeline.
-  Output changes are left to Soloist and Windows; DeezNats does not restart
-  Soloist when the default endpoint changes or reconnects. Live endpoint
-  migration depends on the installed Soloist build and Windows routing.
+  DeezNats restarts Soloist when the Windows default output changes and waits
+  for an output to return if the device disconnects. It attempts to restore
+  active local playback after reconnecting.
   **Reconnect audio output** remains an explicit fallback for a stuck output.
   It restarts Soloist and restores active local playback after pairing returns,
   preserving the confirmed track and queue on screen during recovery.

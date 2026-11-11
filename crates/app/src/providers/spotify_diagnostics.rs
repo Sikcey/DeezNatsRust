@@ -1,33 +1,32 @@
-//! Opt-in, content-free Spotify diagnostics. Set DEEZNATS_SPOTIFY_DIAGNOSTICS
-//! to an absolute log file path before starting the application.
+//! Content-free action diagnostics, enabled by default. The environment override
+//! DEEZNATS_SPOTIFY_DIAGNOSTICS selects an absolute destination path.
 use std::io::Write;
-use std::sync::Mutex;
+use std::sync::{mpsc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-static LOCK: Mutex<()> = Mutex::new(());
-
+static SENDER: OnceLock<mpsc::SyncSender<String>> = OnceLock::new();
 pub(crate) fn record(event: &str, details: &str) {
-    let Some(path) = std::env::var_os("DEEZNATS_SPOTIFY_DIAGNOSTICS") else {
-        return;
-    };
-    if !std::path::Path::new(&path).is_absolute() {
-        return;
-    }
-    let Ok(_guard) = LOCK.lock() else { return };
-    let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    else {
-        return;
-    };
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let _ = writeln!(file, "{timestamp} {event} {details}");
+    let sender = SENDER.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel::<String>(8192);
+        let _ = std::thread::Builder::new().name("action-log".into()).spawn(move || {
+            let path = std::env::var_os("DEEZNATS_SPOTIFY_DIAGNOSTICS").map(std::path::PathBuf::from)
+                .or_else(|| crate::storage::data_dir().ok().map(|root| root.join("provider-actions.log")));
+            let Some(path) = path.filter(|p| p.is_absolute()) else { return };
+            for line in rx {
+                if std::fs::metadata(&path).is_ok_and(|m| m.len() >= 8 * 1024 * 1024) {
+                    let backup = path.with_extension("log.1");
+                    let _ = std::fs::remove_file(&backup);
+                    let _ = std::fs::rename(&path, backup);
+                }
+                if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                    let _ = writeln!(file, "{line}");
+                }
+            }
+        });
+        tx
+    });
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+    let _ = sender.try_send(format!("{timestamp} pid={} thread={:?} {event} {}", std::process::id(), std::thread::current().id(), details.replace(['\r', '\n'], " ")));
 }
-
 pub(crate) fn error_kind(error: &str) -> &'static str {
     if error.contains("Web Player session required") {
         "no_web_session"
@@ -64,4 +63,34 @@ pub(crate) fn error_kind(error: &str) -> &'static str {
     } else {
         "other"
     }
+}
+
+/// A boundary timing event; completion means the call returned, not success.
+pub(crate) struct Span { event: &'static str, operation: String, started: std::time::Instant }
+impl Span {
+    pub(crate) fn new(event: &'static str, operation: &str) -> Self {
+        record(event, &format!("begin {operation}"));
+        Self { event, operation: operation.into(), started: std::time::Instant::now() }
+    }
+}
+impl Drop for Span {
+    fn drop(&mut self) {
+        record(self.event, &format!("returned {} elapsed_ms={}", self.operation, self.started.elapsed().as_millis()));
+    }
+}
+
+/// Write synchronously: a panic in the Windows callback aborts before the log worker can flush.
+pub(crate) fn install_panic_log() {
+    let path=crate::storage::data_dir().ok().map(|root|root.join("panic.log"));
+    let previous=std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(path)=&path {
+            if let Ok(mut file)=std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let timestamp=SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+                let _=writeln!(file,"{timestamp} pid={} thread={:?} {info}\n{}",std::process::id(),std::thread::current().id(),std::backtrace::Backtrace::force_capture());
+                let _=file.sync_all();
+            }
+        }
+        previous(info);
+    }));
 }

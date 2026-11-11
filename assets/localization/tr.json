@@ -1221,5 +1221,19 @@
   "What would you like to listen to in {language}?": "{language} dilinde ne tür dinlemek istersin?",
   "From matching {provider} playlists": "Eşleşen {provider} çalma listelerinden",
   "Loading lyrics...": "\u015eark\u0131 s\u00f6zleri y\u00fckleniyor...",
-  "This song is instrumental.": "Bu \u015fark\u0131 enstr\u00fcmantal."
+  "This song is instrumental.": "Bu \u015fark\u0131 enstr\u00fcmantal.",
+  "Next in queue": "S\u0131radaki",
+  "Your queue is empty": "\u00c7alma s\u0131ran bo\u015f",
+  "Next from: {0}": "S\u0131radaki \u015furadan \u00e7al\u0131nacak: {0}",
+  "Playing on {0}": "{0} cihaz\u0131nda \u00e7al\u0131n\u0131yor",
+  "Invite friends and listen together, wherever you are": "Jam\u2019ine di\u011ferlerini davet et, istedi\u011fin her yerde birlikte dinle.",
+  "Listen together from anywhere": "\u0130stedi\u011fin yerde arkada\u015flar\u0131nla dinle",
+  "Start a Jam": "Jam ba\u015flat",
+  "Open Jam": "Jam\u2019i a\u00e7",
+  "Don't see your device?": "Cihaz\u0131n\u0131 g\u00f6rm\u00fcyor musun?",
+  "Looking for devices\u2026": "Cihazlar aran\u0131yor\u2026",
+  "No active device": "Etkin cihaz yok",
+  "No recently played tracks": "Yak\u0131n zamanda \u00e7al\u0131nan \u015fark\u0131 yok",
+  "Current playlist or radio": "Ge\u00e7erli \u00e7alma listesi veya radyo",
+  "Playing from: {0}": "Şuradan çalıyor: {0}"
 }

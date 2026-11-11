@@ -6265,7 +6265,10 @@ fn process_collection(
     action: CollectionAction,
     tx: &EventSender,
 ) {
-    let tracks = collection_tracks(engine, provider, &item);
+    let tracks = collection_tracks(engine, provider, &item).map(|mut tracks| {
+        if !item.title.trim().is_empty() { for track in &mut tracks { track.raw["queue_context_name"] = json!(item.title); } }
+        tracks
+    });
     if matches!(action, CollectionAction::Favorites) {
         let mut completed = Vec::new();
         let mut error = None;
@@ -6720,6 +6723,14 @@ impl Worker {
                         provider,
                         job,
                     } = request;
+                    let operation = match &job {
+                        Job::LibraryState => "LibraryState", Job::Collection(..) => "Collection",
+                        Job::Route(..) => "Route", Job::More(..) => "More", Job::Api(..) => "Api",
+                        Job::Playlist(..) => "Playlist", Job::Lyrics(..) => "Lyrics",
+                        Job::LyricsWindow(..) => "LyricsWindow", Job::TrackInfo(..) => "TrackInfo",
+                    };
+                    let _request_log = crate::spotify_diagnostics::Span::new("catalog.job", &format!("{:?} {operation} generation={generation}", provider));
+
                     #[cfg(feature = "diagnostics")]
                     let _page_scope = crate::memory_profile::page_scope(if view_tag == 0 {
                         0

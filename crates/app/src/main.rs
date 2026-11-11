@@ -303,6 +303,7 @@ pub(crate) use ui::visualizer;
 mod window;
 
 fn main() {
+    crate::spotify_diagnostics::install_panic_log();
     crate::spotify_diagnostics::record("app.start", "connect_browser_adapter_v1");
     #[cfg(windows)]
     {

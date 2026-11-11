@@ -905,6 +905,7 @@ mod catalog_scroll {
             sibling(r, &old.labels, next.labels.len());
         }
         sibling(&mut scene.queue_panels, &old.panels, next.panels.len());
+        sibling(&mut scene.queue_row_panels, &old.panels, next.panels.len());
         sibling(
             &mut scene.queue_pictures,
             &old.pictures,
@@ -921,6 +922,7 @@ mod catalog_scroll {
         }
         for row in &mut scene.lyric_rows {
             index(&mut row.label, &old.labels, next.labels.len());
+            if let Some(button) = &mut row.button { index(button, &old.buttons, next.buttons.len()); }
         }
         scene.artwork_ahead = std::mem::take(&mut next.artwork_ahead);
         // Keep the full layout's document extent: it includes header/player insets.
@@ -1099,62 +1101,38 @@ mod queue_scroll {
             index(&mut range.end, old, new_len);
         }
     }
-    pub(crate) fn refresh_queue_sidebar(scene: &mut Scene, ui: &Ui, h: i32) -> bool {
+    pub(crate) fn refresh_queue_sidebar(scene: &mut Scene, ui: &Ui, h: i32) -> bool {refresh(scene,ui,h,false)}
+    pub(crate) fn update_queue_sidebar(scene:&mut Scene,ui:&Ui,h:i32)->bool {refresh(scene,ui,h,true)}
+    fn refresh(scene:&mut Scene,ui:&Ui,h:i32,force:bool)->bool {
         let Some(frame) = scene.queue_frame else {
             return false;
         };
         if scene.device_sidebar.is_some()
-            || !ui.queue_sidebar_open
+            || !(ui.queue_sidebar_open || ui.friends_sidebar_open)
             || scene.auth_modal.is_some()
             || scene.login_underlay.is_some()
         {
             return false;
         }
-        let pixels = (ui.queue_scroll.min(scene.queue_scroll_max) * 24
-            + ui.queue_scroll_offset.min(23)) as i32;
-        let returning = (pixels - scene.queue_anchor as i32).abs() >= 216;
-        let had_return = scene.buttons[scene.queue_buttons.clone()]
-            .iter()
-            .any(|b| matches!(b.action, Action::QueueReturn));
-        if (pixels - scene.queue_layout_scroll).abs() < 112 && returning == had_return {
-            let delta = scene.queue_pixel_scroll - pixels;
-            for button in &mut scene.buttons[scene.queue_row_buttons.clone()] {
-                button.rect.y += delta;
-            }
-            for label in &mut scene.labels[scene.queue_row_labels.clone()] {
-                label.rect.y += delta;
-            }
-            for (rect, _) in &mut scene.pictures[scene.queue_pictures.clone()] {
-                rect.y += delta;
-            }
-            scene.queue_pixel_scroll = pixels;
-            if let Some(track) = scene.queue_scrollbar {
+        let pixels = (ui.queue_scroll.min(scene.queue_scroll_max) * 24 + ui.queue_scroll_offset.min(23)) as i32;
+        let pixels=pixels.min(scene.queue_scroll_pixels_max);
+        if !force && (pixels-scene.queue_layout_scroll).abs()<112 {
+            let delta=scene.queue_pixel_scroll-pixels;
+            for label in &mut scene.labels[scene.queue_row_labels.clone()] {label.rect.y+=delta;}
+            for button in &mut scene.buttons[scene.queue_row_buttons.clone()] {button.rect.y+=delta;}
+            for panel in &mut scene.panels[scene.queue_row_panels.clone()] {panel.rect.y+=delta;}
+            for (rect,_) in &mut scene.pictures[scene.queue_pictures.clone()] {rect.y+=delta;}
+            scene.queue_pixel_scroll=pixels;
+            if let Some(track)=scene.queue_scrollbar {
                 for panel in &mut scene.panels[scene.queue_panels.clone()] {
-                    if panel.kind == 17 {
-                        panel.rect.y = track.y
-                            + ((pixels as i64 * (track.h - panel.rect.h) as i64)
-                                / (scene.queue_scroll_max.max(1) as i64 * 24))
-                                as i32;
-                    }
+                    if panel.kind==17 { panel.rect.y=track.y+pixels*(track.h-panel.rect.h)/scene.queue_scroll_pixels_max.max(1); }
                 }
             }
             return true;
         }
         let mut next = Scene::default();
         build_queue_sidebar(&mut next, ui, frame.x, frame.w, h);
-        // Queue media strings are already final. Translate only the header/actions,
-        // avoiding a scan of the entire catalog and playback queue on every frame.
-        for (i, label) in next.labels.iter_mut().enumerate() {
-            if !next.queue_row_labels.contains(&i) {
-                label.text = ui.translated_text(&label.text);
-            }
-        }
-        for button in &mut next.buttons {
-            if !matches!(button.action, Action::QueueJump(_)) {
-                button.text = ui.translated_text(&button.text);
-                button.accessible = ui.translated_text(&button.accessible);
-            }
-        }
+        translate_scene(&mut next,ui);
         let buttons = scene.queue_buttons.clone();
         let labels = scene.queue_labels.clone();
         let panels = scene.queue_panels.clone();
@@ -1190,11 +1168,15 @@ mod queue_scroll {
         }
         for row in &mut scene.lyric_rows {
             index(&mut row.label, &labels, next.labels.len());
+            if let Some(button) = &mut row.button { index(button, &buttons, next.buttons.len()); }
         }
         scene.queue_row_labels =
             labels.start + next.queue_row_labels.start..labels.start + next.queue_row_labels.end;
         scene.queue_row_buttons = buttons.start + next.queue_row_buttons.start
             ..buttons.start + next.queue_row_buttons.end;
+        scene.queue_row_panels=panels.start+next.queue_row_panels.start..panels.start+next.queue_row_panels.end;
+        scene.queue_scroll_pixels_max=next.queue_scroll_pixels_max;
+
         scene.queue_layout_scroll = next.queue_layout_scroll;
         scene.queue_pixel_scroll = next.queue_pixel_scroll;
         scene.queue_buttons = buttons.start..buttons.start + next.buttons.len();
@@ -1215,6 +1197,23 @@ mod queue_scroll {
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[test]
+        fn wheel_translation_reuses_text_and_keeps_localization_on_rebuffer() {
+            for provider in [crate::catalog::Provider::Spotify,crate::catalog::Provider::Deezer,crate::catalog::Provider::YouTube] {
+                let mut ui=Ui::default();ui.provider=provider;ui.queue_sidebar_open=true;ui.set_language("tr");
+                ui.queue=(0..100).map(|index|crate::catalog::Entry {id:index.to_string(),title:format!("Track {index}"),subtitle:"Artist".into(),..Default::default()}).collect();ui.now=ui.queue[0].clone();
+                let mut scene=build(&ui,(1600,1100),true,false,"",true,50);
+                let strings:Vec<_>=scene.labels[scene.queue_row_labels.clone()].iter().map(|label|label.text.as_ptr()).collect();
+                let initial=scene.queue_layout_scroll;ui.queue_scroll=1;
+                assert!(refresh_queue_sidebar(&mut scene,&ui,1100));
+                assert_eq!(scene.queue_layout_scroll,initial);
+                assert_eq!(strings,scene.labels[scene.queue_row_labels.clone()].iter().map(|label|label.text.as_ptr()).collect::<Vec<_>>());
+                for offset in [6,20,1,0] {
+                    ui.queue_scroll=offset;assert!(refresh_queue_sidebar(&mut scene,&ui,1100));
+                    assert!(!scene.labels[scene.queue_labels.clone()].iter().any(|label|matches!(label.text.as_str(),"Now playing"|"Next in queue"|"Your queue is empty") || label.text.contains("Current playlist or radio")));
+                }
+            }
+        }
         #[test]
         fn queue_refresh_preserves_main_page_and_matches_fresh_layout() {
             for provider in [
@@ -1308,7 +1307,7 @@ mod queue_scroll {
     }
 }
 pub(crate) use catalog_scroll::{finish_catalog_scroll, prepare_catalog_scroll};
-pub(crate) use queue_scroll::refresh_queue_sidebar;
+pub(crate) use queue_scroll::{refresh_queue_sidebar,update_queue_sidebar};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
     Home,
@@ -1654,10 +1653,15 @@ pub enum Action {
     ToggleSidebar,
     SetControlAlignment(bool),
     ToggleQueueSidebar,
+    ToggleFriendsSidebar,
+    SpotifyFriendsRefresh,
+    SpotifySharing(bool),
     TogglePodcastDescription(String),
     ToggleLyricsVolume,
     QueueJump(usize),
     QueueClear,
+    QueueRecent(bool),
+    QueueDismissJam,
     QueueReset,
     QueueReturn,
     LyricsFollow,
@@ -1687,6 +1691,156 @@ pub enum Action {
     EqReset,
     OpenTrackInfo(crate::catalog::Entry),
 }
+impl Action {
+    pub(crate) fn log_name(&self) -> &'static str {
+        match self {
+            Self::SwitchProvider(..) => "SwitchProvider",
+            Self::DeezerLogin => "DeezerLogin",
+            Self::YouTubeLogin => "YouTubeLogin",
+            Self::YouTubeLogout => "YouTubeLogout",
+            Self::SpotifyLogin => "SpotifyLogin",
+            Self::OnboardingSelect(..) => "OnboardingSelect",
+            Self::OnboardingNext => "OnboardingNext",
+            Self::SpotifyLogout => "SpotifyLogout",
+            Self::SpotifyRefresh => "SpotifyRefresh",
+            Self::CheckUpdate => "CheckUpdate",
+            Self::DownloadUpdate => "DownloadUpdate",
+            Self::ApplyUpdate => "ApplyUpdate",
+            Self::BindShortcut(..) => "BindShortcut",
+            Self::ResetShortcut(..) => "ResetShortcut",
+            Self::OpenItem(..) => "OpenItem",
+            Self::PlayAll => "PlayAll",
+            Self::More => "More",
+            Self::CollectionMenu => "CollectionMenu",
+            Self::RefreshFlow => "RefreshFlow",
+            Self::Favorite => "Favorite",
+            Self::FavoriteNow => "FavoriteNow",
+            Self::MuteVolume => "MuteVolume",
+            Self::PlayerFullscreen => "PlayerFullscreen",
+            Self::Download => "Download",
+            Self::RemoveDownloads => "RemoveDownloads",
+            Self::LibraryMaintenance(..) => "LibraryMaintenance",
+            Self::RepairDownloads => "RepairDownloads",
+            Self::Share => "Share",
+            Self::Sort(..) => "Sort",
+            Self::ToggleCheck(..) => "ToggleCheck",
+            Self::Preset(..) => "Preset",
+            Self::ResetTheme => "ResetTheme",
+            Self::ImportTheme => "ImportTheme",
+            Self::ExportTheme => "ExportTheme",
+            Self::Shelf(..) => "Shelf",
+            Self::ShelfAll(..) => "ShelfAll",
+            Self::ShelfMore(..) => "ShelfMore",
+            Self::Api(..) => "Api",
+            Self::Adjust(..) => "Adjust",
+            Self::BackgroundImage => "BackgroundImage",
+            Self::ChooseStorage => "ChooseStorage",
+            Self::CancelStorage => "CancelStorage",
+            Self::BackgroundMode(..) => "BackgroundMode",
+            Self::Color(..) => "Color",
+            Self::FlowChoice(..) => "FlowChoice",
+            Self::Genre(..) => "Genre",
+            Self::FlowMoreGenres => "FlowMoreGenres",
+            Self::FlowAddGenre => "FlowAddGenre",
+            Self::ApplyFlow => "ApplyFlow",
+            Self::MixRegion(..) => "MixRegion",
+            Self::MixLanguages => "MixLanguages",
+            Self::MixMore(..) => "MixMore",
+            Self::MixLess(..) => "MixLess",
+            Self::MixGenre(..) => "MixGenre",
+            Self::BuildStyleMix => "BuildStyleMix",
+            Self::CancelDownload(..) => "CancelDownload",
+            Self::Go(..) => "Go",
+            Self::Back => "Back",
+            Self::Connect => "Connect",
+            Self::ConnectSaved => "ConnectSaved",
+            Self::OpenConnect => "OpenConnect",
+            Self::ToggleDeviceMenu => "ToggleDeviceMenu",
+            Self::CloseDeviceMenu => "CloseDeviceMenu",
+            Self::SpotifyDevicesRefresh => "SpotifyDevicesRefresh",
+            Self::SpotifyJamOpen => "SpotifyJamOpen",
+            Self::SpotifyJamRefresh => "SpotifyJamRefresh",
+            Self::SpotifyJamStart => "SpotifyJamStart",
+            Self::SpotifyJamEnd(..) => "SpotifyJamEnd",
+            Self::SpotifyJamLeave(..) => "SpotifyJamLeave",
+            Self::SpotifyJamRemove(..) => "SpotifyJamRemove",
+            Self::SpotifyJamCopyInvite => "SpotifyJamCopyInvite",
+            Self::SpotifyTransferPlayback(..) => "SpotifyTransferPlayback",
+            Self::CopyConnectLink => "CopyConnectLink",
+            Self::SpotifySetup => "SpotifySetup",
+            Self::StartSpotify => "StartSpotify",
+            Self::OpenSpotify => "OpenSpotify",
+            Self::OpenSpotifyOutputSettings => "OpenSpotifyOutputSettings",
+            Self::ReconnectSpotifyOutput => "ReconnectSpotifyOutput",
+            Self::DeezerLoginOptions => "DeezerLoginOptions",
+            Self::DeezerLoginAdvanced(..) => "DeezerLoginAdvanced",
+            Self::CloseDeezerLogin => "CloseDeezerLogin",
+            Self::ConnectDeezerWebView => "ConnectDeezerWebView",
+            Self::Logout => "Logout",
+            Self::PlayId => "PlayId",
+            Self::Toggle => "Toggle",
+            Self::Stop => "Stop",
+            Self::Next => "Next",
+            Self::Previous => "Previous",
+            Self::Shuffle => "Shuffle",
+            Self::Repeat => "Repeat",
+            Self::Setting(..) => "Setting",
+            Self::Tab(..) => "Tab",
+            Self::Filter(..) => "Filter",
+            Self::Notice(..) => "Notice",
+            Self::SavePlaylist => "SavePlaylist",
+            Self::EditPlaylist(..) => "EditPlaylist",
+            Self::ChoosePlaylist(..) => "ChoosePlaylist",
+            Self::ChoosePlaylistCover => "ChoosePlaylistCover",
+            Self::ClearPlaylistDescription => "ClearPlaylistDescription",
+            Self::CropPlaylistCover(..) => "CropPlaylistCover",
+            Self::ExportPlaylistCover => "ExportPlaylistCover",
+            Self::DeletePlaylist => "DeletePlaylist",
+            Self::Search => "Search",
+            Self::Eq(..) => "Eq",
+            Self::Close => "Close",
+            Self::ToggleSidebar => "ToggleSidebar",
+            Self::SetControlAlignment(..) => "SetControlAlignment",
+            Self::ToggleQueueSidebar => "ToggleQueueSidebar",
+            Self::ToggleFriendsSidebar => "ToggleFriendsSidebar",
+            Self::SpotifyFriendsRefresh => "SpotifyFriendsRefresh",
+            Self::SpotifySharing(_) => "SpotifySharing",
+            Self::TogglePodcastDescription(..) => "TogglePodcastDescription",
+            Self::ToggleLyricsVolume => "ToggleLyricsVolume",
+            Self::QueueJump(..) => "QueueJump",
+            Self::QueueClear => "QueueClear",
+            Self::QueueRecent(..) => "QueueRecent",
+            Self::QueueDismissJam => "QueueDismissJam",
+            Self::QueueReset => "QueueReset",
+            Self::QueueReturn => "QueueReturn",
+            Self::LyricsFollow => "LyricsFollow",
+            Self::SeekMs(..) => "SeekMs",
+            Self::ToggleLyricsCoverMode => "ToggleLyricsCoverMode",
+            Self::ToggleLyricsVisualizer => "ToggleLyricsVisualizer",
+            Self::ToggleLyricsFullscreen => "ToggleLyricsFullscreen",
+            Self::VisualizerStyle(..) => "VisualizerStyle",
+            Self::CornerStyle(..) => "CornerStyle",
+            Self::SolidTheme(..) => "SolidTheme",
+            Self::ThemeShelf(..) => "ThemeShelf",
+            Self::CustomTheme(..) => "CustomTheme",
+            Self::SaveCustomTheme => "SaveCustomTheme",
+            Self::CloseCustomTheme => "CloseCustomTheme",
+            Self::ResetCustomTheme => "ResetCustomTheme",
+            Self::PlayerLayout(..) => "PlayerLayout",
+            Self::ToggleBool(..) => "ToggleBool",
+            Self::AdjustLyricsSize(..) => "AdjustLyricsSize",
+            Self::ToggleLyricSource(..) => "ToggleLyricSource",
+            Self::DeezerLogo => "DeezerLogo",
+            Self::SpotifyLogo => "SpotifyLogo",
+            Self::YouTubeLogo => "YouTubeLogo",
+            Self::StreamingQuality(..) => "StreamingQuality",
+            Self::EqMode(..) => "EqMode",
+            Self::EqReset => "EqReset",
+            Self::OpenTrackInfo(..) => "OpenTrackInfo",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rect {
     pub x: i32,
@@ -1724,6 +1878,7 @@ pub struct Button {
     pub text_link: bool,
     pub text_centered: bool,
     pub artist_credit_group: Option<Rect>,
+    pub identity: Option<String>,
 }
 
 impl Default for Button {
@@ -1740,6 +1895,7 @@ impl Default for Button {
             text_link: false,
             text_centered: false,
             artist_credit_group: None,
+            identity: None,
         }
     }
 }
@@ -1820,6 +1976,8 @@ pub struct Scene {
     pub queue_pictures: std::ops::Range<usize>,
     pub queue_row_labels: std::ops::Range<usize>,
     pub queue_row_buttons: std::ops::Range<usize>,
+    pub queue_row_panels: std::ops::Range<usize>,
+    pub queue_scroll_pixels_max: i32,
     pub queue_layout_scroll: i32,
     pub queue_pixel_scroll: i32,
     pub queue_frame: Option<Rect>,
@@ -1947,6 +2105,7 @@ impl Scene {
             text_link: false,
             text_centered: false,
             artist_credit_group: None,
+            identity: None,
         });
     }
 }
@@ -2068,6 +2227,14 @@ pub struct Ui {
     pub liked_ids: std::collections::HashSet<String>,
     pub sidebar_collapsed: bool,
     pub queue_sidebar_open: bool,
+    pub friends_sidebar_open: bool,
+    pub spotify_social: Option<crate::spotify::social::Snapshot>,
+    pub spotify_social_busy: bool,
+    pub spotify_social_refreshed: Option<std::time::Instant>,
+    pub spotify_social_status: String,
+    pub queue_recent: bool,
+    pub queue_history: Vec<crate::catalog::Entry>,
+    pub queue_jam_dismissed: bool,
     pub queue_scroll: usize,
     pub queue_scroll_offset: usize,
     pub queue: Vec<crate::catalog::Entry>,
@@ -2247,6 +2414,14 @@ impl Default for Ui {
             liked_ids: Default::default(),
             sidebar_collapsed: false,
             queue_sidebar_open: false,
+            friends_sidebar_open: false,
+            spotify_social: None,
+            spotify_social_busy: false,
+            spotify_social_refreshed: None,
+            spotify_social_status: String::new(),
+            queue_recent: false,
+            queue_history: Vec::new(),
+            queue_jam_dismissed: false,
             queue_scroll: 0,
             queue_scroll_offset: 0,
             queue: Vec::new(),
@@ -2461,7 +2636,7 @@ impl Ui {
     /// Fold open sidebars before they squeeze the main page below its useful width.
     /// This runs on window resize; users can still explicitly reopen a sidebar.
     pub fn right_sidebar_open(&self) -> bool {
-        self.queue_sidebar_open || self.device_menu_open
+        self.queue_sidebar_open || self.device_menu_open || self.friends_sidebar_open
     }
     pub fn sidebar_values(&self) -> (f32, f32) {
         (
@@ -2472,8 +2647,11 @@ impl Ui {
     pub fn content_left(&self) -> i32 {
         (70. + 176. * self.sidebar_values().0).round() as i32
     }
+    pub fn sidebar_panel_width(&self, width: i32) -> i32 {
+        400.min(width/3)
+    }
     pub fn right_sidebar_width(&self, width: i32) -> i32 {
-        (280.min(width / 3) as f32 * self.sidebar_values().1).round() as i32
+        (self.sidebar_panel_width(width) as f32 * self.sidebar_values().1).round() as i32
     }
     pub fn visible_device_sidebar(&self) -> bool {
         self.device_menu_open
@@ -2481,14 +2659,23 @@ impl Ui {
     pub fn toggle_device_sidebar(&mut self) {
         self.device_menu_open = !self.device_menu_open;
         if self.device_menu_open {
+            self.friends_sidebar_open = false;
             self.queue_sidebar_open = false;
         }
     }
     pub fn toggle_queue_sidebar(&mut self) {
         self.queue_sidebar_open = !self.queue_sidebar_open;
         if self.queue_sidebar_open {
+            self.friends_sidebar_open = false;
             self.device_menu_open = false;
         }
+    }
+    pub fn toggle_friends_sidebar(&mut self) {
+        if self.view == View::Lyrics {
+            return;
+        }
+        self.friends_sidebar_open = !self.friends_sidebar_open;
+        if self.friends_sidebar_open { self.device_menu_open = false; self.queue_sidebar_open = false; self.queue_scroll = 0; self.queue_scroll_offset = 0; }
     }
     pub fn fit_sidebars(&mut self, width: i32) {
         let lyrics = self.view == View::Lyrics;
@@ -2498,7 +2685,7 @@ impl Ui {
             520
         };
         let queue = if self.right_sidebar_open() {
-            280.min(width / 3)
+            self.sidebar_panel_width(width)
         } else {
             0
         };
@@ -2516,6 +2703,7 @@ impl Ui {
         if self.right_sidebar_open() && width - left - right - queue < minimum {
             self.queue_sidebar_open = false;
             self.device_menu_open = false;
+            self.friends_sidebar_open = false;
         }
     }
     pub fn t<'a>(&'a self, value: &'a str) -> &'a str {
@@ -2973,6 +3161,9 @@ impl Ui {
         }
     }
     pub fn go(&mut self, view: View) {
+        if matches!(view, View::Lyrics | View::Settings) {
+            self.friends_sidebar_open = false;
+        }
         if self.view != view {
             self.lyrics_cover_hovered = false;
             self.lyrics_manual_scroll = false;
@@ -2985,6 +3176,9 @@ impl Ui {
     }
     pub fn back(&mut self) {
         if let Some(view) = self.history.pop() {
+            if matches!(view, View::Lyrics | View::Settings) {
+                self.friends_sidebar_open = false;
+            }
             self.lyrics_cover_hovered = false;
             self.lyrics_manual_scroll = false;
             self.lyrics_manual_until = None;
@@ -3374,21 +3568,33 @@ fn provider_card(
     } else {
         y + (height - 34) / 2
     };
-    scene.button(
-        Rect::new(x + w - 148, action_y, 132, 34),
-        ui.t(if matches!(login, Action::SwitchProvider(_)) {
-            "Switch"
-        } else if profile.is_some() {
-            "Log out"
-        } else {
-            "Log in"
-        }),
-        "",
-        login,
-        false,
-    );
-    if let Some(button) = scene.buttons.last_mut() {
-        button.enabled = !busy;
+    let provider = match logo {
+        Action::SpotifyLogo => crate::catalog::Provider::Spotify,
+        Action::YouTubeLogo => crate::catalog::Provider::YouTube,
+        _ => crate::catalog::Provider::Deezer,
+    };
+    let logout = match provider {
+        crate::catalog::Provider::Spotify => Action::SpotifyLogout,
+        crate::catalog::Provider::YouTube => Action::YouTubeLogout,
+        _ => Action::Logout,
+    };
+    let primary = if matches!(login, Action::Logout | Action::SpotifyLogout | Action::YouTubeLogout) {
+        Action::SwitchProvider(provider)
+    } else { login };
+    let selected = matches!(primary, Action::SwitchProvider(_)) && ui.provider == provider;
+    let primary_width=(w-74).clamp(36,132);
+    scene.button(Rect::new(x + w - 58 - primary_width, action_y, primary_width, 34),
+        ui.t(if selected { "Selected" } else if matches!(primary, Action::SwitchProvider(_)) { "Switch" } else { "Log in" }), "", primary, false);
+    if let Some(button) = scene.buttons.last_mut() { button.enabled = !busy && !selected; }
+    if saved || profile.is_some() {
+        scene.button(Rect::new(x + w - 50, action_y, 34, 34), "", "\u{f3b1}", logout, false);
+        if let Some(button) = scene.buttons.last_mut() {
+            button.enabled = !busy;
+            button.accessible = format!("Log out of {name} and remove saved sign-in data");
+            if provider == crate::catalog::Provider::Spotify {
+                button.accessible = "Log out of Spotify and delete Soloist installation, pairing, cache and saved sign-in data".into();
+            }
+        }
     }
     y + height + 8
 }
@@ -4799,209 +5005,218 @@ fn format_date(raw: &str) -> String {
     }
     trimmed.to_string()
 }
-fn queue_lines(entry: &crate::catalog::Entry, _width: i32) -> Vec<String> {
-    let mut metadata = entry.subtitle.clone();
-    if entry.duration > 0 {
-        let seconds = entry.duration / 1000;
-        metadata.push_str(&format!(" \u{2022} {}:{:02}", seconds / 60, seconds % 60));
-    }
-    if let Some(name) = entry.raw["added_by"].as_str().filter(|s| !s.is_empty()) {
-        metadata.push_str(&format!(" \u{2022} Added by {name}"));
-    }
-    vec![entry.title.clone(), metadata]
-}
-fn queue_text_width(_entry: &crate::catalog::Entry, row_width: i32) -> i32 {
-    (row_width - 96).max(1)
-}
-fn queue_button(
-    s: &mut Scene,
-    entry: &crate::catalog::Entry,
-    index: usize,
-    rect: Rect,
-    current: bool,
-    draggable: bool,
-) {
-    let text_w = queue_text_width(entry, rect.w);
-    s.button(rect, "", "", Action::QueueJump(index), current);
-    if let Some(btn) = s.buttons.last_mut() {
-        btn.accessible = format!(
-            "{}: {}",
-            if current { "Now playing" } else { "Play next" },
-            queue_lines(entry, text_w).join(" ")
-        );
-    }
-    if draggable {
-        s.label_sized(rect.x + 5, rect.y + 20, 18, 24, "\u{22ee}\u{22ee}", 1);
-    }
-    // Artwork has its own bounds: button artwork fills the entire button.
-    if rect.h >= 64 {
-        s.pictures.push((
-            Rect::new(rect.x + 26, rect.y + 10, 44, 44),
-            entry.artwork.clone(),
-        ));
-    }
-    if rect.h >= 64 {
-        for (line, text) in queue_lines(entry, text_w).into_iter().enumerate() {
-            s.label_sized(
-                rect.x + 82,
-                rect.y + 10 + line as i32 * 24,
-                text_w,
-                24,
-                text,
-                if line == 0 { 0 } else { 1 },
-            );
-        }
-    }
-}
 fn build_queue_sidebar(s: &mut Scene, ui: &Ui, qx: i32, qw: i32, h: i32) {
     let start = s.labels.len();
     let buttons = s.buttons.len();
     let panels = s.panels.len();
     let pictures = s.pictures.len();
-    build_queue_sidebar_contents(s, ui, qx, qw, h);
+    if ui.friends_sidebar_open { build_friends_sidebar(s, ui, qx, qw, h); }
+    else { build_queue_sidebar_contents(s, ui, qx, qw, h); }
     s.queue_labels = start..s.labels.len();
     s.queue_buttons = buttons..s.buttons.len();
     s.queue_panels = panels..s.panels.len();
     s.queue_pictures = pictures..s.pictures.len();
 }
-fn build_queue_sidebar_contents(s: &mut Scene, ui: &Ui, qx: i32, qw: i32, h: i32) {
-    let bottom = h - if ui.view == View::Lyrics { 12 } else { 96 };
-    s.queue_frame = Some(Rect::new(qx, 10, qw, bottom - 20));
-    s.panel(qx, 10, qw, bottom - 20, 0);
-    // Reserve action space first, then let the localized title use the rest.
-    // Icon actions keep a predictable hit area regardless of translation length.
-    let action_size = 30;
-    let action_gap = 6;
-    let clear_x = qx + qw - 12 - action_size;
-    let reset_x = clear_x - action_gap - action_size;
-    let title_x = if qw >= 260 {
-        s.button(
-            Rect::new(qx + 10, 24, 30, 30),
-            "",
-            "\u{e8fd}",
-            Action::ToggleQueueSidebar,
-            false,
-        );
-        if let Some(button) = s.buttons.last_mut() {
-            button.accessible = "Close queue".into();
-        }
-        qx + 44
-    } else {
-        qx + 14
-    };
-    s.label_sized(title_x, 26, (reset_x - title_x - 8).max(1), 28, "QUEUE", 0);
-    for (x, glyph, action, name) in [
-        (reset_x, "\u{e777}", Action::QueueReset, "Reset"),
-        (clear_x, "\u{e74d}", Action::QueueClear, "Clear"),
-    ] {
-        s.button(
-            Rect::new(x, 24, action_size, action_size),
-            "",
-            glyph,
-            action,
-            false,
-        );
-        if let Some(button) = s.buttons.last_mut() {
-            button.accessible = ui.t(name).into();
+#[cfg(test)]
+mod spotify_reference_panel_tests {
+    use super::*;
+    #[test]
+    fn playback_source_names_capture_collection_flow_and_style_mix() {
+        for provider in [crate::catalog::Provider::Deezer,crate::catalog::Provider::Spotify,crate::catalog::Provider::YouTube] {
+            let mut ui=Ui::default();ui.provider=provider;
+            let mut track=crate::catalog::Entry::default();
+            track.raw=serde_json::json!({"queue_context_name":"My playlist"});
+            ui.view=View::Flow;ui.flow_id="happy".into();
+            assert_eq!(playback_source_name(&ui,&track).as_deref(),Some("My playlist"));
+            track.raw=serde_json::json!({});
+            assert_eq!(playback_source_name(&ui,&track).as_deref(),Some("Flow - Happy"));
+            ui.view=View::Home;track.raw[crate::style_mix::MARKER]=serde_json::json!("0:0");
+            let expected=format!("Style Mix - {} + {}",crate::style_mix::REGIONS[0].0,crate::style_mix::GENRES[0].0);
+            assert_eq!(playback_source_name(&ui,&track),Some(expected));
         }
     }
-    let mut y = 68;
-    let items: &[crate::catalog::Entry] = if !ui.queue.is_empty() {
-        &ui.queue
-    } else if !ui.now.id.is_empty() {
-        std::slice::from_ref(&ui.now)
-    } else {
-        &[]
-    };
-    if items.is_empty() {
-        s.label(qx + 18, y + 24, qw - 36, "Queue is empty", 1);
-        return;
-    }
-    let cur = if ui.queue_index < items.len()
-        && (ui.now.id.is_empty() || items[ui.queue_index].id == ui.now.id)
-    {
-        ui.queue_index
-    } else if !ui.now.id.is_empty() {
-        items
-            .iter()
-            .position(|e| e.id == ui.now.id)
-            .unwrap_or_else(|| ui.queue_index.min(items.len().saturating_sub(1)))
-    } else {
-        ui.queue_index.min(items.len().saturating_sub(1))
-    };
-    s.label(qx + 18, y, qw - 36, "QUEUE", 9);
-    y += 28;
-    let viewport = Rect::new(qx + 12, y, qw - 24, (bottom - 18 - y).max(1));
-    s.queue_viewport = Some(viewport);
-    let upcoming_start = 0;
-    let upcoming = items;
-    let total = (upcoming.len().min((i32::MAX / 72) as usize) as i32) * 72;
-    let max = ((total - viewport.h).max(0) + 23) / 24;
-    let offset = ui.queue_scroll.min(max as usize) as i32;
-    s.queue_scroll_max = max as usize;
-    s.queue_anchor = cur
-        .saturating_mul(72)
-        .saturating_sub((viewport.h / 4) as usize)
-        .min(max as usize * 24);
-    let fractional_offset = if offset < max {
-        ui.queue_scroll_offset.min(23) as i32
-    } else {
-        0
-    };
-    let pixels = offset * 24 + fractional_offset;
-    s.queue_layout_scroll = pixels;
-    s.queue_pixel_scroll = pixels;
-    let first = (pixels.saturating_sub(144).max(0) / 72) as usize;
-    let mut row_y = y + first as i32 * 72 - pixels;
-    let row_labels = s.labels.len();
-    let row_buttons = s.buttons.len();
-    for (idx, entry) in upcoming.iter().enumerate().skip(first) {
-        let idx = upcoming_start + idx;
-        let height = 72;
-        if row_y >= viewport.y + viewport.h + 144 {
-            break;
-        }
-        let top = row_y.max(viewport.y - 144);
-        let end = (row_y + height - 6).min(viewport.y + viewport.h + 144);
-        if end > top {
-            let rect = Rect::new(qx + 12, row_y, qw - 38, height - 6);
-            queue_button(s, entry, idx, rect, idx == cur, idx > cur);
-        }
-        row_y += height;
-    }
-    s.queue_row_labels = row_labels..s.labels.len();
-    s.queue_row_buttons = row_buttons..s.buttons.len();
-    if max > 0 {
-        let track = Rect::new(qx + qw - 20, viewport.y, 8, viewport.h);
-        let thumb = (track.h * track.h / total.max(1)).max(24).min(track.h);
-        s.queue_scrollbar = Some(track);
-        s.panel(
-            track.x,
-            track.y
-                + (((offset as i64 * 24 + fractional_offset as i64) * (track.h - thumb) as i64)
-                    / (max as i64 * 24)) as i32,
-            8,
-            thumb,
-            17,
-        );
-    }
-    if ((offset * 24 + fractional_offset) - s.queue_anchor as i32).abs() >= 216 {
-        s.button(
-            Rect::new(qx + (qw - 36) / 2, viewport.y + viewport.h - 38, 36, 32),
-            "",
-            "\u{e72e}",
-            Action::QueueReturn,
-            false,
-        );
-        if let Some(button) = s.buttons.last_mut() {
-            button.accessible = "Return to now playing".into();
+    #[test]
+    fn clearing_manual_items_keeps_source_rows_visible_after_sidebar_refresh() {
+        for provider in [crate::catalog::Provider::Deezer,crate::catalog::Provider::Spotify,crate::catalog::Provider::YouTube] {
+            let mut ui=Ui::default();ui.provider=provider;ui.queue_sidebar_open=true;
+            let mut sources=vec![entry("current","Current",true),entry("source1","Source one",true),entry("source2","Source two",true)];
+            crate::audio::mark_queue_fallback(&mut sources);
+            sources[0].raw["queue_context_name"]=serde_json::json!("My playlist");
+            ui.now=sources[0].clone();ui.queue=sources.clone();
+            for i in 0..40 {ui.queue.insert(1,crate::audio::explicit_queue_entry(entry(&format!("manual{i}"),"Manual addition",true)));}
+            ui.queue_scroll=75;
+            let mut scene=build(&ui,(1600,1100),true,false,"",true,50);
+            assert!(scene.labels.iter().any(|label|label.text=="Manual addition"));
+            ui.queue=crate::audio::clear_manual_upcoming(&ui.queue,ui.queue_index);
+            assert!(update_queue_sidebar(&mut scene,&ui,1100));
+            for title in ["Current","Source one","Source two","Playing from: My playlist"] { assert!(scene.labels.iter().any(|label|label.text==title),"missing {title} for {provider:?}"); }
+            assert!(!scene.labels.iter().any(|label|label.text=="Manual addition"));
+            assert!(!scene.buttons.iter().any(|button|matches!(button.action,Action::QueueClear)));
+            assert_eq!(ui.queue,sources);
         }
     }
-    if upcoming.is_empty() {
-        s.label(qx + 18, y + 8, qw - 36, "No upcoming songs", 1);
+    fn entry(id:&str,title:&str,manual:bool)->crate::catalog::Entry {
+        crate::catalog::Entry {id:id.into(),title:title.into(),subtitle:"Artist".into(),raw:serde_json::json!({"spotify_manual_queue":manual}),..Default::default()}
+    }
+    #[test]
+    fn queue_separates_manual_items_from_source_and_exposes_real_tabs() {
+        let mut ui=Ui::default();ui.provider=crate::catalog::Provider::Spotify;
+        ui.now=entry("now","Current",false);ui.now.raw["spotify_context_name"]=serde_json::json!("Liked Songs");
+        ui.queue=vec![ui.now.clone(),entry("manual","Manual",true),entry("context","Context",false)];
+        let mut scene=Scene::default();build_queue_sidebar(&mut scene,&ui,10,500,1100);
+        assert!(scene.buttons.iter().any(|b|matches!(b.action,Action::QueueRecent(true))));
+        assert!(scene.buttons.iter().any(|b|matches!(b.action,Action::SpotifyJamStart) && !b.selected && b.text=="Start a Jam"));
+        assert!(!scene.panels.iter().any(|p|p.kind==42)); // No fixed Spotify-green button fill.
+        assert!(scene.panels.iter().any(|p|p.kind==44)); // Theme-accent tab indicator.
+
+        assert!(scene.buttons.iter().any(|b|matches!(b.action,Action::QueueClear)));
+        assert!(scene.labels.iter().any(|l|l.text=="Playing from: Liked Songs"));
+        assert!(scene.labels.iter().any(|l|l.text=="Current" && l.kind==47));
+        ui.queue.remove(1);let mut scene=Scene::default();build_queue_sidebar(&mut scene,&ui,10,500,1100);
+        assert!(!scene.buttons.iter().any(|b|matches!(b.action,Action::QueueClear)));
+        ui.queue_recent=true;ui.queue_history.push(entry("old","Previous",false));
+        let mut scene=Scene::default();build_queue_sidebar(&mut scene,&ui,10,500,1100);
+        assert!(scene.labels.iter().any(|l|l.text=="Previous"));
+        assert!(!scene.labels.iter().any(|l|l.text=="Next in queue"));
+    }
+    #[test]
+    fn every_provider_uses_the_same_sections_but_only_spotify_has_jam() {
+        for provider in [crate::catalog::Provider::Deezer,crate::catalog::Provider::Spotify,crate::catalog::Provider::YouTube] {
+            let mut ui=Ui::default();ui.provider=provider;
+            ui.now=entry("current","Current",false);ui.now.raw["queue_context_name"]=serde_json::json!("Source playlist");
+            ui.queue=vec![ui.now.clone(),crate::audio::explicit_queue_entry(entry("manual","Manual",false)),entry("source","Source",false)];
+            let mut scene=Scene::default();build_queue_sidebar(&mut scene,&ui,10,500,1100);
+            assert!(scene.labels.iter().any(|l|l.text=="Now playing"));
+            assert!(scene.labels.iter().any(|l|l.text=="Next in queue"));
+            assert!(scene.labels.iter().any(|l|l.text=="Playing from: Source playlist"));
+            assert!(scene.buttons.iter().any(|b|matches!(b.action,Action::QueueClear)));
+            assert_eq!(scene.buttons.iter().any(|b|matches!(b.action,Action::SpotifyJamStart | Action::QueueDismissJam)),provider==crate::catalog::Provider::Spotify);
+        }
+    }
+    #[test]
+    fn remote_strip_reserves_space_and_disappears_for_local_playback() {
+        let mut ui=Ui::default();ui.provider=crate::catalog::Provider::Spotify;
+        let normal=player_height(&ui,1400);
+        ui.now.raw=serde_json::json!({"spotify_remote_playback":true,"spotify_device_name":"Living room"});
+        assert_eq!(player_height(&ui,1400),normal+26);
+        let mut scene=Scene::default();build_player(&mut scene,&ui,1400,900,"Song",true,50);
+        assert!(scene.labels.iter().any(|l|l.text=="Playing on Living room"));
+        assert!(scene.panels.iter().any(|p|p.kind==42 && p.rect.y==874));
+        ui.now.raw["spotify_remote_playback"]=serde_json::json!(false);
+        assert_eq!(player_height(&ui,1400),normal);
     }
 }
+fn provider_queue_row(s: &mut Scene, entry: &crate::catalog::Entry, index: Option<usize>, occurrence:usize, x: i32, y: i32, w: i32, current: bool) {
+    s.button(Rect::new(x,y,w,66), "", "", index.map(Action::QueueJump).unwrap_or_else(||Action::OpenItem(entry.clone())), false);
+    if let Some(button)=s.buttons.last_mut() {
+        button.accessible=format!("{} ? {}",entry.title,entry.subtitle);
+        button.identity=Some(format!("queue:{}:{}:{occurrence}",entry.kind,entry.id));
+    }
+    if index.is_some() && !current { s.label_sized(x+w-26,y+18,24,24,"\u{22ee}\u{22ee}",49); }
+    s.pictures.push((Rect::new(x,y+6,52,52),entry.artwork.clone()));
+    s.label_sized(x+66,y+8,(w-70).max(1),24,if entry.title.is_empty() {"Loading..."} else {&entry.title},if current {47} else {0});
+    s.label_sized(x+66,y+33,(w-70).max(1),24,&entry.subtitle,1);
+}
+fn spotify_jam_card(s: &mut Scene, ui: &Ui, x:i32,y:i32,w:i32) {
+    s.panel(x,y,w,112,41);
+    for (line,text) in wrap_text(ui.t("Invite friends and listen together, wherever you are"),w-66,14).into_iter().take(2).enumerate() {
+        s.label_sized(x+16,y+12+line as i32*22,w-66,22,text,1);
+    }
+    s.button(Rect::new(x+w-34,y+10,24,24),"","\u{e711}",Action::QueueDismissJam,false);
+    if let Some(button)=s.buttons.last_mut() {button.accessible="Dismiss Jam invitation".into();}
+    s.button(Rect::new(x+16,y+66,132,34),if ui.spotify_jam.as_ref().is_some_and(|j|j.active) {"Open Jam"} else {"Start a Jam"},"",if ui.spotify_jam.as_ref().is_some_and(|j|j.active) { Action::SpotifyJamOpen } else { Action::SpotifyJamStart },false);
+    if let Some(button)=s.buttons.last_mut() {button.enabled=!ui.spotify_jam_busy;}
+}
+/// Capture the source before asynchronous playback or navigation changes the page.
+pub(crate) fn playback_source_name(ui: &Ui, entry: &crate::catalog::Entry) -> Option<String> {
+    if let Some(name) = entry.raw["queue_context_name"].as_str().filter(|s| !s.trim().is_empty()) { return Some(name.to_owned()); }
+    let style = entry.raw[crate::style_mix::MARKER].as_str().and_then(|key| crate::style_mix::Selection::parse(key).ok())
+        .or_else(|| (ui.view == View::StyleMix).then(|| crate::style_mix::Selection::new(ui.mix_region, ui.mix_genre).ok()).flatten());
+    if let Some(selection) = style { return Some(format!("Style Mix - {} + {}", ui.t(crate::style_mix::REGIONS[selection.region].0), ui.t(crate::style_mix::GENRES[selection.genre].0))); }
+    if matches!(ui.view, View::Flow | View::FlowTune) {
+        let mood = crate::spotify::flow::Selection::parse(&ui.flow_id).ok().map(|s| s.mood);
+        let name = ui.flow_options.iter().find(|(id, _)| id == &ui.flow_id || Some(id) == mood.as_ref()).map(|(_, name)| name.as_str())
+            .or_else(|| crate::spotify::flow::MOODS.iter().find(|(id, _)| Some(*id) == mood.as_deref()).map(|(_, name)| *name));
+        return Some(format!("Flow - {}", ui.t(name.unwrap_or("All moods"))));
+    }
+    ui.page.as_ref().and_then(|page| page.entity.as_ref().map(|e| e.title.as_str()).filter(|s| !s.trim().is_empty())
+        .or_else(|| (!page.title.trim().is_empty()).then_some(page.title.as_str()))).map(str::to_owned)
+}
 
+fn build_provider_queue(s:&mut Scene,ui:&Ui,qx:i32,qw:i32,h:i32) {
+    let bottom=h-if ui.view==View::Lyrics {12} else {96};
+    let frame=Rect::new(qx,10,qw,(bottom-20).max(1));
+    s.queue_frame=Some(frame);
+    s.panel(frame.x,frame.y,frame.w,frame.h,0);
+    s.panel(frame.x,frame.y,frame.w,frame.h,40);
+    let x=qx+14;let w=(qw-28).max(1);
+    let tab_w=(w-34)/2;
+    for (offset,text,recent) in [(0,"Queue",false),(tab_w,"Recently played",true)] {
+        s.button(Rect::new(x+offset,22,tab_w,34),"","",Action::QueueRecent(recent),ui.queue_recent==recent);
+        if let Some(button)=s.buttons.last_mut() {button.accessible=text.into();}
+        s.label_sized(x+offset,25,tab_w,28,text,if ui.queue_recent==recent {0} else {1});
+        if ui.queue_recent==recent {s.panel(x+offset,58,tab_w-8,2,44);}
+    }
+    s.button(Rect::new(qx+qw-36,22,28,30),"","\u{e711}",Action::ToggleQueueSidebar,false);
+    if let Some(button)=s.buttons.last_mut() {button.accessible="Close queue".into();}
+    let viewport=Rect::new(x,78,w,(bottom-94).max(1));s.queue_viewport=Some(viewport);
+    let mut body=Scene::default();let mut y=0;
+    let upcoming:Vec<_>=ui.queue.iter().enumerate().skip(ui.queue_index.saturating_add(1)).collect();
+    let manual:Vec<_>=upcoming.iter().copied().filter(|(_,e)|crate::audio::is_manual_queue_entry(e)).collect();
+    let context:Vec<_>=upcoming.iter().copied().filter(|(_,e)|!crate::audio::is_manual_queue_entry(e)).collect();
+    // Clamp against the new document before virtualizing rows. Clear can shrink it
+    // beneath the old scroll offset; culling at that offset would leave a blank list.
+    let content_height=if ui.queue_recent {ui.queue_history.len() as i32*80} else {
+        34 + if ui.now.id.is_empty() {0} else {92}
+        + if ui.provider==crate::catalog::Provider::Spotify && !ui.queue_jam_dismissed {144} else {0}
+        + 38 + if manual.is_empty() {40} else {manual.len() as i32*80}
+        + if context.is_empty() {0} else {60+context.len() as i32*80}
+    };
+    let maximum=(content_height-viewport.h).max(0);
+    let requested=ui.queue_scroll.saturating_mul(24).saturating_add(ui.queue_scroll_offset).min(maximum as usize) as i32;
+    let visible=|y:i32| y+80>=requested-160 && y<=requested+viewport.h+160;
+    let mut counts=std::collections::HashMap::new();
+    let occurrences:Vec<_>=ui.queue.iter().map(|entry| {let count=counts.entry((&entry.kind,&entry.id)).or_insert(0usize);let occurrence=*count;*count+=1;occurrence}).collect();
+
+    if ui.queue_recent {
+        if ui.queue_history.is_empty() {body.label(x,y+12,w,"No recently played tracks",1);}
+        for (occurrence,entry) in ui.queue_history.iter().enumerate() {if visible(y) {provider_queue_row(&mut body,entry,None,occurrence,x,y,w,false);}y+=80;}
+    } else {
+        body.label(x,y,w,"Now playing",0);y+=34;
+        if !ui.now.id.is_empty() {provider_queue_row(&mut body,&ui.now,ui.queue.get(ui.queue_index).filter(|entry|entry.id==ui.now.id).map(|_|ui.queue_index),occurrences.get(ui.queue_index).copied().unwrap_or(0),x,y,w,true);y+=92;}
+        if ui.provider==crate::catalog::Provider::Spotify && !ui.queue_jam_dismissed {spotify_jam_card(&mut body,ui,x,y,w);y+=144;}
+        body.label(x,y,(w-105).max(1),"Next in queue",0);
+        if !manual.is_empty() {
+            body.button(Rect::new(x+w-104,y-2,104,30),"Clear queue","",Action::QueueClear,false);
+        }
+        y+=38;
+        if manual.is_empty() {body.label(x,y,w,"Your queue is empty",1);y+=40;}
+        for (index,entry) in manual {if visible(y) {provider_queue_row(&mut body,entry,Some(index),occurrences[index],x,y,w,false);}y+=80;}
+        if !context.is_empty() {
+            y+=20;
+            let name=ui.now.raw["queue_context_name"].as_str().or_else(||ui.now.raw["spotify_context_name"].as_str()).filter(|v|!v.is_empty());
+            let heading=name.map(|name|format!("Playing from: {name}")).unwrap_or_else(|| "Up next".to_owned());
+            body.label_sized(x,y,w,30,heading,0);y+=40;
+            for (index,entry) in context {if visible(y) {provider_queue_row(&mut body,entry,Some(index),occurrences[index],x,y,w,false);}y+=80;}
+        }
+    }
+    debug_assert_eq!(content_height,y);let pixels=requested;
+    s.queue_scroll_max=((maximum+23)/24) as usize;s.queue_scroll_pixels_max=maximum;
+    s.queue_layout_scroll=pixels;s.queue_pixel_scroll=pixels;s.queue_anchor=0;
+    let labels=s.labels.len();let buttons=s.buttons.len();let panels=s.panels.len();
+    let buffered=|rect:Rect|rect.y+rect.h>viewport.y-160 && rect.y<viewport.y+viewport.h+160;
+    for mut label in body.labels {label.rect.y+=viewport.y-pixels;if buffered(label.rect) {s.labels.push(label);}}
+    for mut button in body.buttons {button.rect.y+=viewport.y-pixels;if buffered(button.rect) {s.buttons.push(button);}}
+    for mut panel in body.panels {panel.rect.y+=viewport.y-pixels;if buffered(panel.rect) {s.panels.push(panel);}}
+    for (mut rect,url) in body.pictures {rect.y+=viewport.y-pixels;if buffered(rect) {s.pictures.push((rect,url));}}
+    s.queue_row_labels=labels..s.labels.len();s.queue_row_buttons=buttons..s.buttons.len();s.queue_row_panels=panels..s.panels.len();
+    if maximum>0 {let track=Rect::new(qx+qw-8,viewport.y,4,viewport.h);s.queue_scrollbar=Some(track);let thumb=(track.h*track.h/y.max(1)).max(24).min(track.h);s.panel(track.x,track.y+pixels*(track.h-thumb)/maximum,4,thumb,17);}
+
+}
+
+fn build_queue_sidebar_contents(s: &mut Scene, ui: &Ui, qx: i32, qw: i32, h: i32) {
+    build_provider_queue(s,ui,qx,qw,h);
+}
 fn build_lyrics_view(s: &mut Scene, ui: &Ui, w: i32, h: i32, playing: bool, volume: u32) {
     // 1. Back button in top-left corner
     s.button(
@@ -5463,7 +5678,7 @@ pub fn build(
     } else {
         (76. + 186. * expansion).round() as i32
     };
-    let queue_w = (280.min(w / 3) as f32 * right_expansion).round() as i32;
+    let queue_w = (ui.sidebar_panel_width(w) as f32 * right_expansion).round() as i32;
     let cw = w - x - queue_w - if is_lyrics { 32 } else { 40 };
     let (x, cw) = if ui.view == View::Settings {
         let settings_width = cw.min(800);
@@ -5579,8 +5794,10 @@ pub fn build(
     }
     if queue_w > 0 {
         let qx = w - queue_w - (12. * right_expansion).round() as i32;
-        let panel_w = 280.min(w / 3);
-        if ui.visible_device_sidebar() {
+        let panel_w = ui.sidebar_panel_width(w);
+        if ui.friends_sidebar_open {
+            build_queue_sidebar(&mut s, ui, qx, panel_w, h);
+        } else if ui.visible_device_sidebar() {
             let first = s.labels.len();
             device_sidebar::build(&mut s, ui, qx, panel_w, h, playing);
             s.queue_labels = first..s.labels.len();
@@ -7064,6 +7281,7 @@ fn translate_scene(scene: &mut Scene, ui: &Ui) {
         .chain(ui.track_info.iter().map(|(track, _, _)| track))
         .chain(ui.pinned.iter().map(|(_, entry)| entry))
         .chain(ui.queue.iter())
+        .chain(ui.queue_history.iter())
         .chain(ui.offline.iter())
         .chain(ui.page.iter().flat_map(|page| {
             page.rows
@@ -7103,15 +7321,13 @@ fn translate_scene(scene: &mut Scene, ui: &Ui) {
     }
 }
 
+fn spotify_remote_name(ui: &Ui) -> Option<&str> {
+    if ui.provider != crate::catalog::Provider::Spotify || ui.now.raw["spotify_remote_playback"]!=true {return None;}
+    ui.now.raw["spotify_device_name"].as_str().filter(|name|!name.is_empty())
+}
 pub(crate) fn player_height(ui: &Ui, width: i32) -> i32 {
-    let breakpoint = if ui.player_layout == 1 { 1100 } else { 1180 };
-    if width < breakpoint {
-        112
-    } else if ui.player_layout == 1 {
-        64
-    } else {
-        88
-    }
+    let breakpoint=if ui.player_layout==1 {1100} else {1180};
+    (if width<breakpoint {112} else if ui.player_layout==1 {64} else {88}) + if spotify_remote_name(ui).is_some() {26} else {0}
 }
 pub(crate) fn player_title_rects(
     region: Rect,
@@ -7281,7 +7497,7 @@ mod device_sidebar {
                 ui.device_menu_open = devices;
                 ui.queue_sidebar_open = !devices;
                 assert_eq!(ui.sidebar_values(), (1., 1.));
-                assert_eq!(ui.right_sidebar_width(1200), 280);
+                assert_eq!(ui.right_sidebar_width(1200), 400);
             }
         }
         #[test]
@@ -7461,7 +7677,41 @@ mod device_sidebar {
             s.device_sidebar_buttons = first_button..s.buttons.len();
             return;
         }
-        s.label_sized(x, rect.y + 16, inner - 72, 28, "Spotify Connect", 0);
+    if ui.spotify_jam.as_ref().is_none_or(|j|!j.active) {
+        // Compact Connect surface; an active Jam retains its participant controls below.
+        s.panel(rect.x,rect.y,rect.w,rect.h,40);
+        s.label_sized(x,rect.y+18,inner-42,28,"Connect",0);
+        s.button(Rect::new(x+inner-30,rect.y+16,30,30),"","\u{e711}",Action::CloseDeviceMenu,false);
+        let active=ui.spotify_devices.iter().find(|d|d["is_active"]==true);
+        let card=Rect::new(x,rect.y+66,inner,134);s.device_active_card=Some(card);
+        s.panel(card.x,card.y,card.w,card.h,41);
+        s.label_sized(x+18,card.y+20,28,30,"\u{e7f4}",43);
+        let name=active.and_then(|d|d["name"].as_str()).unwrap_or("No active device");
+        s.label_sized(x+58,card.y+20,inner-70,30,name,40);
+        for (line,text) in wrap_text(ui.t("Listen together from anywhere"),(inner-156).max(60),13).into_iter().take(2).enumerate() {
+            s.label_sized(x+16,card.y+76+line as i32*20,(inner-156).max(60),20,text,1);
+        }
+        s.button(Rect::new(x+inner-132,card.y+82,116,34),"Start a Jam","",Action::SpotifyJamStart,false);
+        if let Some(b)=s.buttons.last_mut() {b.enabled=!ui.spotify_jam_busy;}
+        let viewport=Rect::new(x,card.y+170,inner,(rect.h-310).max(1));s.queue_viewport=Some(viewport);
+        let others:Vec<_>=ui.spotify_devices.iter().filter(|d|d["is_active"]!=true).collect();
+        let maximum=(others.len() as i32*64-viewport.h).max(0);let offset=ui.device_sidebar_scroll.clamp(0,(maximum+23)/24)*24;
+        for (index,device) in others.into_iter().enumerate() {
+            let y=viewport.y+index as i32*64-offset;
+            if y<viewport.y || y+52>viewport.y+viewport.h {continue;}
+            let id=device["id"].as_str().unwrap_or_default();
+            s.button(Rect::new(x,y,inner,52),"","",Action::SpotifyTransferPlayback(id.into()),false);
+            if let Some(b)=s.buttons.last_mut() {b.enabled=!ui.spotify_devices_busy && device["is_restricted"]!=true && !id.is_empty();b.accessible=device["name"].as_str().unwrap_or("Spotify device").into();}
+            s.label_sized(x+4,y,30,52,"\u{e7f4}",44);
+            s.label_sized(x+46,y,inner-50,52,device["name"].as_str().unwrap_or("Spotify device"),22);
+        }
+        s.label_sized(x,rect.y+rect.h-52,inner-40,30,if ui.spotify_devices_busy {"Looking for devices?"} else {"Don't see your device?"},0);
+        s.button(Rect::new(x+inner-34,rect.y+rect.h-52,32,30),"","\u{e72c}",Action::SpotifyDevicesRefresh,false);
+        if let Some(button)=s.buttons.last_mut() {button.enabled=!ui.spotify_devices_busy;button.accessible="Refresh devices".into();}
+
+        s.device_sidebar_buttons=first_button..s.buttons.len();return;
+    }
+    s.label_sized(x, rect.y + 16, inner - 72, 28, "Spotify Connect", 0);
         s.button(
             Rect::new(x + inner - 66, rect.y + 14, 30, 30),
             "",
@@ -7907,8 +8157,8 @@ mod device_menu_scene_tests {
         };
         ui.set_language("tr");
         let scene = build(&ui, (1180, 900), true, false, "Song", true, 50);
-        assert!(scene.labels.iter().any(|l| l.text == "Şu cihazda çalıyor"));
-        assert!(scene.labels.iter().any(|l| l.text == "✓ Etkin cihaz"));
+        assert!(scene.labels.iter().any(|l|l.text=="DeezNats" && l.kind==40));
+        assert!(scene.labels.iter().any(|l|l.kind==43));
         assert!(scene.buttons.iter().any(|b| b.text == "Jam başlat"));
     }
     #[test]
@@ -7942,6 +8192,12 @@ mod device_menu_scene_tests {
                             && rect.y + rect.h <= height
                     );
                     assert!(scene.device_popover_anchor.is_none());
+                    if provider==crate::catalog::Provider::Spotify {
+                        assert!(scene.labels[first_label..].iter().any(|label|label.text=="Connect"));
+                        assert!(scene.buttons[scene.device_sidebar_buttons.clone()].iter().all(|button|button.rect.x>=rect.x && button.rect.x+button.rect.w<=rect.x+rect.w && button.rect.y>=rect.y && button.rect.y+button.rect.h<=rect.y+rect.h));
+                        continue;
+                    }
+
                     assert!(scene.labels[first_label..]
                         .iter()
                         .any(|label| label.text == "DeezNats Connect"));
@@ -7994,6 +8250,87 @@ mod device_menu_scene_tests {
             .buttons
             .iter()
             .any(|b| matches!(b.action, Action::SpotifyTransferPlayback(_))));
+    }
+}
+
+fn friend_target(uri: &str, title: &str, subtitle: &str) -> Option<crate::catalog::Entry> {
+    let parts: Vec<_> = uri.split(':').collect();
+    if parts.first().copied() != Some("spotify") { return None; }
+    let kind = if parts.contains(&"playlist") { "playlist" } else { *parts.get(1)? };
+    if !matches!(kind, "track" | "album" | "playlist") { return None; }
+    let id = *parts.last()?;
+    if id.len() != 22 || !id.bytes().all(|b| b.is_ascii_alphanumeric()) { return None; }
+    Some(crate::catalog::Entry { id: format!("spotify:{kind}:{id}"), kind: kind.into(),
+        title: title.into(), subtitle: subtitle.into(), raw: serde_json::json!({"friend_activity":true}), ..Default::default() })
+}
+
+fn build_friends_sidebar(s: &mut Scene, ui: &Ui, x: i32, width: i32, h: i32) {
+    let bottom = h - if ui.view == View::Lyrics { 12 } else { 96 };
+    s.panel(x, 10, width, bottom - 20, 0);
+    s.queue_frame = Some(Rect::new(x, 10, width, bottom - 20));
+    s.label_sized(x + 16, 26, width - 96, 30, "Friend activity", 0);
+    s.button(Rect::new(x + width - 76, 26, 28, 28), "", "\u{e72c}", Action::SpotifyFriendsRefresh, false);
+    s.button(Rect::new(x + width - 42, 26, 28, 28), "", "\u{e711}", Action::ToggleFriendsSidebar, false);
+    let mut y = 70;
+    for line in wrap_text(&ui.spotify_social_status, width - 32, 13).into_iter().take(3) {
+        s.label_sized(x + 16, y, width - 32, 22, line, 1); y += 22;
+    }
+    if let Some(social) = &ui.spotify_social {
+        if social.friends.is_empty() && !ui.spotify_social_busy { s.label_sized(x + 16, y + 12, width - 32, 28, "No friend activity available", 1); }
+        let viewport = Rect::new(x + 8, y, width - 16, (bottom - 20 - y).max(1));
+        s.queue_viewport = Some(viewport);
+        let total = social.friends.len() as i32 * 90;
+        let maximum = (total - viewport.h).max(0);
+        let pixels = (ui.queue_scroll as i32 * 24 + ui.queue_scroll_offset as i32).min(maximum);
+        s.queue_scroll_max = ((maximum + 23) / 24) as usize;
+        s.queue_scroll_pixels_max = maximum;
+        s.queue_layout_scroll = pixels;
+        s.queue_pixel_scroll = pixels;
+        let labels = s.labels.len(); let buttons = s.buttons.len();
+        let panels = s.panels.len();
+        y -= pixels;
+
+        for friend in &social.friends {
+            if y + 90 < viewport.y - 160 { y += 90; continue; }
+            if y > viewport.y + viewport.h + 160 { break; }
+            s.pictures.push((Rect::new(x + 14, y + 10, 44, 44), friend.avatar.clone()));
+            let text_x = x + 72;
+            let text_w = (width - 88).max(1);
+            s.label_sized(text_x, y + 6, (text_w - 54).max(1), 24, &friend.name, 48);
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+            let timestamp = if friend.timestamp > 10_000_000_000 { friend.timestamp / 1000 } else { friend.timestamp };
+            if timestamp > 0 {
+                let elapsed = now.saturating_sub(timestamp);
+                let age = if elapsed < 60 { "Now".to_owned() }
+                    else if elapsed < 3600 { format!("{}m", elapsed / 60) }
+                    else if elapsed < 86400 { format!("{}h", elapsed / 3600) }
+                    else { format!("{}d", elapsed / 86400) };
+                s.label_sized(x + width - 64, y + 6, 48, 24, age, 22);
+            }
+            let song = if friend.artist.is_empty() { friend.track.clone() }
+                else { format!("{} \u{2022} {}", friend.track, friend.artist) };
+            if let Some(target) = friend_target(&friend.uri, &friend.track, &friend.artist) {
+                s.link(Rect::new(text_x, y + 30, text_w, 22), song, target, false);
+                if let Some(button) = s.buttons.last_mut() { button.identity = Some(format!("friend-track:{}:{}", friend.name, friend.uri)); }
+            } else { s.label_sized(text_x, y + 30, text_w, 22, song, 1); }
+            if !friend.context.is_empty() {
+                s.label_sized(text_x, y + 52, 24, 22, "\u{e8d6}", 50);
+                if let Some(target) = friend_target(&friend.context_uri, &friend.context, "") {
+                    s.link(Rect::new(text_x + 28, y + 52, (text_w - 28).max(1), 22), &friend.context, target, false);
+                    if let Some(button) = s.buttons.last_mut() { button.identity = Some(format!("friend-context:{}:{}", friend.name, friend.context_uri)); }
+                } else { s.label_sized(text_x + 28, y + 52, (text_w - 28).max(1), 22, &friend.context, 1); }
+            }
+            y += 90;
+        }
+        s.queue_row_labels = labels..s.labels.len();
+        s.queue_row_buttons = buttons..s.buttons.len();
+        s.queue_row_panels = panels..s.panels.len();
+        if maximum > 0 {
+            let track = Rect::new(x + width - 8, viewport.y, 4, viewport.h);
+            s.queue_scrollbar = Some(track);
+            let thumb = (track.h * track.h / total.max(1)).max(24).min(track.h);
+            s.panel(track.x, track.y + pixels * (track.h - thumb) / maximum, 4, thumb, 17);
+        }
     }
 }
 
@@ -8054,7 +8391,14 @@ fn player_extras(s: &mut Scene, ui: &Ui, right: i32, y: i32, volume: u32, narrow
     ));
 }
 fn build_player(s: &mut Scene, ui: &Ui, w: i32, h: i32, title: &str, playing: bool, volume: u32) {
-    let height = player_height(ui, w);
+    let remote=spotify_remote_name(ui);
+    if let Some(name)=remote {
+        s.panel(8,h-26,w-16,24,42);
+        s.label_sized(24,h-25,w-48,24,format!("Playing on {name}"),45);
+    }
+    let extra=if remote.is_some() {26} else {0};
+    let h=h-extra;
+    let height = player_height(ui, w)-extra;
     let top = h - height;
     let right = w - 8;
     s.panel(0, top, w, height, 21);
@@ -10002,7 +10346,7 @@ mod tests {
             assert!(scene
                 .pictures
                 .iter()
-                .any(|(r, url)| url == "queue-cover" && r.w == 44 && r.h == 44));
+                .any(|(r, url)| url == "queue-cover" && r.w == 52 && r.h == 52));
             let mut seen = String::new();
             for offset in 0..=scene.queue_scroll_max {
                 ui.queue_scroll = offset;
@@ -10026,8 +10370,9 @@ mod tests {
                     }
                 }
             }
-            assert!(seen.contains("Added by"));
-            assert!(seen.contains("日本語"));
+            assert!(!seen.contains("Added by"));
+            assert!(!seen.contains("日本語"));
+            assert!(seen.contains("An artist"));
             ui.queue_scroll = 0;
         }
     }
@@ -10874,7 +11219,7 @@ mod tests {
             queue_sidebar_open: true,
             ..Default::default()
         };
-        ui.fit_sidebars(1200);
+        ui.fit_sidebars(1400);
         assert!(!ui.sidebar_collapsed && ui.queue_sidebar_open);
         ui.fit_sidebars(1080);
         assert!(ui.sidebar_collapsed && ui.queue_sidebar_open);
@@ -11608,11 +11953,8 @@ mod tests {
         assert!(scene
             .buttons
             .iter()
-            .any(|b| matches!(b.action, Action::QueueReset)));
-        assert!(scene
-            .buttons
-            .iter()
-            .any(|b| matches!(b.action, Action::QueueClear)));
+            .any(|b| matches!(b.action, Action::QueueRecent(true))));
+        assert!(!scene.buttons.iter().any(|b|matches!(b.action,Action::QueueClear)));
         assert!(scene
             .buttons
             .iter()
@@ -11666,23 +12008,16 @@ mod tests {
     }
     #[test]
     fn queue_header_reserves_space_for_actions_at_narrow_widths() {
-        let ui = Ui::default();
-        for width in [160, 200, 240, 280, 360] {
-            let mut scene = Scene::default();
-            build_queue_sidebar(&mut scene, &ui, 10, width, 800);
-            let title = scene.labels.iter().find(|l| l.text == "QUEUE").unwrap();
-            let actions: Vec<_> = scene
-                .buttons
-                .iter()
-                .filter(|b| matches!(b.action, Action::QueueReset | Action::QueueClear))
-                .collect();
-            assert_eq!(actions.len(), 2);
-            assert!(title.rect.x + title.rect.w + 8 <= actions[0].rect.x);
-            assert!(actions[0].rect.x + actions[0].rect.w < actions[1].rect.x);
-            assert!(actions[1].rect.x + actions[1].rect.w <= 10 + width - 12);
-            assert!(actions
-                .iter()
-                .all(|b| b.text.is_empty() && !b.accessible.is_empty()));
+        let ui=Ui::default();
+        for width in [160,200,240,280,360] {
+            let mut scene=Scene::default();build_queue_sidebar(&mut scene,&ui,10,width,800);
+            let tabs:Vec<_>=scene.buttons.iter().filter(|b|matches!(b.action,Action::QueueRecent(_))).collect();
+            let close=scene.buttons.iter().find(|b|b.accessible=="Close queue").unwrap();
+            assert_eq!(tabs.len(),2);
+            assert!(tabs[0].rect.x+tabs[0].rect.w<=tabs[1].rect.x);
+            assert!(tabs[1].rect.x+tabs[1].rect.w<close.rect.x);
+            assert!(close.rect.x+close.rect.w<=10+width);
+            assert!(tabs.iter().all(|b|!b.accessible.is_empty()));
         }
     }
     #[test]
@@ -11793,7 +12128,7 @@ mod tests {
             .iter()
             .find(|b| matches!(b.action, Action::QueueJump(20)))
             .unwrap();
-        assert_eq!(current.rect.y, viewport.y + viewport.h / 4);
+        assert_eq!(current.rect.y, viewport.y + 34);
     }
     #[test]
     fn queue_labels_are_identical_on_regular_and_lyrics_pages() {
@@ -11854,7 +12189,7 @@ mod tests {
         ui.now = ui.queue[0].clone();
 
         let scene = build(&ui, (1200, 800), true, false, "Song 1", true, 80);
-        assert!(scene.labels.iter().any(|l| l.text == "QUEUE"));
+        assert!(scene.labels.iter().any(|l| l.text == "Queue"));
         assert!(!scene.labels.iter().any(|l| l.text == "HISTORY"));
         assert!(scene
             .buttons
@@ -11874,13 +12209,10 @@ mod tests {
         ui.now = ui.queue[1].clone();
         let scene2 = build(&ui, (1200, 800), true, false, "Song 2", true, 80);
         assert!(!scene2.labels.iter().any(|l| l.text == "HISTORY"));
-        assert!(scene2
-            .buttons
-            .iter()
-            .any(|b| matches!(b.action, Action::QueueJump(0))));
+        assert!(!scene2.buttons.iter().any(|b|matches!(b.action,Action::QueueJump(0))));
         assert_eq!(ui.queue[0].id, "t1");
         assert_eq!(ui.queue_index, 1);
-        assert!(scene2.labels.iter().any(|l| l.text == "QUEUE"));
+        assert!(scene2.labels.iter().any(|l| l.text == "Queue"));
     }
     #[test]
     fn artist_page_and_custom_colors_views() {
@@ -12828,14 +13160,14 @@ mod tests {
         // 3. Queue sidebar panel does not overlap with main content panel
         ui.queue_sidebar_open = true;
         let scene_q = build(&ui, (1200, 800), true, false, "", false, 50);
-        let q_header = scene_q.labels.iter().find(|l| l.text == "QUEUE").unwrap();
+        let q_header = scene_q.labels.iter().find(|l| l.text == "Queue").unwrap();
         assert_eq!(q_header.kind, 0);
         let q_icon = scene_q
             .buttons
             .iter()
             .find(|b| b.accessible == "Close queue")
             .unwrap();
-        assert_eq!(q_icon.glyph, "\u{e8fd}");
+        assert_eq!(q_icon.glyph, "\u{e711}");
         assert!(matches!(q_icon.action, Action::ToggleQueueSidebar));
 
         // Check panel boundaries
@@ -13186,7 +13518,7 @@ mod tests {
             let popup = scene.volume_popup.unwrap();
             let volume = scene.volume.unwrap();
             let seek = scene.seek.unwrap();
-            let queue = scene.labels.iter().find(|l| l.text == "QUEUE").unwrap();
+            let queue = scene.labels.iter().find(|l| l.text == "Queue").unwrap();
             assert!(area.x + area.w < queue.rect.x);
             assert!(cover.x + cover.w < area.x);
             assert!(popup.y >= cover.y && popup.y + popup.h < seek.y);
@@ -13823,7 +14155,7 @@ mod tests {
                     assert!(scene
                         .buttons
                         .iter()
-                        .any(|button| matches!(button.action, Action::Go(View::Account))));
+                        .any(|button| matches!(button.action, Action::DeezerLogin)));
                     assert!(scene.session.is_none());
                 }
             }
@@ -13959,6 +14291,9 @@ mod spotify_scene_tests {
             .buttons
             .iter()
             .any(|button| matches!(button.action, Action::ConnectSaved)));
+        let logout = scene.buttons.iter().find(|button| matches!(button.action, Action::Logout)).unwrap();
+        assert_eq!(logout.glyph, "\u{f3b1}");
+        assert!(logout.text.is_empty());
     }
 
     #[test]
@@ -21801,5 +22136,116 @@ pub(crate) mod visualizer {
                 assert!(p.1 <= 784.0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod friend_sidebar_tests {
+    use super::*;
+
+    #[test]
+    fn lyrics_and_settings_navigation_close_friends() {
+        for view in [View::Lyrics, View::Settings] {
+            let mut ui = Ui::default();
+            ui.friends_sidebar_open = true;
+            ui.go(view);
+            assert!(!ui.friends_sidebar_open);
+            ui.go(View::Home);
+            ui.friends_sidebar_open = true;
+            ui.back();
+            assert!(!ui.friends_sidebar_open);
+        }
+    }
+    #[test]
+    fn friends_sidebar_cannot_open_on_lyrics_page() {
+        let mut ui = Ui::default();
+        ui.friends_sidebar_open = true;
+        ui.go(View::Lyrics);
+        ui.toggle_friends_sidebar();
+        assert!(!ui.friends_sidebar_open);
+        ui.back();
+        ui.toggle_friends_sidebar();
+        assert!(ui.friends_sidebar_open);
+    }
+    #[test]
+    fn right_sidebars_are_mutually_exclusive() {
+        let mut ui = Ui::default();
+        ui.queue_sidebar_open = true;
+        ui.toggle_friends_sidebar();
+        assert!(ui.friends_sidebar_open && !ui.queue_sidebar_open && !ui.device_menu_open);
+        ui.toggle_device_sidebar();
+        assert!(ui.device_menu_open && !ui.friends_sidebar_open);
+        ui.toggle_friends_sidebar();
+        ui.toggle_queue_sidebar();
+        assert!(ui.queue_sidebar_open && !ui.friends_sidebar_open);
+        ui.toggle_friends_sidebar();
+        ui.toggle_friends_sidebar();
+        assert!(!ui.right_sidebar_open());
+    }
+    #[test]
+    fn friend_canvas_scrolling_preserves_main_nodes_and_click_targets() {
+        let mut ui = Ui { provider: crate::catalog::Provider::Spotify, friends_sidebar_open: true, ..Default::default() };
+        ui.spotify_social = Some(crate::spotify::social::Snapshot {
+            friends: (0..50).map(|i| crate::spotify::social::Friend {
+                name: format!("Friend {i}"), track: format!("Song {i}"),
+                uri: format!("spotify:track:{i:022}"), context: format!("Collection {i}"),
+                context_uri: format!("spotify:{}:{i:022}", if i%2==0 { "album" } else { "playlist" }),
+                ..Default::default()
+            }).collect(), ..Default::default()
+        });
+        let mut scene = Scene::default();
+        scene.label_sized(20, 100, 200, 24, "Main page", 0);
+        scene.content_labels = 0..1;
+        build_queue_sidebar(&mut scene, &ui, 800, 400, 900);
+        assert!(scene.device_sidebar.is_none());
+        assert!(scene.queue_scrollbar.is_some());
+        let main = scene.labels[0].text.as_ptr();
+        let name = scene.labels.iter().find(|l| l.text == "Friend 0").unwrap().rect;
+        ui.queue_scroll_offset = 13;
+        assert!(refresh_queue_sidebar(&mut scene, &ui, 900));
+        assert_eq!(scene.labels[0].text.as_ptr(), main);
+        assert_eq!(scene.labels.iter().find(|l|l.text=="Friend 0").unwrap().rect.y, name.y-13);
+        let targets: Vec<_> = scene.buttons[scene.queue_row_buttons.clone()].iter().filter_map(|b| {
+            if let Action::OpenItem(item) = &b.action { assert!(b.text_link); Some(item.kind.as_str()) } else { None }
+        }).collect();
+        assert!(targets.contains(&"track") && targets.contains(&"album") && targets.contains(&"playlist"));
+        ui.queue_scroll = 80; ui.queue_scroll_offset = 7;
+        assert!(refresh_queue_sidebar(&mut scene, &ui, 900));
+        assert_eq!(scene.labels[0].text.as_ptr(), main);
+        assert_eq!(scene.queue_pixel_scroll, 1927);
+        let mut fresh = Scene::default();
+        build_queue_sidebar(&mut fresh, &ui, 800, 400, 900);
+        assert_eq!(scene.labels[scene.queue_labels.clone()].iter().map(|l|(&l.text,l.rect)).collect::<Vec<_>>(), fresh.labels.iter().map(|l|(&l.text,l.rect)).collect::<Vec<_>>());
+        assert!(friend_target("https://example.com", "", "").is_none());
+        assert_eq!(friend_target("spotify:user:owner:playlist:0000000000000000000001", "List", "").unwrap().id, "spotify:playlist:0000000000000000000001");
+    }
+
+    #[test]
+    fn friends_activity_shows_tracks_without_unavailable_privacy_control() {
+        let mut ui = Ui { provider: crate::catalog::Provider::Spotify, friends_sidebar_open: true, ..Default::default() };
+        let mut scene = Scene::default();
+        build_friends_sidebar(&mut scene, &ui, 800, 400, 900);
+        assert!(!scene.buttons.iter().any(|b| matches!(b.action, Action::SpotifySharing(_))));
+        assert!(scene.buttons.iter().any(|b| matches!(b.action, Action::SpotifyFriendsRefresh)));
+        ui.spotify_social = Some(crate::spotify::social::Snapshot {
+            friends: (0..30).map(|i| crate::spotify::social::Friend {
+                name: format!("Friend {i}"), track: format!("Song {i}"),
+                artist: "Artist".into(), uri: String::new(), ..Default::default()
+            }).collect(), sharing: None,
+        });
+        let mut scene = Scene::default();
+        build_friends_sidebar(&mut scene, &ui, 800, 400, 900);
+        assert!(scene.labels.iter().any(|l| l.text == "Song 0 \u{2022} Artist"));
+        let name = scene.labels.iter().find(|l| l.text == "Friend 0").unwrap();
+        assert_eq!(name.kind, 48);
+        assert!(name.rect.h >= 20);
+        assert!(scene.queue_scroll_pixels_max > 0);
+        ui.queue_scroll = scene.queue_scroll_max;
+        ui.queue_scroll_offset = 23;
+        let mut scene = Scene::default();
+        build_friends_sidebar(&mut scene, &ui, 800, 400, 900);
+        assert!(scene.labels.iter().any(|l| l.text == "Song 29 \u{2022} Artist"));
+        ui.fit_sidebars(600);
+        assert!(!ui.friends_sidebar_open);
     }
 }

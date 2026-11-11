@@ -1194,6 +1194,7 @@ mod catalog {
     }
 
     pub(crate) fn invoke(name: &str, args: &[Value]) -> Result<Value, String> {
+        let _request_log = crate::spotify_diagnostics::Span::new("youtube.api", name);
         if name.ends_with("StyleMixGenres") || name == "StyleMixGenres" {
             let region = args
                 .first()
@@ -1972,6 +1973,7 @@ mod playback {
                     if !q.iter().any(|t| t.id == e.id) {
                         q.insert(0, (**e).clone());
                     }
+                    crate::audio::mark_queue_fallback(&mut q);
                     snapshot.queue_index = q.iter().position(|t| t.id == e.id).unwrap_or(0);
                     if snapshot.shuffle {
                         self.shuffle.prepare(&mut q, snapshot.queue_index);
@@ -2043,20 +2045,17 @@ mod playback {
                 }
                 Command::Autoplay(v) => snapshot.autoplay = *v,
                 Command::QueueClear => {
-                    self.stop();
-                    self.radio = None;
-                    self.last_seed.clear();
-                    snapshot.queue = Default::default();
-                    snapshot.queue_index = 0;
-                    snapshot.state = "Stopped".into();
+                    if snapshot.queue.is_empty() {self.radio=None;}
+                    snapshot.queue=crate::audio::clear_manual_upcoming(&snapshot.queue,snapshot.queue_index).into();
+                    snapshot.message="Manually queued tracks cleared; source playback continues".into();
                 }
                 Command::QueueInsertNext(t) => {
-                    let index = (snapshot.queue_index + 1).min(snapshot.queue.len());
-                    ArcQueue::insert(snapshot, index, (**t).clone());
+                    let index=(snapshot.queue_index+1).min(snapshot.queue.len());
+                    ArcQueue::insert(snapshot,index,crate::audio::explicit_queue_entry((**t).clone()));
                 }
                 Command::QueueAddLast(t) => {
-                    let index = snapshot.queue.len();
-                    ArcQueue::insert(snapshot, index, (**t).clone());
+                    let index=crate::audio::queue_add_position(&snapshot.queue,snapshot.queue_index);
+                    ArcQueue::insert(snapshot,index,crate::audio::explicit_queue_entry((**t).clone()));
                 }
                 Command::QueueMove { from, to, expected } => {
                     match crate::audio::reordered_queue(
@@ -2439,6 +2438,21 @@ mod playback {
             assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
             assert!(player.auth.is_none());
             assert!(player.pending.is_none());
+        }
+        #[test]
+        fn manual_queue_is_fifo_before_context_and_clear_keeps_playback() {
+            let mut player=Player::default();
+            let (tx,rx)=mpsc::channel();player.radio=Some(rx);
+            let mut snapshot=Snapshot {state:"Playing".into(),position:1234,radio_active:true,..Default::default()};
+            let entries:Vec<_>=["current","context"].into_iter().map(|id|Entry {id:id.into(),..Default::default()}).collect();
+            snapshot.now=entries[0].clone();snapshot.queue=entries.into();
+            for id in ["manual1","manual2"] {player.handle(&Command::QueueAddLast(Box::new(Entry {id:id.into(),..Default::default()})),&mut snapshot);}
+            assert_eq!(snapshot.queue.iter().map(|e|e.id.as_str()).collect::<Vec<_>>(),vec!["current","manual1","manual2","context"]);
+            player.handle(&Command::QueueClear,&mut snapshot);
+            assert_eq!(snapshot.queue.iter().map(|e|e.id.as_str()).collect::<Vec<_>>(),vec!["current","context"]);
+            assert_eq!(snapshot.state,"Playing");assert_eq!(snapshot.position,1234);
+            assert!(snapshot.radio_active);assert!(player.radio.is_some());
+            assert!(tx.send(Ok(Vec::new())).is_ok());
         }
         #[test]
         fn cleared_queue_does_not_receive_old_radio_results() {

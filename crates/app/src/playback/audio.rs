@@ -1127,6 +1127,7 @@ use std::{
 };
 #[derive(Clone)]
 pub enum Command {
+    Selection(u64, Box<Command>),
     SwitchProvider(crate::catalog::Provider),
     Login(String),
     LoginSaved,
@@ -1142,6 +1143,7 @@ pub enum Command {
     },
     QueueInsertNext(Box<crate::catalog::Entry>),
     QueueAddLast(Box<crate::catalog::Entry>),
+    QueueAddMany(Vec<crate::catalog::Entry>),
     Next,
     Previous,
     Shuffle(bool),
@@ -1156,6 +1158,86 @@ pub enum Command {
     SeekMs(u64),
     Volume(u32),
     Quit,
+}
+impl Command {
+    pub(crate) fn log_name(&self) -> &'static str {
+        match self {
+            Self::Selection(_, command) => command.log_name(),
+            Self::SwitchProvider(..) => "SwitchProvider",
+            Self::Login(..) => "Login",
+            Self::LoginSaved => "LoginSaved",
+            Self::Logout => "Logout",
+            Self::Play(..) => "Play",
+            Self::PlayEntry(..) => "PlayEntry",
+            Self::PlayQueueIndex(..) => "PlayQueueIndex",
+            Self::QueueClear => "QueueClear",
+            Self::QueueMove { .. } => "QueueMove",
+            Self::QueueInsertNext(..) => "QueueInsertNext",
+            Self::QueueAddLast(..) => "QueueAddLast",
+            Self::QueueAddMany(..) => "QueueAddMany",
+            Self::Next => "Next",
+            Self::Previous => "Previous",
+            Self::Shuffle(..) => "Shuffle",
+            Self::Repeat(..) => "Repeat",
+            Self::Autoplay(..) => "Autoplay",
+            Self::Api(..) => "Api",
+            Self::Discord(..) => "Discord",
+            Self::Toggle => "Toggle",
+            Self::SetPlaying(..) => "SetPlaying",
+            Self::Stop => "Stop",
+            Self::Seek(..) => "Seek",
+            Self::SeekMs(..) => "SeekMs",
+            Self::Volume(..) => "Volume",
+            Self::Quit => "Quit",
+        }
+    }
+}
+
+fn is_song_selection(command: &Command) -> bool {
+    match command { Command::Selection(_, inner) => is_song_selection(inner),
+        Command::Play(_) | Command::PlayEntry(..) | Command::PlayQueueIndex(_) => true, _ => false }
+}
+fn is_command_boundary(command: &Command) -> bool {
+    match command { Command::Selection(_, inner) => is_command_boundary(inner),
+        Command::SwitchProvider(_) | Command::Logout | Command::Quit => true, _ => false }
+}
+fn supersede_spotify_commands(pending: &mut std::collections::VecDeque<Command>) {
+    if pending.iter().any(is_command_boundary) { return; }
+                    if let Some(latest) = pending.iter().rposition(is_song_selection) {
+                        let mut position = 0;
+                        pending.retain(|cmd| {
+                            let stale = position < latest && (is_song_selection(cmd) || matches!(cmd, Command::QueueAddLast(_) | Command::QueueInsertNext(_)));
+                            position += 1;
+                            !stale
+                        });
+                    }
+}
+#[cfg(test)]
+#[test]
+fn newest_spotify_song_supersedes_backlogged_edits() {
+    let mut commands = std::collections::VecDeque::from(vec![Command::Play("old".into()), Command::QueueAddLast(Box::default()), Command::Volume(50), Command::Play("new".into())]);
+    supersede_spotify_commands(&mut commands);
+    assert_eq!(commands.len(), 2);
+    assert!(matches!(commands.pop_front(), Some(Command::Volume(50))));
+    assert!(matches!(commands.pop_front(), Some(Command::Play(uri)) if uri == "new"));
+    let mut boundary = std::collections::VecDeque::from(vec![Command::Logout, Command::Play("new".into())]);
+    supersede_spotify_commands(&mut boundary);
+    assert!(matches!(boundary.front(), Some(Command::Logout)));
+}
+#[cfg(test)]
+#[test]
+fn selection_epoch_travels_with_the_enqueued_request() {
+    let (commands, received) = mpsc::sync_channel(4);
+    let (_, updates) = mpsc::sync_channel(1);
+    let epoch = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let worker = Worker { commands, updates, selection_epoch: epoch.clone() };
+    assert!(worker.submit(Command::Play("first".into())).is_ok());
+    assert!(worker.submit(Command::Play("second".into())).is_ok());
+    assert_eq!(epoch.load(std::sync::atomic::Ordering::SeqCst), 3);
+    let mut pending = std::collections::VecDeque::from(vec![received.recv().unwrap(), received.recv().unwrap()]);
+    supersede_spotify_commands(&mut pending);
+    assert_eq!(pending.len(), 1);
+    assert!(matches!(pending.pop_front(), Some(Command::Selection(3, command)) if matches!(*command, Command::Play(ref uri) if uri=="second")));
 }
 #[derive(Clone, Default)]
 pub struct Snapshot {
@@ -1185,30 +1267,67 @@ pub struct Snapshot {
 }
 // Collection tracks are the fallback after explicitly queued items.
 pub(crate) const QUEUE_FALLBACK: &str = "_queue_fallback";
+pub(crate) const QUEUE_MANUAL: &str = "_queue_manual";
 pub(crate) fn mark_queue_fallback(items: &mut [crate::catalog::Entry]) {
     for item in items {
         if !item.raw.is_object() {
             item.raw = serde_json::json!({});
         }
         item.raw[QUEUE_FALLBACK] = serde_json::json!(true);
+        item.raw[QUEUE_MANUAL] = serde_json::json!(false);
     }
 }
 pub(crate) fn queue_add_position(items: &[crate::catalog::Entry], index: usize) -> usize {
     let start = index.saturating_add(1).min(items.len());
     items[start..]
         .iter()
-        .position(|item| item.raw[QUEUE_FALLBACK] == true)
+        .position(|item| !is_manual_queue_entry(item))
         .map_or(items.len(), |offset| start + offset)
 }
 pub(crate) fn explicit_queue_entry(mut item: crate::catalog::Entry) -> crate::catalog::Entry {
     if let Some(raw) = item.raw.as_object_mut() {
         raw.remove(QUEUE_FALLBACK);
     }
+    if !item.raw.is_object() { item.raw=serde_json::json!({}); }
+    item.raw[QUEUE_MANUAL]=serde_json::json!(true);
     item
+}
+pub(crate) fn is_manual_queue_entry(item: &crate::catalog::Entry) -> bool {
+    item.raw[QUEUE_MANUAL].as_bool().unwrap_or_else(|| item.raw["spotify_manual_queue"]==true)
+}
+#[cfg(test)]
+#[test]
+fn source_classification_survives_native_queue_flags_and_clear() {
+    let mut source=crate::catalog::Entry {id:"source".into(),raw:serde_json::json!({"spotify_manual_queue":true}),..Default::default()};
+    mark_queue_fallback(std::slice::from_mut(&mut source));
+    assert!(!is_manual_queue_entry(&source));
+    let manual=explicit_queue_entry(source.clone());
+    assert!(is_manual_queue_entry(&manual));
+    let queue=vec![source.clone(),manual,source.clone()];
+    assert_eq!(clear_manual_upcoming(&queue,0),vec![source.clone(),source]);
+}
+
+pub(crate) fn clear_manual_upcoming(items: &[crate::catalog::Entry], index: usize) -> Vec<crate::catalog::Entry> {
+    items.iter().enumerate().filter(|(i,item)| *i<=index || !is_manual_queue_entry(item)).map(|(_,item)|item.clone()).collect()
 }
 #[cfg(test)]
 mod queue_priority_tests {
     use super::*;
+    #[test]
+    fn clear_removes_only_manual_upcoming_occurrences_for_all_providers() {
+        for prefix in ["", "spotify:track:", "youtube:track:"] {
+            let current=crate::catalog::Entry {id:format!("{prefix}same"),..Default::default()};
+            let manual=explicit_queue_entry(current.clone());
+            let context=crate::catalog::Entry {id:format!("{prefix}context"),..Default::default()};
+            let queue=vec![current.clone(),manual.clone(),context.clone(),manual];
+            let remaining=clear_manual_upcoming(&queue,0);
+            assert_eq!(remaining.len(),2);
+            assert_eq!(remaining[0].id,current.id);
+            assert_eq!(remaining[1].id,context.id);
+            assert_eq!(queue_add_position(&remaining,0),1);
+        }
+    }
+
     #[test]
     fn queued_tracks_keep_order_before_collection_fallback() {
         let entry = |id: &str| crate::catalog::Entry {
@@ -1228,13 +1347,14 @@ mod queue_priority_tests {
         );
         assert_eq!(queue_add_position(&queue, 1), 3);
         assert_eq!(
-            queue_add_position(&[entry("current"), entry("queued")], 0),
+            queue_add_position(&[entry("current"), explicit_queue_entry(entry("queued"))], 0),
             2
         );
     }
 }
 
 pub struct Worker {
+    selection_epoch: Arc<std::sync::atomic::AtomicU64>,
     pub commands: mpsc::SyncSender<Command>,
     pub updates: mpsc::Receiver<Snapshot>,
 }
@@ -1271,6 +1391,8 @@ fn adopt_queue(snapshot: &mut Snapshot, value: &serde_json::Value) -> Result<i64
             if let Some(fallback) = old.raw.get(QUEUE_FALLBACK) {
                 entry.raw[QUEUE_FALLBACK] = fallback.clone();
             }
+            for key in [QUEUE_MANUAL,"queue_context_name"] { if let Some(value)=old.raw.get(key) {entry.raw[key]=value.clone();} }
+
             if let Some(selection) = old.raw.get(crate::style_mix::MARKER) {
                 entry.raw[crate::style_mix::MARKER] = selection.clone();
             }
@@ -1325,6 +1447,11 @@ impl PreparedShuffle {
     pub(crate) fn prepare(&mut self, tracks: &mut [crate::catalog::Entry], current: usize) {
         self.original = tracks.to_vec();
         let start = current.saturating_add(1).min(tracks.len());
+        let mut upcoming:Vec<_>=tracks[start..].iter().filter(|entry|is_manual_queue_entry(entry)).cloned().collect();
+        let manual_count=upcoming.len();
+        upcoming.extend(tracks[start..].iter().filter(|entry|!is_manual_queue_entry(entry)).cloned());
+        tracks[start..].clone_from_slice(&upcoming);
+        let start=start+manual_count;
         let mut random = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1413,7 +1540,7 @@ impl PreparedShuffle {
         for original in self.original.drain(..) {
             if let Some(at) = remaining
                 .iter()
-                .position(|(_, row)| row.id == original.id && row.kind == original.kind)
+                .position(|(_, row)| row.id == original.id && row.kind == original.kind && is_manual_queue_entry(row)==is_manual_queue_entry(&original))
             {
                 let (index, row) = remaining.remove(at);
                 if index == current {
@@ -1434,6 +1561,17 @@ impl PreparedShuffle {
 #[cfg(test)]
 mod prepared_shuffle_tests {
     use super::*;
+    #[test]
+    fn shuffle_preserves_manual_order_and_restore_does_not_recreate_cleared_items() {
+        let mut entries=rows(&["current","manual1","manual2","source1","source2"]);
+        entries[1]=explicit_queue_entry(entries[1].clone());entries[2]=explicit_queue_entry(entries[2].clone());
+        let mut shuffle=PreparedShuffle::default();shuffle.prepare(&mut entries,0);
+        assert_eq!(entries[1].id,"manual1");assert_eq!(entries[2].id,"manual2");
+        entries=clear_manual_upcoming(&entries,0);
+        shuffle.restore(&mut entries,0);
+        assert_eq!(entries.iter().map(|e|e.id.as_str()).collect::<Vec<_>>(),vec!["current","source1","source2"]);
+    }
+
 
     fn rows(ids: &[&str]) -> Vec<crate::catalog::Entry> {
         ids.iter()
@@ -1720,7 +1858,16 @@ mod output_tests {
     }
 }
 impl Worker {
+    pub fn submit(&self, command: Command) -> Result<(), mpsc::TrySendError<Command>> {
+        if matches!(&command, Command::Play(_) | Command::PlayEntry(..) | Command::PlayQueueIndex(_) | Command::SwitchProvider(_) | Command::Stop | Command::Logout | Command::Quit) {
+            let epoch = self.selection_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            return self.commands.try_send(Command::Selection(epoch, Box::new(command)));
+        }
+        self.commands.try_send(command)
+    }
     pub fn start() -> Self {
+        let selection_epoch = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let live_selection = selection_epoch.clone();
         let (commands, rx) = mpsc::sync_channel(32);
         let (tx, updates) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
@@ -1752,20 +1899,36 @@ impl Worker {
                 state: "Stopped".into(),
                 ..Default::default()
             };
-            let mut deferred_command = None;
+            let mut deferred_commands = std::collections::VecDeque::new();
             #[cfg(feature = "diagnostics")]
             let mut playback_started: Option<std::time::Instant> = None;
             loop {
-                let mut command = deferred_command
-                    .take()
+                let mut command = deferred_commands
+                    .pop_front()
                     .map(Ok)
                     .unwrap_or_else(|| rx.recv_timeout(Duration::from_millis(200)));
+                if snapshot.provider == crate::catalog::Provider::Spotify {
+                    let mut pending = std::collections::VecDeque::new();
+                    if let Ok(cmd) = command { pending.push_back(cmd); }
+                    pending.append(&mut deferred_commands);
+                    pending.extend(rx.try_iter());
+                    supersede_spotify_commands(&mut pending);
+                    command = pending.pop_front().map(Ok).unwrap_or(Err(mpsc::RecvTimeoutError::Timeout));
+                    if let Ok(Command::QueueAddLast(entry)) = &command {
+                        let mut entries = vec![(**entry).clone()];
+                        while matches!(pending.front(), Some(Command::QueueAddLast(_))) {
+                            if let Some(Command::QueueAddLast(entry)) = pending.pop_front() { entries.push(*entry); }
+                        }
+                        if entries.len() > 1 { command = Ok(Command::QueueAddMany(entries)); }
+                    }
+                    deferred_commands = pending;
+                }
                 if matches!(command, Ok(Command::Volume(_))) {
                     while let Ok(next) = rx.try_recv() {
                         if matches!(next, Command::Volume(_)) {
                             command = Ok(next);
                         } else {
-                            deferred_command = Some(next);
+                            deferred_commands.push_back(next);
                             break;
                         }
                     }
@@ -1774,6 +1937,13 @@ impl Worker {
                     volume = (*value).min(100);
                     spotify_volume_applied = false;
                 }
+                let mut command_epoch = live_selection.load(std::sync::atomic::Ordering::SeqCst);
+                command = command.map(|cmd| match cmd {
+                    Command::Selection(epoch, command) => { command_epoch = epoch; *command },
+                    command => command,
+                });
+                if let Ok(cmd) = &command { crate::spotify_diagnostics::record("player.command.received", cmd.log_name()); }
+                spotify_queue.bind_generation(live_selection.clone(), command_epoch);
                 while let Ok((epoch, result)) = account_rx.try_recv() {
                     if epoch == account_epoch
                         && snapshot.provider == crate::catalog::Provider::Spotify
@@ -1901,6 +2071,16 @@ impl Worker {
                             .snapshot()
                             .is_some_and(|state| state.connected && state.logged_in)
                     });
+                    if matches!(&command, Ok(Command::PlayEntry(..) | Command::Play(_) | Command::PlayQueueIndex(_) | Command::SetPlaying(true) | Command::Toggle)) {
+                        let readiness = handle.as_ref().map(|h| {
+                            let state = h.snapshot();
+                            format!("phase={:?} connected={} logged_in={} active={}", h.status().phase,
+                                state.as_ref().is_some_and(|s| s.connected),
+                                state.as_ref().is_some_and(|s| s.logged_in),
+                                state.as_ref().is_some_and(|s| s.is_active))
+                        }).unwrap_or_else(|| "no_supervisor".into());
+                        crate::spotify_diagnostics::record("playback.request", &readiness);
+                    }
                     let explicit_remote = crate::spotify::remote::selected_device().is_some();
                     spotify_remote.enable(explicit_remote, account_epoch);
                     if !local_active || explicit_remote {
@@ -2129,7 +2309,6 @@ impl Worker {
                         Ok(Command::Play(_))
                             | Ok(Command::PlayEntry(..))
                             | Ok(Command::PlayQueueIndex(_))
-                            | Ok(Command::QueueClear)
                             | Ok(Command::Login(_))
                             | Ok(Command::Logout)
                     );
@@ -2358,10 +2537,13 @@ impl Worker {
                         }
                         Ok(Command::QueueClear) => {
                             let dz = engine.as_ref().ok_or("Connect to Deezer first")?;
-                            set_queue(dz, &[], 0)?;
+                            sync_queue(dz, &mut snapshot, &mut queue_version)?;
+                            let remaining=clear_manual_upcoming(&snapshot.queue,snapshot.queue_index);
+                            set_queue(dz, &remaining, snapshot.queue_index)?;
+                            snapshot.queue=Arc::new(remaining);
                             queue_version = -1;
                             sync_queue(dz, &mut snapshot, &mut queue_version)?;
-                            snapshot.message = "Queue cleared".into();
+                            snapshot.message = "Manually queued tracks cleared; source playback continues".into();
                         }
                         Ok(Command::QueueInsertNext(item)) | Ok(Command::QueueAddLast(item)) => {
                             let dz = engine.as_ref().ok_or("Connect to Deezer first")?;
@@ -2665,7 +2847,10 @@ impl Worker {
                                 }
                             }
                         }
-                        if snapshot.now.id.is_empty() && snapshot.queue_index < snapshot.queue.len()
+                        if let Some(source) = snapshot.queue.get(snapshot.queue_index).filter(|entry| entry.id == snapshot.now.id) {
+                        if let Some(name) = source.raw.get("queue_context_name") { snapshot.now.raw["queue_context_name"] = name.clone(); }
+                    }
+                    if snapshot.now.id.is_empty() && snapshot.queue_index < snapshot.queue.len()
                         {
                             snapshot.now = snapshot.queue[snapshot.queue_index].clone();
                             snapshot.title = snapshot.now.title.clone();
@@ -2716,7 +2901,7 @@ impl Worker {
                 }
             }
         });
-        Self { commands, updates }
+        Self { selection_epoch, commands, updates }
     }
 }
 #[cfg(test)]
@@ -2747,6 +2932,18 @@ mod reorder_tests {
 mod queue_tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn engine_refresh_preserves_manual_marker_and_source_for_duplicate_items() {
+        let current=crate::catalog::Entry {id:"1".into(),kind:"track".into(),raw:json!({"queue_context_name":"Playlist"}),..Default::default()};
+        let mut manual=explicit_queue_entry(current.clone());manual.raw["added_by"]=json!("Listener");
+        let mut snapshot=Snapshot {queue:Arc::new(vec![current,manual]),..Default::default()};
+        adopt_queue(&mut snapshot,&json!({"version":1,"index":0,"tracks":[{"id":"1","name":"Song"},{"id":"1","name":"Song"}]})).unwrap();
+        assert!(!is_manual_queue_entry(&snapshot.queue[0]));
+        assert!(is_manual_queue_entry(&snapshot.queue[1]));
+        assert_eq!(snapshot.queue[1].raw["queue_context_name"],"Playlist");
+        assert_eq!(clear_manual_upcoming(&snapshot.queue,0).len(),1);
+    }
+
     #[test]
     fn queue_refresh_keeps_style_mix_constraints_when_engine_drops_custom_fields() {
         let mut snapshot = Snapshot::default();

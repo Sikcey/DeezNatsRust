@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.7
+
+- Improve Spotify catalog, playback recovery, diagnostics and interface behavior.
+- Improve YouTube catalog handling and Azerbaijani and Turkish translations.
+
 ## 0.1.6
 
 - Reorganize application source and assets, improve localization and update packaging.

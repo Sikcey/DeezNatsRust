@@ -1221,5 +1221,19 @@
   "What would you like to listen to in {language}?": "{language} dilində hansı janrı dinləmək istəyirsən?",
   "From matching {provider} playlists": "Uyğun {provider} pleylistlərindən",
   "Loading lyrics...": "Mahn\u0131 s\u00f6zl\u0259ri y\u00fckl\u0259nir...",
-  "This song is instrumental.": "Bu mahn\u0131 instrumentald\u0131r."
+  "This song is instrumental.": "Bu mahn\u0131 instrumentald\u0131r.",
+  "Current playlist or radio": "Cari pleylist v\u0259 ya radio",
+  "Don't see your device?": "Cihaz\u0131n\u0131 g\u00f6rm\u00fcrs\u0259n?",
+  "Invite friends and listen together, wherever you are": "Jam sessiyana dig\u0259rl\u0259rini d\u0259v\u0259t et, ist\u0259diyin yerd\u0259 birlikd\u0259 dinl\u0259.",
+  "Listen together from anywhere": "\u0130st\u0259diyin yerd\u0259 dostlar\u0131nla dinl\u0259",
+  "Looking for devices\u2026": "Cihazlar axtar\u0131l\u0131r\u2026",
+  "Next from: {0}": "S\u0131rada buradan s\u0259sl\u0259ndiril\u0259c\u0259k: {0}",
+  "Next in queue": "N\u00f6vb\u0259ti",
+  "No active device": "Aktiv cihaz yoxdur",
+  "No recently played tracks": "Bu yax\u0131nlarda s\u0259sl\u0259ndiril\u0259n mahn\u0131 yoxdur",
+  "Open Jam": "Jam sessiyas\u0131n\u0131 a\u00e7",
+  "Playing on {0}": "{0} cihaz\u0131nda s\u0259sl\u0259ndirilir",
+  "Start a Jam": "Jam ba\u015flat",
+  "Your queue is empty": "N\u00f6vb\u0259n bo\u015fdur",
+  "Playing from: {0}": "Buradan oxudulur: {0}"
 }

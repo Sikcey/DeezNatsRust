@@ -931,6 +931,7 @@ mod catalog {
         value
     }
     pub(crate) fn invoke(name: &str, args: &[Value]) -> Result<Value, String> {
+        let _log = crate::spotify_diagnostics::Span::new("spotify.catalog", name);
         if name == "DZQueueJSON" && super::web::has_session() {
             let state = super::web_devices::snapshot()?;
             return Ok(
@@ -1120,7 +1121,7 @@ pub(crate) mod flow {
         )
     }
 
-    /// Derive mood genres from the provider's current playlist titles/descriptions.
+    /// Derive mood genres from explicitly named genres in mood playlist titles.
     /// Saved selections always win over discovery, including an explicitly empty selection.
     pub(crate) fn provider_tuner(
         key: &str,
@@ -1160,11 +1161,7 @@ pub(crate) mod flow {
             .flatten()
             .map(|item| {
                 (
-                    searchable(&format!(
-                        "{} {}",
-                        item["title"].as_str().unwrap_or_default(),
-                        item["description"].as_str().unwrap_or_default()
-                    )),
+                    searchable(item["title"].as_str().unwrap_or_default()),
                     item,
                 )
             })
@@ -1175,7 +1172,9 @@ pub(crate) mod flow {
                 let pattern = searchable(name);
                 let source = sources
                     .iter()
-                    .find(|(text, _)| text.contains(&pattern))
+                    .find(|(text, _)| {
+                        text.contains(&searchable(&selection.mood)) && text.contains(&pattern)
+                    })
                     .map(|(_, item)| *item);
                 let native = directory.as_array().into_iter().flatten().find(|genre| {
                     genre["title"]
@@ -1734,6 +1733,31 @@ pub(crate) mod flow {
         }
 
         #[test]
+    fn mood_defaults_ignore_descriptions_and_unrelated_search_results() {
+        let tuner = provider_tuner(
+            "focus",
+            &json!([]),
+            &json!([
+                {"title":"Ambient Focus", "description":"No rock, pop, metal or jazz."},
+                {"title":"Rock Party", "description":"Focus on the biggest hits."},
+                {"title":"Jazz Classics"}
+            ]),
+        )
+        .unwrap();
+        let enabled: Vec<_> = tuner["genres"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|genre| genre["isEnabled"] == true)
+            .map(|genre| genre["id"].as_str().unwrap())
+            .collect();
+        assert!(enabled.contains(&"Ambient"));
+        for genre in ["Rock", "Pop", "Metal", "Jazz"] {
+            assert!(!enabled.iter().any(|name| name.eq_ignore_ascii_case(genre)));
+        }
+    }
+
+    #[test]
         fn provider_genre_matching_uses_word_boundaries_and_image_keys_require_https() {
             let tuner =
                 provider_tuner("party", &json!([]), &json!([{"title":"Popular hip-hop"}])).unwrap();
@@ -1901,6 +1925,257 @@ pub(crate) mod flow {
         }
     }
 }
+pub(crate) mod social {
+    use serde_json::Value;
+
+    #[derive(Clone, Default)]
+    pub(crate) struct Friend {
+        pub name: String,
+        pub track: String,
+        pub artist: String,
+        pub uri: String,
+        pub avatar: String,
+        pub context: String,
+        pub context_uri: String,
+        pub timestamp: u64,
+    }
+
+    #[derive(Clone, Default)]
+    pub(crate) struct Snapshot {
+        pub friends: Vec<Friend>,
+        pub sharing: Option<bool>,
+    }
+
+    fn parse(value: &Value) -> Result<Snapshot, String> {
+        let friends = value["friends"].as_array().ok_or("Spotify returned an invalid friend activity response")?;
+        Ok(Snapshot {
+            friends: friends.iter().filter_map(|item| {
+                let name = item["user"]["name"].as_str()?;
+                let track = item["track"]["name"].as_str()?;
+                Some(Friend {
+                    name: name.to_owned(),
+                    track: track.to_owned(),
+                    artist: item["track"]["artist"]["name"].as_str().unwrap_or("").to_owned(),
+                    uri: item["track"]["uri"].as_str().unwrap_or("").to_owned(),
+                    avatar: item["user"]["imageUrl"].as_str().unwrap_or("").to_owned(),
+                    context: item["track"]["context"]["name"].as_str().unwrap_or("").to_owned(),
+                    timestamp: item["timestamp"].as_u64().unwrap_or(0),
+                    context_uri: item["track"]["context"]["uri"].as_str().unwrap_or("").to_owned(),
+                })
+            }).collect(),
+            sharing: None,
+        })
+    }
+
+    fn request(method: &str, path: &str, body: &[u8]) -> Result<Value, String> {
+        super::jam_auth::check_cooldown()?;
+        let identity = super::jam_auth::cookie()?;
+        for attempt in 0..2 {
+            let authorization = format!("Bearer {}", super::jam_auth::token()?);
+            let response = crate::lyrics::http::response(method,
+                &format!("https://spclient.wg.spotify.com{path}"),
+                &[("Authorization", &authorization), ("Accept", "application/json"),
+                  ("Content-Type", "application/json"), ("Cache-Control", "no-cache")], body)?;
+            if super::jam_auth::cookie()? != identity {
+                return Err("Spotify sign-in changed; refresh friend activity.".into());
+            }
+            if response.status == 401 {
+                super::jam_auth::invalidate();
+                if attempt == 0 { continue; }
+            }
+            let bytes = super::jam_auth::checked(response)?;
+            return serde_json::from_slice(&bytes).map_err(|_| "Spotify returned invalid friend activity".into());
+        }
+        Err("Spotify friend activity authorization failed".into())
+    }
+
+    fn cached(path: &str) -> Result<Value, String> {
+        use std::{collections::HashMap, sync::{Mutex, OnceLock}};
+        static CACHE: OnceLock<Mutex<HashMap<(String, String), (u64, Value)>>> = OnceLock::new();
+        let cache = CACHE.get_or_init(Default::default);
+        let identity = super::jam::account_key().ok_or("Spotify sign-in required")?;
+        let key = (identity, path.to_owned());
+        if let Some((expiry, value)) = cache.lock().map_err(|_| "Spotify activity cache busy")?.get(&key) {
+            if *expiry > super::jam_auth::now() { return Ok(value.clone()); }
+        }
+        let value = request("GET", path, &[])?;
+        let mut cache = cache.lock().map_err(|_| "Spotify activity cache busy")?;
+        if cache.len() >= 512 { cache.clear(); }
+        cache.insert(key, (super::jam_auth::now() + 300, value.clone()));
+        Ok(value)
+    }
+
+    fn track_gid(uri: &str) -> Option<String> {
+        let id = uri.strip_prefix("spotify:track:")?;
+        if id.len() != 22 { return None; }
+        let gid = id.bytes().try_fold(0u128, |v, c| {
+            let n = match c { b'0'..=b'9' => c-b'0', b'a'..=b'z' => c-b'a'+10,
+                b'A'..=b'Z' => c-b'A'+36, _ => return None };
+            v.checked_mul(62)?.checked_add(n as u128)
+        })?;
+        Some(format!("{gid:032x}"))
+    }
+
+    fn timestamp(value: &str) -> Option<u64> {
+        // The feed uses UTC RFC3339, rather than the buddy list's epoch milliseconds.
+        let value = value.strip_suffix('Z')?;
+        let (date, time) = value.split_once('T')?;
+        let date = date.split('-').map(str::parse::<i64>).collect::<Result<Vec<_>, _>>().ok()?;
+        let time = time.split(':').map(str::parse::<f64>).collect::<Result<Vec<_>, _>>().ok()?;
+        if date.len()!=3 || time.len()!=3 || !(1970..=9999).contains(&date[0])
+            || !(1..=12).contains(&date[1]) || !(1..=31).contains(&date[2])
+            || !(0.0..24.0).contains(&time[0]) || !(0.0..60.0).contains(&time[1])
+            || !(0.0..60.0).contains(&time[2]) { return None; }
+        let y = date[0] - i64::from(date[1] <= 2);
+        let era = y / 400;
+        let year = y - era * 400;
+        let month = date[1] + if date[1] > 2 { -3 } else { 9 };
+        let days = era * 146097 + year * 365 + year / 4 - year / 100
+            + (153 * month + 2) / 5 + date[2] - 1 - 719468;
+        u64::try_from(days * 86400000 + (time[0]*3600000.0 + time[1]*60000.0 + time[2]*1000.0) as i64).ok()
+    }
+
+    fn live_entries(value: &Value) -> Result<Vec<(String, String, String, u64)>, String> {
+        let entities = value["entities"].as_array().ok_or("Spotify listening activity response has no entities")?;
+        let mut latest = std::collections::HashMap::new();
+        for item in entities {
+            let Some(user) = item.get("userEntity").or_else(|| item.get("followEntity")) else { continue };
+            let Some(uri) = user["uri"].as_str().filter(|s| s.starts_with("spotify:user:")) else { continue };
+            let activity = &user["activity"];
+            let Some(track) = activity["entityUri"].as_str().filter(|s| track_gid(s).is_some()) else { continue };
+            let Some(time) = activity["timestamp"].as_str().and_then(timestamp) else { continue };
+            let context = activity["contextUri"].as_str().unwrap_or("");
+            let entry = (uri.to_owned(), track.to_owned(), context.to_owned(), time);
+            if latest.get(uri).is_none_or(|v: &(String,String,String,u64)| v.3 < time) { latest.insert(uri.to_owned(), entry); }
+        }
+        let mut entries: Vec<_> = latest.into_values().collect();
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.3));
+        Ok(entries)
+    }
+
+    fn album_uri(album: &Value) -> Option<String> {
+        use base64::Engine;
+        if let Some(uri) = album["canonical_uri"].as_str().filter(|u| u.starts_with("spotify:album:")) { return Some(uri.to_owned()); }
+        let encoded = album["gid"].as_str()?;
+        let mut gid = if encoded.len() == 32 && encoded.bytes().all(|b| b.is_ascii_hexdigit()) {
+            u128::from_str_radix(encoded,16).ok()?
+        } else {
+            let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+            u128::from_be_bytes(bytes.try_into().ok()?)
+        };
+        let alphabet = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let mut id = [b'0'; 22];
+        for c in id.iter_mut().rev() { *c = alphabet[(gid % 62) as usize]; gid /= 62; }
+        Some(format!("spotify:album:{}", String::from_utf8(id.to_vec()).ok()?))
+    }
+
+    fn live() -> Result<Snapshot, String> {
+        let value = request("POST", "/listening-activity/v1/feed", br#"{"unused":true,"resultLimit":100}"#)?;
+        let entries = live_entries(&value)?;
+        let mut friends = Vec::with_capacity(entries.len());
+        for (user, uri, context, timestamp) in entries {
+            let id = user.strip_prefix("spotify:user:").unwrap_or_default();
+            let id: String = url::form_urlencoded::byte_serialize(id.as_bytes()).collect();
+            let profile = cached(&format!("/user-profile-view/v3/profile/{id}?playlist_limit=0&artist_limit=0"))?;
+            let gid = track_gid(&uri).ok_or("Invalid friend track URI")?;
+            let track = cached(&format!("/metadata/4/track/{gid}?format=json"))?;
+            let album = track["album"]["name"].as_str().unwrap_or("");
+            let album_target = album_uri(&track["album"]).unwrap_or_default();
+            let (context_name, context_uri) = if context.contains(":playlist:") {
+                let playlist = context.rsplit(':').next().unwrap_or_default();
+                match cached(&format!("/playlist/v2/playlist/{playlist}?format=json"))
+                    .ok().and_then(|v| v["attributes"]["name"].as_str().map(str::to_owned)) {
+                    Some(name) => (name, context.clone()),
+                    None => (album.to_owned(), album_target),
+                }
+            } else if context.starts_with("spotify:track:") {
+                (track["name"].as_str().unwrap_or("").to_owned(), context.clone())
+            } else if context.starts_with("spotify:album:") {
+                (album.to_owned(), context.clone())
+            } else { (album.to_owned(), album_target) };
+            friends.push(Friend {
+                name: profile["name"].as_str().unwrap_or(&user).to_owned(),
+                avatar: profile["image_url"].as_str().unwrap_or("").to_owned(),
+                track: track["name"].as_str().ok_or("Spotify friend track metadata has no name")?.to_owned(),
+                artist: track["artist"].as_array().map(|artists| artists.iter().filter_map(|v|v["name"].as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default(),
+                context_uri,
+                uri, context: context_name, timestamp,
+            });
+        }
+        Ok(Snapshot { friends, sharing: None })
+    }
+
+    pub(crate) fn fetch() -> Result<Snapshot, String> {
+        match live() {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) => {
+                crate::spotify_diagnostics::record("spotify.social", &format!("live_feed_failed kind={}", crate::spotify_diagnostics::error_kind(&error)));
+                Err(format!("Could not load Spotify listening activity: {error}"))
+            }
+        }
+    }
+
+    pub(crate) fn set_sharing(_sharing: bool) -> Result<Snapshot, String> {
+        Err("Spotify listening activity sharing cannot be changed here. Use Spotify settings.".into())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        #[ignore = "uses the saved Spotify sign-in and live service"]
+        fn live_friend_activity_fetch() {
+            let value = request("POST", "/listening-activity/v1/feed", br#"{"unused":true,"resultLimit":100}"#).unwrap();
+            let entries = live_entries(&value).unwrap();
+            let snapshot = fetch().expect("live friend activity request failed");
+            eprintln!("feed_entries={} displayed={} avatars={} contexts={} timestamps={}", entries.len(), snapshot.friends.len(),
+                snapshot.friends.iter().filter(|f| !f.avatar.is_empty()).count(),
+                snapshot.friends.iter().filter(|f| !f.context.is_empty()).count(),
+                snapshot.friends.iter().filter(|f| f.timestamp > 0).count());
+            assert_eq!(snapshot.friends.len(), entries.len());
+            assert!(snapshot.friends.iter().all(|f| !f.track.is_empty()));
+            eprintln!("clickable_contexts={}", snapshot.friends.iter().filter(|f| !f.context_uri.is_empty()).count());
+        }
+        #[test]
+        fn friend_album_gid_produces_a_clickable_spotify_uri() {
+            use base64::Engine;
+            let id = "51xHvAUYQfhY29GcGlBM0n";
+            let gid = u128::from_str_radix(&track_gid(&format!("spotify:track:{id}")).unwrap(),16).unwrap();
+            let album = serde_json::json!({"gid":base64::engine::general_purpose::STANDARD.encode(gid.to_be_bytes())});
+            assert_eq!(album_uri(&album),Some(format!("spotify:album:{id}")));
+            assert_eq!(album_uri(&serde_json::json!({"gid":format!("{gid:032x}")})), Some(format!("spotify:album:{id}")));
+            assert!(album_uri(&serde_json::json!({})).is_none());
+        }
+        #[test]
+        fn live_feed_deduplicates_and_sorts_latest_activity() {
+            let value = serde_json::json!({"entities":[
+                {"followEntity":{"uri":"spotify:user:a","activity":{"entityUri":"spotify:track:51xHvAUYQfhY29GcGlBM0n","timestamp":"2026-10-14T17:00:00Z"}}},
+                {"userEntity":{"uri":"spotify:user:b","activity":{"entityUri":"spotify:track:51xHvAUYQfhY29GcGlBM0n","timestamp":"2026-10-14T17:30:00.123Z"}}},
+                {"followEntity":{"uri":"spotify:user:a","activity":{"entityUri":"spotify:track:51xHvAUYQfhY29GcGlBM0n","timestamp":"2026-10-14T17:10:00Z"}}},
+                {"followEntity":{"uri":"spotify:user:c","activity":{"entityUri":"spotify:episode:123","timestamp":"2026-10-14T17:20:00Z"}}}
+            ]});
+            let entries = live_entries(&value).unwrap();
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].0, "spotify:user:b");
+            assert_eq!(entries[1].3, timestamp("2026-10-14T17:10:00Z").unwrap());
+            assert_eq!(timestamp("1970-01-01T00:00:01.500Z"), Some(1500));
+            assert!(timestamp("bad").is_none());
+            assert!(live_entries(&serde_json::json!({})).is_err());
+        }
+        #[test]
+        fn parses_buddylist_without_inventing_privacy_state() {
+            let result = parse(&serde_json::json!({"friends":[{"timestamp":1700000000000u64,"user":{"name":"Sam","imageUrl":"https://example.com/avatar.jpg"},"track":{"name":"Song","artist":{"name":"Artist"},"uri":"spotify:track:123","context":{"name":"Playlist"}}}]})).unwrap();
+            assert_eq!(result.friends[0].track, "Song");
+            assert_eq!(result.friends[0].artist, "Artist");
+            assert_eq!(result.friends[0].avatar, "https://example.com/avatar.jpg");
+            assert_eq!(result.friends[0].context, "Playlist");
+            assert_eq!(result.friends[0].timestamp, 1700000000000);
+            assert!(result.sharing.is_none());
+            assert!(parse(&serde_json::json!({})).is_err());
+        }
+    }
+}
+
 pub(crate) mod jam {
     //! Native Jam control over Spotify's social-connect protocol; no WebView2.
     use super::jam_auth as auth;
@@ -2720,6 +2995,7 @@ mod jam_auth {
         let mut url = url::Url::parse("https://open.spotify.com/api/token").unwrap();
         url.query_pairs_mut()
             .append_pair("reason", "transport")
+            .append_pair("_", &now().to_string())
             .append_pair("productType", "web-player")
             .append_pair("totp", &totp(&key, now()))
             .append_pair("totpServer", &totp(&key, server))
@@ -2728,7 +3004,7 @@ mod jam_auth {
         let value = json(&checked(http::response(
             "GET",
             url.as_str(),
-            &[("Cookie", &header)],
+            &[("Cookie", &header), ("Cache-Control", "no-cache")],
             &[],
         )?)?)?;
         if value["isAnonymous"] != false {
@@ -2795,6 +3071,32 @@ pub(crate) mod playback {
         };
 
         const STATION: &str = "spotify_station";
+        struct MetadataLoader {
+            requests: std::sync::mpsc::SyncSender<(Option<(Arc<AtomicU64>,u64)>,String)>,
+            results: std::sync::mpsc::Receiver<Entry>,
+            requested: std::collections::HashMap<String,Instant>,
+        }
+        impl MetadataLoader {
+            fn start()->Self {
+                let (requests,rx)=std::sync::mpsc::sync_channel::<(Option<(Arc<AtomicU64>,u64)>,String)>(16);
+                let (tx,results)=std::sync::mpsc::sync_channel(32);
+                std::thread::spawn(move || {
+                    while let Ok((generation,uri))=rx.recv() {
+                        let current=||generation.as_ref().is_none_or(|(live,epoch)|live.load(Ordering::SeqCst)==*epoch);
+                        if !current() {continue;}
+                        let kind=if uri.starts_with("spotify:episode:") {"episode"} else {"track"};
+                        crate::spotify_diagnostics::record("queue.metadata","lookup");
+                        let value=if kind=="track" {super::super::catalog_invoke("DZTrackMetadataJSON",&[json!(uri)])} else {super::super::catalog_invoke("SPCatalogItemJSON",&[json!(kind),json!(uri)])};
+                        if !current() {continue;}
+                        match value {
+                            Ok(value)=>if let Some(entry)=crate::catalog::entry(&value,kind).filter(|entry|entry.id==uri) {crate::spotify_diagnostics::record("queue.metadata","resolved");let _=tx.try_send(entry);},
+                            Err(error)=>crate::spotify_diagnostics::record("queue.metadata.error",crate::spotify_diagnostics::error_kind(&error)),
+                        }
+                    }
+                });
+                Self {requests,results,requested:Default::default()}
+            }
+        }
         #[derive(Default)]
         pub(crate) struct Queue {
             items: Arc<Vec<Entry>>,
@@ -2805,6 +3107,16 @@ pub(crate) mod playback {
             refill_at: Option<Instant>,
             device: Option<String>,
             generation: Option<(Arc<AtomicU64>, u64)>,
+            metadata_cache: std::collections::HashMap<String,Entry>,
+            metadata_order: std::collections::VecDeque<String>,
+            remembered_index: usize,
+            retain_cleared_source: bool,
+            metadata_loader: Option<MetadataLoader>,
+            remembered_queue: Option<Arc<Vec<Entry>>>,
+            manual_pending: std::collections::VecDeque<Entry>,
+            manual_uids: std::collections::HashMap<String,Entry>,
+            last_current: String,
+            last_position: u64,
         }
         fn playable(entry: &Entry) -> bool {
             let mut parts = entry.id.split(':');
@@ -2883,7 +3195,7 @@ pub(crate) mod playback {
             Some(marker)
         }
         fn metadata(target: &mut Entry, original: &Entry) {
-            for name in [STATION, crate::style_mix::MARKER, "added_by"] {
+            for name in [STATION, crate::style_mix::MARKER, "added_by", "spotify_context_name", "queue_context_name"] {
                 if let Some(value) = original.raw.get(name) {
                     target.raw[name] = value.clone();
                 }
@@ -2900,18 +3212,111 @@ pub(crate) mod playback {
                             .all(|(v, e)| v["uri"].as_str() == Some(e.id.as_str()))
                 })
         }
-        impl Queue {
+    fn needs_metadata(entry: &Entry) -> bool {
+        playable(entry) && (entry.title.is_empty() || entry.artwork.is_empty() || entry.duration == 0)
+    }
+    impl Queue {
             fn reset(&mut self) {
                 let generation = self.generation.clone();
-                *self = Self {
-                    generation,
-                    ..Default::default()
-                };
+                let metadata_cache=std::mem::take(&mut self.metadata_cache);
+                let metadata_order=std::mem::take(&mut self.metadata_order);
+                let metadata_loader=self.metadata_loader.take();
+                *self = Self {generation,metadata_cache,metadata_order,metadata_loader,..Default::default()};
+            }
+            fn merge_metadata(entry:&mut Entry, known:&Entry) {
+                if entry.title.is_empty() {entry.title.clone_from(&known.title);}
+                if entry.subtitle.is_empty() {entry.subtitle.clone_from(&known.subtitle);}
+                if entry.artwork.is_empty() {entry.artwork.clone_from(&known.artwork);}
+                if entry.album.is_empty() {entry.album.clone_from(&known.album);}
+                if entry.artist_id.is_empty() {entry.artist_id.clone_from(&known.artist_id);}
+                if entry.album_id.is_empty() {entry.album_id.clone_from(&known.album_id);}
+                if entry.duration==0 {entry.duration=known.duration;}
+                metadata(entry,known);
+            }
+            fn remember(&mut self, entries:&[Entry]) {
+                for entry in entries.iter().filter(|e|!e.id.is_empty() && (!e.title.is_empty() || !e.subtitle.is_empty() || !e.artwork.is_empty())) {
+                    if let Some(known)=self.metadata_cache.get_mut(&entry.id) {Self::merge_metadata(known,entry);}
+                    else {
+                        if self.metadata_cache.len()>=4096 {if let Some(oldest)=self.metadata_order.pop_front() {self.metadata_cache.remove(&oldest);}}
+                        self.metadata_order.push_back(entry.id.clone());self.metadata_cache.insert(entry.id.clone(),entry.clone());
+                    }
+                }
+            }
+            pub(super) fn remember_snapshot(&mut self,s:&Snapshot) {
+                if self.remembered_index!=s.queue_index || self.remembered_queue.as_ref().is_none_or(|old|!Arc::ptr_eq(old,&s.queue)) {
+                    let start=s.queue_index.min(s.queue.len());let end=(start+161).min(s.queue.len());
+                    self.remember(&s.queue[start..end]);self.remembered_queue=Some(s.queue.clone());self.remembered_index=s.queue_index;
+                }
+                self.remember(std::slice::from_ref(&s.now));
+            }
+            pub(super) fn poll_metadata(&mut self) {
+                let results:Vec<_>=self.metadata_loader.as_ref().map(|loader|loader.results.try_iter().collect()).unwrap_or_default();
+                if results.is_empty() {return;}
+                self.remember(&results);
+                let mut changed=None;
+                for (index,entry) in self.items.iter().enumerate() {
+                    if let Some(known)=results.iter().find(|known|known.id==entry.id) {
+                        let mut enriched=entry.clone();Self::merge_metadata(&mut enriched,known);
+                        if enriched!=*entry {changed.get_or_insert_with(||self.items.as_ref().clone())[index]=enriched;}
+                    }
+                }
+                if let Some(items)=changed {self.items=Arc::new(items);}
+            }
+            pub(super) fn request_metadata(&mut self,s:&Snapshot) {
+            let missing:Vec<_>=std::iter::once(&s.now).chain(s.queue.iter().skip(s.queue_index.saturating_add(1))).filter(|entry|needs_metadata(entry)).map(|entry|entry.id.clone()).take(24).collect();
+                if missing.is_empty() {return;}
+                let generation=self.generation.clone();
+                let loader=self.metadata_loader.get_or_insert_with(MetadataLoader::start);
+                for uri in missing {
+                    if loader.requested.get(&uri).is_some_and(|at|at.elapsed()<Duration::from_secs(60)) {continue;}
+                    if loader.requested.len()>=4096 {loader.requested.clear();}
+                    if loader.requests.try_send((generation.clone(),uri.clone())).is_ok() {loader.requested.insert(uri,Instant::now());}
+                }
+            }
+            pub(super) fn enrich(&self,entry:&mut Entry) {
+                if let Some(known)=self.metadata_cache.get(&entry.id) {Self::merge_metadata(entry,known);}
+            }
+            pub(super) fn note_added(&mut self,entry:&Entry,s:&mut Snapshot) {
+                let mut entry=crate::audio::explicit_queue_entry(entry.clone());self.remember(std::slice::from_ref(&entry));
+                let count=s.queue.iter().skip(s.queue_index.saturating_add(1)).filter(|row|row.id==entry.id).count()+1;
+                entry.raw["_queue_expected_count"]=json!(count);
+                self.manual_pending.push_back(entry.clone());self.last_current=s.now.id.clone();self.last_position=s.position;
+                let mut items=s.queue.as_ref().clone();
+                if items.is_empty() && !s.now.id.is_empty() {items.push(s.now.clone());s.queue_index=0;}
+                let at=crate::audio::queue_add_position(&items,s.queue_index);items.insert(at,entry);
+                self.items=Arc::new(items);self.index=s.queue_index;self.window_end=self.items.len().min(self.window_end.saturating_add(1).max(1));
+                self.confirmed=Some(Instant::now());s.queue=self.items.clone();
+            }
+            pub(super) fn has_pending_manual(&self)->bool {!self.manual_pending.is_empty()}
+            pub(super) fn reconcile_manual(&mut self,items:&mut Vec<Entry>,_current:&str,_position:u64) {
+                for entry in items.iter_mut().skip(1) {
+                    if let Some(known)=entry.raw["spotify_queue_uid"].as_str().and_then(|uid|self.manual_uids.get(uid)) {
+                        Self::merge_metadata(entry,known);entry.raw[crate::audio::QUEUE_MANUAL]=json!(true);
+                    }
+                }
+                let mut used=std::collections::HashSet::new();let mut confirmed=Vec::new();
+                for (pending_index,manual) in self.manual_pending.iter().enumerate() {
+                    let available=items.iter().skip(1).filter(|entry|entry.id==manual.id).count();
+                    let expected=manual.raw["_queue_expected_count"].as_u64().unwrap_or(1) as usize;
+                    let authoritative=(1..items.len()).find(|index|!used.contains(index) && items[*index].id==manual.id && crate::audio::is_manual_queue_entry(&items[*index]));
+                    let at=authoritative.or_else(||if available>=expected {(1..items.len()).find(|index|!used.contains(index) && items[*index].id==manual.id)} else {None});
+                    let observed=at.is_some();
+                    let at=at.unwrap_or_else(|| {let at=crate::audio::queue_add_position(items,0);used=std::mem::take(&mut used).into_iter().map(|index|if index>=at {index+1} else {index}).collect();items.insert(at,manual.clone());at});
+                    if observed {
+                        if let Some(uid)=items[at].raw["spotify_queue_uid"].as_str().filter(|uid|!uid.is_empty()) {
+                            if self.manual_uids.len()<4096 {self.manual_uids.insert(uid.into(),manual.clone());}
+                            confirmed.push(pending_index);
+                        } else if authoritative.is_some() {confirmed.push(pending_index);}
+                    }
+                    used.insert(at);Self::merge_metadata(&mut items[at],manual);items[at].raw[crate::audio::QUEUE_MANUAL]=json!(true);
+                }
+                for index in confirmed.into_iter().rev() {self.manual_pending.remove(index);}
             }
             pub fn bind_generation(&mut self, live: Arc<AtomicU64>, epoch: u64) {
+                if self.generation.as_ref().is_some_and(|(_,old)|*old!=epoch) {if let Some(loader)=&mut self.metadata_loader {loader.requested.clear();}}
                 self.generation = Some((live, epoch));
             }
-            fn check_current(&self) -> Result<(), String> {
+            pub(super) fn check_current(&self) -> Result<(), String> {
                 if self.generation.as_ref().is_some_and(|(live, epoch)| {
                     *epoch == 0 || live.load(Ordering::SeqCst) != *epoch
                 }) {
@@ -2955,13 +3360,31 @@ pub(crate) mod playback {
                         (items, s.queue_index, s.position, s.state != "Playing")
                     }
                     Command::QueueClear => {
-                        if !playable(&s.now) {
-                            return Err(
-                                "Spotify has no current item whose upcoming queue can be cleared"
-                                    .into(),
-                            );
+                        self.check_current()?;
+                        let remaining=crate::audio::clear_manual_upcoming(&s.queue,s.queue_index);
+                        crate::spotify_diagnostics::record("queue.clear.request", &format!("before={} retained={} current={}",s.queue.len(),remaining.len(),s.queue_index));
+                        if remaining.len()!=s.queue.len() {
+                            let before=web_devices::playback_target()?;
+                            if before["uri"].as_str()!=Some(s.now.id.as_str()) {return Err("Spotify current item changed; refresh before editing queue".into());}
+                            // Soloist's native set_queue replaces the entire upcoming window,
+                            // including supplied collection tracks. Send the retained source tail.
+                            let (_,end)=window_body(&remaining,s.queue_index,s.position)?;
+                            let next:Vec<_>=remaining[s.queue_index+1..end].iter().map(|entry|json!({"uri":entry.id,"metadata":{}})).collect();
+                            web_devices::set_queue(&before,&next)?;
+                            self.check_current()?;
+                            self.retain_source_after_manual_clear(s,remaining);
                         }
-                        (vec![s.now.clone()], 0, s.position, s.state != "Playing")
+                        s.message="Manually queued tracks cleared; source playback continues".into();
+                        return Ok(true);
+                    }
+                    Command::QueueAddMany(entries) => {
+                        if entries.iter().any(|entry| !playable(entry)) { return Err("Only Spotify tracks and episodes can be queued".into()); }
+                        let mut items = s.queue.as_ref().clone();
+                        if items.is_empty() && playable(&s.now) { items.push(s.now.clone()); }
+                        if items.is_empty() { return Err("Start Spotify playback before editing its queue".into()); }
+                        let at = crate::audio::queue_add_position(&items, s.queue_index);
+                        items.splice(at..at, entries.iter().cloned().map(crate::audio::explicit_queue_entry));
+                        (items, s.queue_index, s.position, s.state != "Playing")
                     }
                     Command::QueueInsertNext(entry) | Command::QueueAddLast(entry) => {
                         if !playable(entry) {
@@ -3013,6 +3436,15 @@ pub(crate) mod playback {
                 )?;
                 Ok(true)
             }
+            fn retain_source_after_manual_clear(&mut self,s:&mut Snapshot,remaining:Vec<Entry>) {
+                self.manual_pending.clear();self.manual_uids.clear();
+                self.items=Arc::new(remaining);self.index=s.queue_index;
+                self.window_end=(self.index+80).min(self.items.len());
+                self.confirmed=Some(Instant::now());self.awaiting_play=false;
+                self.retain_cleared_source=true;
+                s.queue=self.items.clone();
+                crate::spotify_diagnostics::record("queue.clear.applied", &format!("retained={} current={}",s.queue.len(),s.queue_index));
+            }
             fn replace(
                 &mut self,
                 s: &mut Snapshot,
@@ -3033,7 +3465,11 @@ pub(crate) mod playback {
                 );
                 window_body(&items, index, position)?;
                 self.check_current()?;
-                let before = web_devices::playback_target().map_err(|e| {
+                let before = (if !preserve {
+                    if let Some(device) = s.now.raw["spotify_device_id"].as_str() {
+                        web_devices::devices().and_then(|devices| devices.as_array().and_then(|items| items.iter().find(|d| d["id"].as_str()==Some(device) && d["is_restricted"]==false)).cloned().map(|device| json!({"device":device})).ok_or_else(|| "Soloist device unavailable".into()))
+                    } else { web_devices::playback_target() }
+                } else { web_devices::playback_target() }).map_err(|e| {
                     crate::spotify_diagnostics::record(
                         "queue.target.error",
                         crate::spotify_diagnostics::error_kind(&e),
@@ -3076,6 +3512,7 @@ pub(crate) mod playback {
                     .ok_or("Spotify returned no active device")?
                     .to_owned();
                 if !preserve {
+                    self.retain_cleared_source=false;
                     request["options"]["initially_paused"] = json!(paused);
                     self.check_current()?;
                     web_devices::play(request, &device).map_err(|e| {
@@ -3097,9 +3534,9 @@ pub(crate) mod playback {
                     s.now = self.items[index].clone();
                     s.position = position;
                     s.duration = s.now.duration;
-                    s.state = if paused { "Paused" } else { "Playing" }.into();
+                    s.state = if paused { "Paused" } else { "Loading" }.into();
                     s.radio_active = station(&s.now).is_some();
-                    s.message = "Spotify playback started".into();
+                    s.message = "Spotify playback requested; waiting for Soloist".into();
                     return Ok(());
                 }
                 // SetQueue replaces upcoming tracks without restarting current playback. Revision
@@ -3138,9 +3575,14 @@ pub(crate) mod playback {
                     std::thread::sleep(Duration::from_millis(150));
                 }
                 if !verified {
-                    self.items = Arc::default();
+                    crate::spotify_diagnostics::record("queue.confirmation.details", &format!("expected_next={} actual_next={} uri_match={} queue_match={} playing={:?} expected_playing={} position={:?} expected_position={}", window_end-index-1, observed["next_tracks"].as_array().map_or(0, Vec::len), observed["uri"].as_str()==Some(items[index].id.as_str()), queue_matches(&observed, &items[..window_end], index), observed["is_playing"].as_bool(), !paused, observed["position_ms"].as_u64(), position));
+                    if let Some(next) = observed["next_tracks"].as_array() {
+                        for track in next.iter().take(4) { crate::spotify_diagnostics::record("queue.track.shape", &format!("provider={} queued={} uri_match_first={}", track["provider"], track["metadata"]["is_queued"], items.get(index+1).is_some_and(|entry|track["uri"].as_str()==Some(entry.id.as_str())))); }
+                    }
+                    crate::spotify_diagnostics::record("queue.confirmation", "not confirmed; preserving local queue");
                     return Err("Spotify did not confirm queue order, position and playback state; refresh the queue (remote playback may have changed)".into());
                 }
+                self.check_current()?;
                 self.items = Arc::new(items);
                 self.device = Some(device.into());
                 self.index = index;
@@ -3156,6 +3598,19 @@ pub(crate) mod playback {
                 Ok(())
             }
             pub fn observe(&mut self, s: &mut Snapshot, state: &state::Snapshot) -> bool {
+                let boundary=state.duration_ms>0 && self.last_position>=state.duration_ms.saturating_sub(1000) && s.position<1500 && state.repeat!="track";
+                if ((!self.last_current.is_empty() && self.last_current!=s.now.id) || boundary) && self.manual_pending.front().is_some_and(|entry|entry.id==s.now.id) {
+                    self.manual_pending.pop_front();
+                    for entry in self.manual_pending.iter_mut().filter(|entry|entry.id==s.now.id) {let count=entry.raw["_queue_expected_count"].as_u64().unwrap_or(1);entry.raw["_queue_expected_count"]=json!(count.saturating_sub(1).max(1));}
+                }
+                self.last_current=s.now.id.clone();self.last_position=s.position;
+
+                // Metadata is useful even while remote queue order is catching up.
+                if let Some(catalog) = self.items.iter().find(|entry| entry.id == s.now.id) {
+                    if s.now.subtitle.is_empty() { s.now.subtitle.clone_from(&catalog.subtitle); }
+                    if s.now.artist_id.is_empty() { s.now.artist_id.clone_from(&catalog.artist_id); }
+                    if s.now.album.is_empty() { s.now.album.clone_from(&catalog.album); }
+                }
                 if self.items.is_empty() {
                     return false;
                 }
@@ -3167,7 +3622,8 @@ pub(crate) mod playback {
                             .iter()
                             .zip(&self.items[index + 1..self.window_end])
                             .all(|(v, e)| v["item"]["uri"].as_str() == Some(e.id.as_str()))
-                        && state.upcoming.len().min(10) == (self.window_end - index - 1).min(10)
+                        && (state.upcoming.len().min(10) == (self.window_end - index - 1).min(10)
+                            || self.retain_cleared_source && state.upcoming.len() >= self.window_end-index-1)
                 };
                 let waiting = self.awaiting_play
                     && self
@@ -3175,8 +3631,12 @@ pub(crate) mod playback {
                         .is_some_and(|at| at.elapsed() < Duration::from_secs(3));
                 let index = (self.index..self.items.len())
                     .chain(0..self.index)
-                    .find(|&i| (!waiting || i == self.index) && matching(i));
+                    .find(|&i| (!self.awaiting_play || i == self.index) && matching(i));
                 if let Some(index) = index {
+                    if self.awaiting_play {
+                        crate::spotify_diagnostics::record("queue.play", "observed");
+                        s.message = "Spotify playback confirmed".into();
+                    }
                     self.awaiting_play = false;
                     self.index = index;
                     let catalog = &self.items[index];
@@ -3224,11 +3684,14 @@ pub(crate) mod playback {
                     if waiting {
                         s.position = 0;
                     }
-                    if s.state == "Stopped" {
-                        s.state = "Playing".into();
-                    }
+                    if waiting { s.state = "Loading".into(); }
                     s.radio_active = station(&s.now).is_some();
                 } else {
+                    if self.awaiting_play {
+                        self.awaiting_play = false;
+                        s.message = "Spotify did not confirm the requested track; try again".into();
+                        crate::spotify_diagnostics::record("queue.play", "confirmation_expired");
+                    }
                     self.items = Arc::default();
                     return false;
                 }
@@ -3458,6 +3921,119 @@ pub(crate) mod playback {
                 assert_eq!(items.len(), 170);
             }
             #[test]
+            fn clear_preserves_source_history_and_continuation_across_native_events() {
+                let mut source=vec![track('a'),track('b'),track('c')];
+                crate::audio::mark_queue_fallback(&mut source);
+                let mut snapshot=Snapshot {queue:Arc::new(source.clone()),queue_index:1,now:source[1].clone(),state:"Playing".into(),position:5000,..Default::default()};
+                let manual=crate::audio::explicit_queue_entry(track('d'));
+                Arc::make_mut(&mut snapshot.queue).insert(2,manual);
+                let mut managed=Queue::default();
+                let remaining=crate::audio::clear_manual_upcoming(&snapshot.queue,1);
+                managed.retain_source_after_manual_clear(&mut snapshot,remaining);
+                managed.confirmed=Some(Instant::now()-Duration::from_secs(4));
+                let mut native=state::Snapshot::default();
+                native.upcoming=vec![json!({"item":{"uri":source[2].id}}),json!({"item":{"uri":track('e').id}})];
+                assert!(managed.observe(&mut snapshot,&native));
+                assert_eq!(*snapshot.queue,source);assert_eq!(snapshot.queue_index,1);
+                assert_eq!(snapshot.position,5000);assert_eq!(snapshot.state,"Playing");
+            }
+            #[test]
+            fn pending_track_does_not_report_playing_until_observed() {
+                let chosen = track('b');
+                let mut queue = Queue { items: Arc::new(vec![chosen.clone()]), window_end: 1,
+                    confirmed: Some(Instant::now()), awaiting_play: true, ..Default::default() };
+                let mut snapshot = Snapshot { now: track('a'), state: "Playing".into(), ..Default::default() };
+                assert!(queue.observe(&mut snapshot, &state::Snapshot::default()));
+                assert_eq!(snapshot.state, "Loading");
+                assert!(queue.awaiting_play);
+                snapshot.now = chosen;
+                snapshot.state = "Playing".into();
+                assert!(queue.observe(&mut snapshot, &state::Snapshot::default()));
+                assert!(!queue.awaiting_play);
+                assert_eq!(snapshot.message, "Spotify playback confirmed");
+            }
+            #[test]
+            fn expired_selection_cannot_confirm_the_old_track() {
+                let a = track('a');
+                let b = track('b');
+                let mut queue = Queue { items: Arc::new(vec![a.clone(), b.clone()]), index: 1, window_end: 2,
+                    confirmed: Some(Instant::now()-Duration::from_secs(4)), awaiting_play: true, ..Default::default() };
+                let mut snapshot = Snapshot { now: a, state: "Playing".into(), ..Default::default() };
+                let state = state::Snapshot { upcoming: vec![json!({"item":{"uri":b.id}})], ..Default::default() };
+                assert!(!queue.observe(&mut snapshot, &state));
+                assert!(!queue.awaiting_play);
+                assert!(snapshot.message.contains("did not confirm"));
+            }
+            #[test]
+            fn newer_selection_cancels_old_completion_before_publication() {
+                let live = Arc::new(AtomicU64::new(1));
+                let mut queue = Queue::default();
+                queue.bind_generation(live.clone(), 1);
+                assert!(queue.check_current().is_ok());
+                live.fetch_add(1, Ordering::SeqCst);
+                assert!(queue.check_current().is_err());
+                queue.reset();
+                assert!(queue.check_current().is_err());
+                queue.bind_generation(live, 2);
+                assert!(queue.check_current().is_ok());
+            }
+            #[test]
+        fn missing_duration_requires_metadata_even_with_title_and_artwork() {
+            let mut entry = track('a');
+            entry.title = "Song".into();
+            entry.artwork = "cover".into();
+            entry.duration = 0;
+            assert!(needs_metadata(&entry));
+            entry.duration = 180_000;
+            assert!(!needs_metadata(&entry));
+        }
+        #[test]
+        fn partial_events_keep_known_metadata_after_queue_reconciliation() {
+                let mut known=track('a');known.title="Title".into();known.subtitle="Artist".into();known.artwork="cover".into();
+                let mut queue=Queue::default();queue.remember(std::slice::from_ref(&known));queue.reset();
+                let mut partial=Entry {id:known.id.clone(),kind:"track".into(),..Default::default()};queue.enrich(&mut partial);
+                assert_eq!(partial.title,"Title");assert_eq!(partial.subtitle,"Artist");assert_eq!(partial.artwork,"cover");
+            }
+            #[test]
+            fn accepted_additions_are_stable_during_lag_and_keep_duplicate_context_occurrences() {
+                let current=track('a');let mut added=track('b');added.title="Added".into();added.subtitle="Artist".into();
+                let mut snapshot=Snapshot {now:current.clone(),queue:Arc::new(vec![current.clone(),added.clone()]),state:"Playing".into(),..Default::default()};
+                let mut queue=Queue::default();queue.note_added(&added,&mut snapshot);queue.note_added(&added,&mut snapshot);
+                assert_eq!(snapshot.queue.len(),4);assert!(crate::audio::is_manual_queue_entry(&snapshot.queue[1]));
+                let mut delayed=vec![current.clone(),added.clone()];queue.reconcile_manual(&mut delayed,&current.id,0);
+                assert_eq!(delayed.len(),4);assert_eq!(delayed.iter().filter(|entry|crate::audio::is_manual_queue_entry(entry)).count(),2);
+                let mut confirmed=vec![current.clone(),added.clone(),added.clone(),added.clone()];queue.reconcile_manual(&mut confirmed,&current.id,0);
+                assert_eq!(confirmed.len(),4);assert_eq!(confirmed.iter().filter(|entry|crate::audio::is_manual_queue_entry(entry)).count(),2);
+                queue.reset();assert!(queue.manual_pending.is_empty());
+            }
+            #[test]
+            fn confirmed_native_uid_does_not_resurrect_after_external_queue_clear() {
+                let current=track('a');let added=track('b');
+                let mut snapshot=Snapshot {now:current.clone(),queue:Arc::new(vec![current.clone()]),..Default::default()};
+                let mut queue=Queue::default();queue.note_added(&added,&mut snapshot);
+                let mut native=added.clone();native.raw["spotify_queue_uid"]=json!("manual-uid");
+                let mut observed=vec![current.clone(),native];queue.reconcile_manual(&mut observed,&current.id,0);
+                assert!(!queue.has_pending_manual());assert!(crate::audio::is_manual_queue_entry(&observed[1]));
+                let mut cleared=vec![current.clone()];queue.reconcile_manual(&mut cleared,&current.id,0);assert_eq!(cleared.len(),1);
+                let mut context=added;context.raw["spotify_queue_uid"]=json!("context-uid");
+                let mut later=vec![current.clone(),context];queue.reconcile_manual(&mut later,&current.id,0);
+                assert!(!crate::audio::is_manual_queue_entry(&later[1]));
+            }
+            #[test]
+            fn artist_metadata_survives_unconfirmed_remote_queue_order() {
+                let mut current = track('a');
+                current.subtitle = "Artist".into();
+                current.artist_id = "spotify:artist:example".into();
+                let mut queue = Queue { items: Arc::new(vec![current.clone(), track('b')]), window_end: 2, ..Default::default() };
+                let mut snapshot = Snapshot { now: current, ..Default::default() };
+                snapshot.now.subtitle.clear();
+                snapshot.now.artist_id.clear();
+                let state = state::Snapshot { upcoming: vec![json!({"item":{"uri":track('c').id}})], ..Default::default() };
+                queue.observe(&mut snapshot, &state);
+                assert_eq!(snapshot.now.subtitle, "Artist");
+                assert_eq!(snapshot.now.artist_id, "spotify:artist:example");
+            }
+            #[test]
             fn pending_play_ignores_stale_previous_track_and_position() {
                 let a = track('a');
                 let b = track('b');
@@ -3523,64 +4099,83 @@ pub(crate) mod playback {
     }
     pub(crate) use playback_queue::Queue;
 
+    fn native_queue_additions(command: &Command) -> Result<Option<Vec<String>>, String> {
+        let entries: Vec<&Entry> = match command {
+            Command::QueueAddLast(entry) => vec![entry],
+            Command::QueueAddMany(entries) => entries.iter().collect(),
+            _ => return Ok(None),
+        };
+        let mut uris = Vec::new();
+        for entry in entries {
+            let uri = &entry.id;
+            let mut parts = uri.split(':');
+            if parts.next() != Some("spotify") || !matches!(parts.next(), Some("track" | "episode"))
+                || !parts.next().is_some_and(|id| id.len()==22 && id.bytes().all(|b|b.is_ascii_alphanumeric())) || parts.next().is_some() {
+                return Err("Only valid Spotify tracks and episodes can be queued".into());
+            }
+            uris.push(uri.clone());
+        }
+        Ok(Some(uris))
+    }
+    #[cfg(test)]
+    #[test]
+    fn native_queue_additions_validate_the_whole_batch_and_preserve_order() {
+        let a = Entry { id: "spotify:track:1111111111111111111111".into(), ..Default::default() };
+        let b = Entry { id: "spotify:episode:2222222222222222222222".into(), ..Default::default() };
+        assert_eq!(native_queue_additions(&Command::QueueAddMany(vec![a.clone(),b.clone()])).unwrap(),Some(vec![a.id.clone(),b.id]));
+        assert!(native_queue_additions(&Command::QueueAddMany(vec![a,Entry {id:"foreign".into(),..Default::default()}])).is_err());
+        assert!(native_queue_additions(&Command::QueueInsertNext(Box::default())).unwrap().is_none());
+    }
+
     pub(crate) fn dispatch(
         command: &Command,
         handle: &Handle,
         snapshot: &mut Snapshot,
         queue: &mut Queue,
     ) -> Result<(), String> {
+        queue.check_current()?;
+        if let Some(uris) = native_queue_additions(command)? {
+            for uri in uris {
+                queue.check_current()?;
+                handle.control(&Control::AddToQueue(uri.clone()))?;
+                queue.check_current()?;
+                let entry=match command {Command::QueueAddLast(entry)=>Some(entry.as_ref()),Command::QueueAddMany(entries)=>entries.iter().find(|entry|entry.id==uri),_=>None};
+                if let Some(entry)=entry {queue.note_added(entry,snapshot);}
+            }
+            snapshot.message = "Spotify queue addition acknowledged".into();
+            return Ok(());
+        }
         if matches!(
             command,
             Command::PlayEntry(..)
                 | Command::PlayQueueIndex(_)
-                | Command::QueueAddLast(_)
+                | Command::QueueAddLast(_) | Command::QueueAddMany(_)
                 | Command::QueueInsertNext(_)
                 | Command::QueueClear
                 | Command::QueueMove { .. }
         ) {
-            // Explicit local play must address the paired Soloist, even when another
-            // Connect device was active. Never move playback for a queue-only edit.
-            let local = handle
-                .snapshot()
-                .filter(|s| s.connected && s.logged_in)
+            let local = handle.snapshot().filter(|s| s.connected && s.logged_in)
                 .ok_or("Pair Soloist in Spotify before starting local playback")?;
-            if local.is_active {
-                // The queue request obtains a fresh active device; validate it there.
+            if matches!(command, Command::PlayEntry(..) | Command::PlayQueueIndex(_)) {
+                let managed_name = super::soloist::managed_device_name();
+                let mut devices = super::web_devices::devices()?;
+                for _ in 0..5 {
+                    if devices.as_array().into_iter().flatten().any(|d| d["is_restricted"]==false && d["name"].as_str().is_some_and(|name| name == managed_name || (!local.device_name.is_empty() && name == local.device_name))) { break; }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    devices = super::web_devices::devices()?;
+                }
+                let matches: Vec<_> = devices.as_array().into_iter().flatten()
+                    .filter(|d| d["is_restricted"]==false && d["name"].as_str().is_some_and(|name| name == managed_name || (!local.device_name.is_empty() && name == local.device_name)))
+                    .collect();
+                let target = matches.iter().find(|d| d["is_active"]==true).copied()
+                    .or_else(|| (matches.len()==1).then(||matches[0]))
+                    .ok_or("Soloist device unavailable or ambiguous; refresh Spotify Connect devices")?;
+                snapshot.now.raw["spotify_device_id"] = target["id"].clone();
+                snapshot.now.raw["spotify_local_device_name"] = Value::Null;
+            } else {
+                if !local.is_active { return Err("Soloist is no longer the active device; refresh before editing its queue".into()); }
                 snapshot.now.raw["spotify_device_id"] = Value::Null;
                 snapshot.now.raw["spotify_local_device_name"] = json!(local.device_name);
-            } else {
-                let devices = super::web_devices::devices()?;
-                let matches: Vec<_> = devices
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter(|d| {
-                        d["name"].as_str() == Some(local.device_name.as_str())
-                            && d["is_restricted"] == false
-                    })
-                    .collect();
-                let target = matches
-                .iter()
-                .find(|d| d["is_active"] == true)
-                .copied()
-                .or_else(|| (matches.len() == 1).then(|| matches[0]))
-                .ok_or(
-                    "Soloist device is unavailable or ambiguous; refresh Spotify Connect devices",
-                )?;
-                let device = target["id"].as_str().ok_or("Invalid Soloist device")?;
-                if target["is_active"] != true {
-                    if !matches!(command, Command::PlayEntry(..) | Command::PlayQueueIndex(_)) {
-                        return Err(
-                        "Soloist is no longer the active device; refresh before editing its queue"
-                            .into(),
-                    );
-                    }
-                    super::web::device_command(
-                        json!({"action":"transfer","device":device,"playing":false,"confirm":false}),
-                    )?;
-                }
-                snapshot.now.raw["spotify_device_id"] = json!(device);
-                snapshot.now.raw["spotify_local_device_name"] = Value::Null;
             }
         }
         // Queue edits use native HTTP; Soloist remains the playback device.
@@ -3626,7 +4221,7 @@ pub(crate) mod playback {
                 }
                 .into(),
             ),
-            Command::QueueAddLast(_)
+            Command::QueueAddLast(_) | Command::QueueAddMany(_)
             | Command::QueueInsertNext(_)
             | Command::QueueClear
             | Command::QueueMove { .. } => unreachable!(),
@@ -3640,6 +4235,7 @@ pub(crate) mod playback {
             Command::Login(_) | Command::LoginSaved | Command::Logout => {
                 return Err("Use Spotify account authorization for this provider".into())
             }
+            Command::Selection(..) => return Err("Playback selection envelope was not dispatched".into()),
             Command::Discord(_) | Command::Quit => return Ok(()),
         };
         handle.control(&control).map(|_| ())
@@ -3681,21 +4277,39 @@ pub(crate) mod playback {
         snapshot.radio_active = false;
         snapshot.eq = Value::Null;
         snapshot.quality.clear(); // No documented Soloist quality telemetry.
+        managed.poll_metadata();
+        managed.remember_snapshot(snapshot);
         snapshot.now = entity_entry(&state.item).unwrap_or_default();
+        managed.enrich(&mut snapshot.now);
+        if let Some(name)=state.context.pointer("/decorations/identity/name").or_else(||state.context.get("name")).and_then(Value::as_str).filter(|name|!name.is_empty()) {
+            snapshot.now.raw["spotify_context_name"]=json!(name);
+        }
+
         snapshot.title = snapshot.now.title.clone();
-        if !managed.observe(snapshot, &state) {
+        let observed_current=snapshot.now.clone();
+        let matched=managed.observe(snapshot, &state);
+        if !matched || managed.has_pending_manual() {
             let mut queue = Vec::with_capacity(state.upcoming.len() + 1);
-            if !snapshot.now.id.is_empty() {
-                queue.push(snapshot.now.clone());
+            if !observed_current.id.is_empty() {
+                queue.push(observed_current.clone());
             }
             queue.extend(
                 state
                     .upcoming
                     .iter()
-                    .filter_map(|v| entity_entry(&v["item"])),
+                    .filter_map(|v| {
+                        let mut entry=entity_entry(&v["item"])?;
+                        entry.raw["spotify_queue_uid"]=v["uid"].clone();
+                        entry.raw["spotify_manual_queue"]=json!(v["provider"]=="queue" || v["is_queued"]==true || v["metadata"]["is_queued"]=="true" || v["metadata"]["is_queued"]==true || v["item"]["metadata"]["is_queued"]=="true");
+                        managed.enrich(&mut entry);
+                        Some(entry)
+                    }),
             );
-            replace_queue_if_changed(snapshot, queue);
-            snapshot.queue_index = 0;
+            managed.reconcile_manual(&mut queue,&observed_current.id,state.position_ms);
+            if !matched {replace_queue_if_changed(snapshot, queue);snapshot.queue_index = 0;}
+        }
+        if let Some(name)=state.context.pointer("/decorations/identity/name").or_else(||state.context.get("name")).and_then(Value::as_str).filter(|name|!name.is_empty()) {
+            snapshot.now.raw["spotify_context_name"]=json!(name);
         }
         // Soloist may omit decorations in an incremental item event. Catalog
         // metadata belongs to the same URI and is a valid duration fallback.
@@ -3708,6 +4322,8 @@ pub(crate) mod playback {
         if let Some(error) = &state.last_error {
             snapshot.message.clone_from(error);
         }
+        managed.request_metadata(snapshot);
+
     }
     fn replace_queue_if_changed(snapshot: &mut Snapshot, queue: Vec<Entry>) {
         if *snapshot.queue != queue {
@@ -3912,6 +4528,8 @@ pub(crate) mod remote {
                         apply(&mut s, Some(&state), now_ms());
                         queue.observe_remote(&mut s, &state);
                         s.now.raw["spotify_device_id"] = state["device"]["id"].clone();
+        s.now.raw["spotify_remote_playback"] = json!(true);
+        s.now.raw["spotify_device_name"] = state["device"]["name"].clone();
                         if let Some((_, cmd, expected)) = command {
                             if !current(epoch, live.load(Ordering::SeqCst)) {
                                 return Ok(None);
@@ -4067,7 +4685,7 @@ pub(crate) mod remote {
                 | Command::QueueClear
                 | Command::QueueMove { .. }
                 | Command::QueueInsertNext(_)
-                | Command::QueueAddLast(_)
+                | Command::QueueAddLast(_) | Command::QueueAddMany(_)
         ) && (expected.now.id != s.now.id
             || expected.queue_index != s.queue_index
             || expected
@@ -4233,6 +4851,8 @@ pub(crate) mod remote {
         }
         s.now.duration = s.duration;
         s.now.raw["spotify_device_id"] = state["device"]["id"].clone();
+        s.now.raw["spotify_remote_playback"] = json!(true);
+        s.now.raw["spotify_device_name"] = state["device"]["name"].clone();
         s.title = s.now.title.clone();
         s.shuffle = state["options"]["shuffling_context"]
             .as_bool()
@@ -4647,6 +5267,8 @@ pub(crate) mod web {
                 }
                 let target = if action == "transfer" {
                     &c["device"]
+                } else if action == "play" && c["expected"]["device"].as_str().is_some_and(id) {
+                    &c["expected"]["device"]
                 } else {
                     &state["active_device_id"]
                 };
@@ -4852,6 +5474,37 @@ pub(crate) mod web {
                     )
                     .unwrap();
                     assert!(transferred);
+                }
+                #[test]
+                fn clear_manual_queue_does_not_replace_context_or_transport_options() {
+                    let mut writes = 0;
+                    execute_with(&json!({"action":"queue","next_tracks":[],"expected":{"device":"soloist","uri":"spotify:track:current","revision":"rev1"}}), &mut |method,path,body| {
+                        if method == "GET" { return Ok((200,cluster())); }
+                        writes += 1;
+                        assert_eq!(path,"player/command/from/origin/to/soloist");
+                        let command=&body.unwrap()["command"];
+                        assert_eq!(command["endpoint"],"set_queue");
+                        assert_eq!(command["next_tracks"],json!([]));
+                        assert_eq!(command["queue_revision"],"rev1");
+                        assert!(command.get("context").is_none());
+                        assert!(command.get("options").is_none());
+                        assert!(command.get("repeating_context").is_none());
+                        assert!(command.get("repeating_track").is_none());
+                        Ok((202,Value::Null))
+                    }).unwrap();
+                    assert_eq!(writes,1);
+                }
+                #[test]
+                fn explicit_play_addresses_device_without_an_active_device() {
+                    let mut writes = 0;
+                    execute_with(&json!({"action":"play","expected":{"device":"soloist"},"descriptor":{"context":{"uri":"spotify:track:chosen"},"options":{}}}), &mut |method,path,body| {
+                        if method == "GET" { let mut state=cluster(); state["active_device_id"]=Value::Null; return Ok((200,state)); }
+                        writes += 1;
+                        assert_eq!(path,"player/command/from/origin/to/soloist");
+                        assert_eq!(body.unwrap()["command"]["endpoint"],"play");
+                        Ok((202,Value::Null))
+                    }).unwrap();
+                    assert_eq!(writes,1);
                 }
                 fn cluster() -> Value {
                     json!({"active_device_id":"soloist", "devices":{"soloist":{"can_play":true,"capabilities":{"is_controllable":true}}},
@@ -6056,11 +6709,14 @@ mod web_catalog {
         if title.is_empty() || title.len() > 300 {
             return Err("Enter a playlist name".into());
         }
-        let mut body = json!({"playlistUri": playlist, "newName": title});
+        let mut values = json!({"name": title});
         if name == "DZUpdatePlaylistJSON" {
-            body["newDescription"] = json!(arg(args, 2)?);
+            values["description"] = json!(arg(args, 2)?);
         }
-        Ok(("editPlaylistAttributes".into(), body))
+        Ok((
+            format!("https://spclient.wg.spotify.com/playlist/v2/playlist/{}/changes", playlist.rsplit(':').next().unwrap()),
+            playlist_changes(playlist_attributes(values)),
+        ))
     }
     fn uri(args: &[Value], n: usize, kinds: &[&str]) -> Result<String, String> {
         let value = arg(args, n)?;
@@ -6683,17 +7339,27 @@ mod web_catalog {
         let value = web::rest_get(&format!(
         "https://spclient.wg.spotify.com/inspiredby-mix/v2/seed_to_playlist/{uri}?response-format=json"
     ))?;
-        let playlist_uri = [
-            value.get("uri"),
-            value.get("playlist_uri"),
-            value.pointer("/playlist/uri"),
-        ]
-        .into_iter()
-        .flatten()
-        .find_map(Value::as_str)
-        .filter(|s| s.starts_with("spotify:playlist:"))
-        .ok_or("Spotify radio did not return a playlist")?;
-        playlist(playlist_uri, 0)
+        playlist(radio_playlist_uri(&value)?, 0)
+    }
+    fn radio_playlist_uri(value: &Value) -> Result<&str, String> {
+        // The Web Player's go-to-radio action reads body.mediaItems[0].uri.
+        value["mediaItems"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.get("uri"))
+            .chain(
+                [
+                    value.get("uri"),
+                    value.get("playlist_uri"),
+                    value.pointer("/playlist/uri"),
+                ]
+                .into_iter()
+                .flatten(),
+            )
+            .filter_map(Value::as_str)
+            .find(|s| s.starts_with("spotify:playlist:") && s.len() > "spotify:playlist:".len())
+            .ok_or_else(|| "Spotify radio did not return a playlist".into())
     }
     fn flow_options() -> ResultValue {
         Ok(json!({"options":super::flow::MOODS.iter().map(|(id,title)|
@@ -6866,8 +7532,35 @@ mod web_catalog {
         }
         Ok(json!({"items":items}))
     }
+    fn playlist_attributes(values: Value) -> Value {
+        json!({"kind":6,"updateListAttributes":{"newAttributes":{"values":values,"noValue":[]}}})
+    }
+    fn playlist_changes(op: Value) -> Value {
+        json!({"deltas":[{"ops":[op],"info":{"source":{"client":5}}}],
+            "wantResultingRevisions":false,"wantSyncResult":false,"nonces":[]})
+    }
+    fn playlist_library_request(username: &str, playlist: &str, save: bool) -> (String, Value) {
+        let mut url = url::Url::parse("https://spclient.wg.spotify.com/playlist/v2/user/").unwrap();
+        url.path_segments_mut().unwrap().pop_if_empty().push(username).push("rootlist").push("changes");
+        let op = if save {
+            json!({"kind":2,"add":{"items":[{"uri":playlist}],"addFirst":true}})
+        } else {
+            json!({"kind":3,"rem":{"items":[{"uri":playlist}],"itemsAsKey":true}})
+        };
+        (url.into(), playlist_changes(op))
+    }
     fn mutate_library(uri: &str, save: bool) -> ResultValue {
-        mutate_library_with(uri, save, web::mutation)
+        // Pathfinder's library mutation excludes playlists. They belong to the user's rootlist.
+        if uri.starts_with("spotify:playlist:") {
+            let account = web::account()?;
+            let username = account["id"].as_str().filter(|s| !s.is_empty())
+                .ok_or("Spotify account identity is unavailable; sign in again")?;
+            let (url, body) = playlist_library_request(username, uri, save);
+            web::rest_request("POST", &url, Some(&body))?;
+            Ok(json!(1))
+        } else {
+            mutate_library_with(uri, save, web::mutation)
+        }
     }
     fn mutate_library_with(
         uri: &str,
@@ -7302,9 +7995,8 @@ mod web_catalog {
                 Ok(json!(1))
             }
             "DZRenamePlaylist" | "DZUpdatePlaylistJSON" => {
-                let (operation, variables) = playlist_details_request(name, args)?;
-                let result = web::mutation(&operation, variables)?;
-                confirmed(&result)?;
+                let (url, body) = playlist_details_request(name, args)?;
+                web::rest_request("POST", &url, Some(&body))?;
                 Ok(json!(1))
             }
             "DZCreatePlaylist" => {
@@ -7314,11 +8006,12 @@ mod web_catalog {
                 }
                 let v = web::rest_request(
                     "POST",
-                    "https://api.spotify.com/v1/me/playlists",
-                    Some(&json!({"name":name,"public":false})),
+                    "https://spclient.wg.spotify.com/playlist/v2/playlist",
+                    Some(&json!({"ops":[playlist_attributes(json!({"name":name}))]})),
                 )?;
                 let u = text(&v, &["uri"]);
                 if u.starts_with("spotify:playlist:") {
+                    mutate_library(u, true)?;
                     Ok(json!({"id":u,"uri":u}))
                 } else {
                     Err("Spotify did not return the created playlist URI".into())
@@ -7356,7 +8049,26 @@ mod web_catalog {
     mod tests {
         use super::*;
         #[test]
-        fn playlist_details_use_web_player_fields_and_validate_id() {
+        fn radio_resolves_web_player_media_items() {
+            let response = json!({"uri":"spotify:track:seed", "mediaItems":[
+                {"uri":"spotify:playlist:radio"}
+            ]});
+            assert_eq!(radio_playlist_uri(&response).unwrap(), "spotify:playlist:radio");
+            for response in [
+                json!({"uri":"spotify:playlist:radio"}),
+                json!({"playlist_uri":"spotify:playlist:radio"}),
+                json!({"playlist":{"uri":"spotify:playlist:radio"}}),
+            ] {
+                assert_eq!(radio_playlist_uri(&response).unwrap(), "spotify:playlist:radio");
+            }
+            for response in [json!({}), json!({"mediaItems":[]}),
+                json!({"mediaItems":[{"uri":"spotify:track:seed"}]}),
+                json!({"uri":"spotify:playlist:"})] {
+                assert!(radio_playlist_uri(&response).is_err());
+            }
+        }
+        #[test]
+        fn playlist_details_use_native_attributes_and_validate_id() {
             let id = "1234567890123456789012";
             let (operation, body) = playlist_details_request(
                 "DZUpdatePlaylistJSON",
@@ -7367,17 +8079,11 @@ mod web_catalog {
                 ],
             )
             .unwrap();
-            assert_eq!(operation, "editPlaylistAttributes");
-            assert_eq!(
-                body,
-                json!({"playlistUri":format!("spotify:playlist:{id}"), "newName":"New name", "newDescription":""})
-            );
+            assert_eq!(operation, format!("https://spclient.wg.spotify.com/playlist/v2/playlist/{id}/changes"));
+            assert_eq!(body["deltas"][0]["ops"][0], playlist_attributes(json!({"name":"New name","description":""})));
             let (_, body) =
                 playlist_details_request("DZRenamePlaylist", &[json!(id), json!("Name")]).unwrap();
-            assert_eq!(
-                body,
-                json!({"playlistUri":format!("spotify:playlist:{id}"), "newName":"Name"})
-            );
+            assert_eq!(body["deltas"][0]["ops"][0], playlist_attributes(json!({"name":"Name"})));
             assert!(playlist_details_request(
                 "DZRenamePlaylist",
                 &[json!("invalid"), json!("Name")]
@@ -7385,8 +8091,17 @@ mod web_catalog {
             .is_err());
         }
         #[test]
+        fn playlist_library_mutations_use_rootlist_and_uri_keys() {
+            let uri = "spotify:playlist:1234567890123456789012";
+            let (url, body) = playlist_library_request("user/name", uri, true);
+            assert_eq!(url, "https://spclient.wg.spotify.com/playlist/v2/user/user%2Fname/rootlist/changes");
+            assert_eq!(body["deltas"][0]["ops"][0], json!({"kind":2,"add":{"items":[{"uri":uri}],"addFirst":true}}));
+            let (_, body) = playlist_library_request("user", uri, false);
+            assert_eq!(body["deltas"][0]["ops"][0], json!({"kind":3,"rem":{"items":[{"uri":uri}],"itemsAsKey":true}}));
+        }
+        #[test]
         fn library_mutations_send_library_item_uris_and_require_confirmation() {
-            for kind in ["playlist", "album", "track", "episode", "show"] {
+            for kind in ["album", "track", "episode", "show"] {
                 let uri = format!("spotify:{kind}:1234567890123456789012");
                 for save in [true, false] {
                     let result = mutate_library_with(&uri, save, |operation, variables| {
@@ -7663,8 +8378,22 @@ pub(crate) mod web_devices {
         super::web::device_command(json!({"action":"state"}))
     }
 
+    // Retry only reads during Connect's brief activation/cluster propagation gap.
+    // Mutating requests are never replayed: an error may follow an accepted command.
+    fn settled_read<T>(mut read: impl FnMut() -> Result<T, String>) -> Result<T, String> {
+        for attempt in 0..3 {
+            match read() {
+                Err(error) if attempt < 2 && matches!(error.as_str(), "Invalid Spotify Connect cluster" | "No active Spotify playback device; select a device first") => {
+                    crate::spotify_diagnostics::record("connect.read.retry", &format!("attempt={} reason={}", attempt+1, error));
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                result => return result,
+            }
+        }
+        unreachable!()
+    }
     pub(crate) fn devices() -> Result<Value, String> {
-        normalize_devices(&state()?)
+        settled_read(|| normalize_devices(&state()?))
     }
 
     fn normalize_devices(cluster: &Value) -> Result<Value, String> {
@@ -7765,6 +8494,9 @@ pub(crate) mod web_devices {
         normalize_snapshot(&state()?)
     }
     pub(crate) fn playback_target() -> Result<Value, String> {
+        settled_read(playback_target_once)
+    }
+    fn playback_target_once() -> Result<Value, String> {
         let cluster = state()?;
         if cluster["active_device_id"]
             .as_str()
@@ -7892,6 +8624,15 @@ pub(crate) mod web_devices {
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[test]
+        fn transient_cluster_reads_retry_but_permanent_errors_do_not() {
+            let mut reads=0;
+            let result=settled_read(|| { reads+=1; if reads==1 {Err("Invalid Spotify Connect cluster".into())} else {Ok(7)} });
+            assert_eq!(result,Ok(7));assert_eq!(reads,2);
+            let mut reads=0;
+            let result:Result<(),String>=settled_read(|| {reads+=1;Err("Spotify active device changed; refresh before editing playback".into())});
+            assert!(result.is_err());assert_eq!(reads,1);
+        }
         fn fixture() -> Value {
             json!({"active_device_id":"speaker","devices":{
             "observer":{"device_id":"observer","capabilities":{"hidden":true}},
@@ -8251,15 +8992,24 @@ pub(crate) mod service {
                 if self.checked.elapsed() < Duration::from_secs(1) {
                     return false;
                 }
+            self.refresh()
+        }
+        fn refresh(&mut self) -> bool {
                 self.checked = Instant::now();
                 let Ok(endpoint) = self.read() else {
                     return false;
                 };
                 observe(&mut self.endpoint, endpoint)
             }
+        pub fn available(&self) -> bool {
+            self.endpoint.is_some()
+        }
+        pub fn changed_now(&mut self) -> bool {
+            self.refresh()
+        }
         }
         fn observe(previous: &mut Option<String>, endpoint: Option<String>) -> bool {
-            let changed = endpoint.is_some() && *previous != endpoint;
+        let changed = *previous != endpoint;
             *previous = endpoint;
             changed
         }
@@ -8279,7 +9029,7 @@ pub(crate) mod service {
                 let mut previous = Some("speakers".into());
                 assert!(!observe(&mut previous, Some("speakers".into())));
                 assert!(observe(&mut previous, Some("headphones".into())));
-                assert!(!observe(&mut previous, None));
+            assert!(observe(&mut previous, None));
                 assert!(observe(&mut previous, Some("headphones".into())));
                 assert!(!observe(&mut previous, Some("headphones".into())));
             }
@@ -8319,10 +9069,30 @@ pub(crate) mod service {
     pub(crate) struct Service {
         status: Arc<Mutex<Status>>,
         stop: Arc<AtomicBool>,
-        worker: Option<JoinHandle<()>>,
         handle: Arc<Handle>,
     }
     static ACTIVE: Mutex<Option<Weak<Handle>>> = Mutex::new(None);
+    pub(crate) fn shutdown() -> Result<(), String> {
+        let handle = ACTIVE
+            .lock()
+            .map_err(|_| "Spotify supervisor unavailable")?
+            .take()
+            .and_then(|h| h.upgrade());
+        if let Some(handle) = handle {
+            handle.stop.store(true, Ordering::Release);
+            if let Some(worker) = handle
+                .worker
+                .lock()
+                .map_err(|_| "Spotify supervisor unavailable")?
+                .take()
+            {
+                worker
+                    .join()
+                    .map_err(|_| "Spotify supervisor shutdown failed")?;
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn reopen_output() -> Result<(), String> {
         let handle = ACTIVE
             .lock()
@@ -8373,10 +9143,17 @@ pub(crate) mod service {
         status: Arc<Mutex<Status>>,
         commands: mpsc::SyncSender<Request>,
         stop: Arc<AtomicBool>,
+        worker: Mutex<Option<JoinHandle<()>>>,
     }
     impl Drop for Handle {
         fn drop(&mut self) {
+            crate::spotify_diagnostics::record("supervisor.stop", "last_owner_dropped");
             self.stop.store(true, Ordering::Relaxed);
+            if let Ok(worker) = self.worker.get_mut() {
+                if let Some(worker) = worker.take() {
+                    let _ = worker.join();
+                }
+            }
         }
     }
     impl Handle {
@@ -8390,6 +9167,7 @@ pub(crate) mod service {
                 .unwrap_or_else(|_| Status::new(Phase::Failed, "Spotify status unavailable"))
         }
         pub fn control(&self, command: &Control) -> Result<serde_json::Value, String> {
+            crate::spotify_diagnostics::record("soloist.control.request", command.log_name());
             let (reply, rx) = mpsc::sync_channel(1);
             self.commands
                 .try_send(Request {
@@ -8404,6 +9182,7 @@ pub(crate) mod service {
     }
     impl Service {
         pub fn start() -> Result<Self, String> {
+            crate::spotify_diagnostics::record("supervisor.start", "requested");
             let mut active = ACTIVE
                 .lock()
                 .map_err(|_| "Spotify supervisor unavailable")?;
@@ -8413,9 +9192,8 @@ pub(crate) mod service {
                 .filter(|h| !matches!(h.status().phase, Phase::Failed | Phase::Stopped))
             {
                 return Ok(Self {
-                    status: handle.status.clone(),
+                    status: { crate::spotify_diagnostics::record("supervisor.start", "reused"); handle.status.clone() },
                     stop: handle.stop.clone(),
-                    worker: None,
                     handle,
                 });
             }
@@ -8451,12 +9229,16 @@ pub(crate) mod service {
                 status: status.clone(),
                 commands,
                 stop: stop.clone(),
+                worker: Mutex::new(None),
             });
             let worker = thread::Builder::new()
             .name("spotify-pairing".into())
             .spawn(move || {
                 let publish = |state: Status| {
                     if let Ok(mut current) = output.lock() {
+                        if current.phase != state.phase {
+                            crate::spotify_diagnostics::record("supervisor.phase", &format!("{:?} -> {:?}", current.phase, state.phase));
+                        }
                         *current = state;
                     }
                 };
@@ -8491,13 +9273,30 @@ pub(crate) mod service {
                 let mut awaiting_since = None;
                 let mut last_connected = Instant::now();
                 let mut restore: Option<OutputRecovery> = None;
+                let mut output_lost = false;
+                let mut restart_output = false;
+                let mut pending_failure: Option<(String, Instant)> = None;
                 while !stopped.load(Ordering::Relaxed) {
                     let requested = reopen_requested.swap(false, Ordering::AcqRel);
                     let output_changed = output_watcher.changed();
-                    if requested || output_changed {
+                    if output_changed && !output_watcher.available() {
+                        output_lost = true;
+                        publish(Status::new(Phase::Connecting, "Waiting for a Spotify audio output..."));
+                    }
+                    if output_lost && !output_watcher.available() {
+                        thread::sleep(Duration::from_millis(150));
+                        continue;
+                    }
+                    if requested || output_changed || restart_output || output_lost {
+                        output_lost = false;
+                        restart_output = false;
+                        pending_failure = None;
                         let previous = restore.take().map(|recovery| recovery.previous).or_else(||
                             player.snapshot().ok().filter(|s| s.connected && s.logged_in && s.is_active
-                                && matches!(s.status.as_str(), "playing" | "paused")));
+                                && matches!(s.status.as_str(), "playing" | "paused"))).or_else(||
+                            snapshots.lock().ok().and_then(|s| s.as_ref().map(|s| (**s).clone()))
+                                .filter(|s| s.connected && s.logged_in && s.is_active
+                                    && matches!(s.status.as_str(), "playing" | "paused")));
                         publish(Status::new(Phase::Connecting, "Reopening Spotify audio output..."));
                         if let Ok(mut target) = _published.0.lock() { *target = None; }
                         // Keep the last confirmed track visible while the output is reopened.
@@ -8534,11 +9333,13 @@ pub(crate) mod service {
                         } else {
                             Err("Spotify playback request expired before dispatch".into())
                         };
+                        crate::spotify_diagnostics::record("soloist.control.result", &format!("{} {}", req.command.log_name(), if result.is_ok() { "ok" } else { "failed" }));
                         let _ = req.reply.send(result);
                         request = requests.try_recv().ok();
                     }
                     match player.snapshot() {
                         Ok(snapshot) => {
+                            pending_failure = None;
                             if let Some(recovery) = &mut restore {
                                 match recovery.advance(&snapshot, |command| player.control(command).map(|_| ())) {
                                     Ok(true) => { restore = None; continue; }
@@ -8577,8 +9378,21 @@ pub(crate) mod service {
                             publish(status);
                         }
                         Err(error) => {
-                            publish(Status::new(Phase::Failed, error));
-                            return;
+                            // The process can exit before the periodic endpoint poll sees a change.
+                            if output_watcher.changed_now() {
+                                if output_watcher.available() {
+                                    restart_output = true;
+                                } else {
+                                    output_lost = true;
+                                }
+                                continue;
+                            }
+                            let failure = pending_failure.get_or_insert_with(|| (error, Instant::now()));
+                            if failure.1.elapsed() >= Duration::from_secs(2) {
+                                publish(Status::new(Phase::Failed, failure.0.clone()));
+                                return;
+                            }
+                            thread::sleep(Duration::from_millis(150));
                         }
                     }
                 }
@@ -8587,10 +9401,13 @@ pub(crate) mod service {
                 publish(Status::new(Phase::Stopped, "Spotify playback stopped."));
             })
             .map_err(|_| "Could not start Spotify pairing")?;
+            *handle
+                .worker
+                .lock()
+                .map_err(|_| "Spotify supervisor unavailable")? = Some(worker);
             Ok(Self {
                 status,
                 stop,
-                worker: Some(worker),
                 handle,
             })
         }
@@ -8601,14 +9418,6 @@ pub(crate) mod service {
                 .unwrap_or_else(|_| {
                     Status::new(Phase::Failed, "Spotify pairing status unavailable.")
                 })
-        }
-    }
-    impl Drop for Service {
-        fn drop(&mut self) {
-            self.stop.store(true, Ordering::Relaxed);
-            if let Some(worker) = self.worker.take() {
-                let _ = worker.join();
-            }
         }
     }
     fn connection_status(snapshot: &Snapshot) -> Status {
@@ -8766,8 +9575,16 @@ pub(crate) mod service {
         }
         #[test]
         fn failed_startup_is_reported_without_blocking_the_caller() {
-            let mut service = Service::start_with(|_| Err("fixture failure".into())).unwrap();
-            service.worker.take().unwrap().join().unwrap();
+            let service = Service::start_with(|_| Err("fixture failure".into())).unwrap();
+            service
+                .handle
+                .worker
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .join()
+                .unwrap();
             assert_eq!(
                 service.status(),
                 Status::new(Phase::Failed, "fixture failure")
@@ -8775,13 +9592,21 @@ pub(crate) mod service {
         }
         #[test]
         fn cancellation_during_startup_cannot_publish_ready() {
-            let mut service = Service::start_with(|_| {
+            let service = Service::start_with(|_| {
                 thread::sleep(Duration::from_millis(50));
                 Err("cancelled startup".into())
             })
             .unwrap();
             service.stop.store(true, Ordering::Relaxed);
-            service.worker.take().unwrap().join().unwrap();
+            service
+                .handle
+                .worker
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .join()
+                .unwrap();
             assert_eq!(service.status().phase, Phase::Stopped);
         }
         #[test]
@@ -8845,7 +9670,7 @@ pub(crate) mod service {
                 })
                 .unwrap()
             };
-            let mut service = start();
+            let service = start();
             let began = Instant::now();
             while service.status().phase != Phase::Pairing {
                 assert!(
@@ -8891,18 +9716,25 @@ pub(crate) mod service {
                 );
                 thread::sleep(Duration::from_millis(20));
             }
+            *ACTIVE.lock().unwrap() = Some(Arc::downgrade(&service.handle));
+            let second = Service::start().unwrap();
+            assert!(Arc::ptr_eq(&service.handle, &second.handle));
             let handle = service.handle();
             let target = handle.audio_target.lock().unwrap().clone().unwrap();
             drop(service);
+            assert!(target.is_alive());
+            assert!(!second.stop.load(Ordering::Relaxed));
+            drop(second);
+            assert!(target.is_alive());
+            drop(handle);
             assert!(!target.is_alive());
-            assert_eq!(handle.status().phase, Phase::Stopped);
             let lock = std::fs::OpenOptions::new()
                 .write(true)
                 .share_mode(0)
                 .open(data.join("deeznats.lock"))
                 .unwrap();
             drop(lock);
-            let mut restored = start();
+            let restored = start();
             let began = Instant::now();
             while restored.status().phase != Phase::Ready {
                 assert_ne!(
@@ -8918,7 +9750,15 @@ pub(crate) mod service {
                 "paired"
             );
             restored.stop.store(true, Ordering::Relaxed);
-            restored.worker.take().unwrap().join().unwrap();
+            restored
+                .handle
+                .worker
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .join()
+                .unwrap();
         }
     }
 }
@@ -10215,6 +11055,42 @@ pub(crate) mod setup {
 }
 pub(crate) mod soloist {
     //! Reusable Soloist lifecycle and command API. Owns no Deezer/UI state.
+    fn device_name_for_username(username: Option<&str>) -> String {
+        match username
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && !name.chars().any(char::is_control))
+        {
+            Some(name) => format!("DeezNats - {name}"),
+            None => "DeezNats".into(),
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn device_names_use_valid_usernames_and_fall_back_safely() {
+        assert_eq!(device_name_for_username(Some("Alice")), "DeezNats - Alice");
+        assert_eq!(device_name_for_username(Some("?pek")), "DeezNats - ?pek");
+        assert_eq!(device_name_for_username(None), "DeezNats");
+        assert_eq!(device_name_for_username(Some("  ")), "DeezNats");
+        assert_eq!(device_name_for_username(Some("a\nb")), "DeezNats");
+        assert!(managed_device_name().starts_with("DeezNats"));
+    }
+
+    pub(super) fn managed_device_name() -> String {
+        let mut buffer = [0u16; 257];
+        let mut size = buffer.len() as u32;
+        let username = unsafe {
+            windows_sys::Win32::System::WindowsProgramming::GetUserNameW(
+                buffer.as_mut_ptr(),
+                &mut size,
+            )
+        };
+        let name = (username != 0 && size > 1 && size as usize <= buffer.len())
+            .then(|| String::from_utf16(&buffer[..size as usize - 1]).ok())
+            .flatten();
+        device_name_for_username(name.as_deref())
+    }
+
     use super::{
         process::{self, Process, MAX_OUTPUT},
         state::{Snapshot, State},
@@ -10301,6 +11177,27 @@ pub(crate) mod soloist {
         Now,
         Queue(u8),
     }
+impl Control {
+    pub(crate) fn log_name(&self) -> &'static str {
+        match self {
+            Self::Play(..) => "Play",
+            Self::Pause => "Pause",
+            Self::Next => "Next",
+            Self::Previous => "Previous",
+            Self::Seek(..) => "Seek",
+            Self::Volume(..) => "Volume",
+            Self::Shuffle(..) => "Shuffle",
+            Self::Repeat(..) => "Repeat",
+            Self::AddToQueue(..) => "AddToQueue",
+            Self::Activate => "Activate",
+            Self::Deactivate => "Deactivate",
+            Self::Status => "Status",
+            Self::Now => "Now",
+            Self::Queue(..) => "Queue",
+        }
+    }
+}
+
     impl Control {
         pub fn parse(args: &[&str]) -> Result<Self, String> {
             let command = match args {
@@ -10453,7 +11350,7 @@ pub(crate) mod soloist {
             command
                 .args([
                     "--device-name",
-                    "DeezNats",
+                    &managed_device_name(),
                     "--api-key",
                     &config.api_key,
                     "--ws",
@@ -10529,6 +11426,7 @@ pub(crate) mod soloist {
             command
         }
         pub fn control(&mut self, control: &Control) -> Result<Value, String> {
+            let _log = crate::spotify_diagnostics::Span::new("soloist.control", control.log_name());
             let args = control.args()?;
             self.check_running()?;
             if !self.runtime_ready() {
@@ -12960,6 +13858,9 @@ pub(crate) fn save_web_cookie(cookie: &str) -> Result<(), String> {
     Ok(())
 }
 pub(crate) fn logout() -> Result<(), String> {
+    crate::spotify_diagnostics::record("logout.start", "stop supervisor and delete local Spotify data");
+    service::shutdown().inspect_err(|_| crate::spotify_diagnostics::record("logout.supervisor", "failed"))?;
+    crate::spotify_diagnostics::record("logout.supervisor", "stopped");
     web::reset();
     let _guard = AUTH
         .lock()
@@ -12969,8 +13870,80 @@ pub(crate) fn logout() -> Result<(), String> {
     let web_api = crate::session::provider_remove("spotify-web-api");
     drop(_guard);
     catalog::reset();
-    api.and(web).and(web_api)
+    let config = crate::session::provider_remove("spotify-soloist");
+    let root = crate::storage::data_dir()?;
+    let mut cleanup = Ok(());
+    for name in ["spotify-soloist", "spotify-soloist-install"] {
+        crate::spotify_diagnostics::record("logout.remove", name);
+        if let Err(error) = std::fs::remove_dir_all(root.join(name)) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                crate::spotify_diagnostics::record("logout.remove.failed", &format!("{name}: {:?}", error.kind()));
+                cleanup = Err(format!("Could not remove {name}: {error}"));
+            }
+        }
+    }
+    let result = api.and(web).and(web_api).and(config).and(cleanup);
+    crate::spotify_diagnostics::record("logout.complete", if result.is_ok() { "ok" } else { "failed" });
+    result
 }
+fn playback_bench(report_path: &std::path::Path) -> Result<(), String> {
+    use std::time::{Duration, Instant};
+    let mut results = Vec::new();
+    let service = service::Service::start()?;
+    let handle = service.handle();
+    let deadline = Instant::now() + Duration::from_secs(180);
+    while !handle.snapshot().is_some_and(|s| s.connected && s.logged_in) {
+        if Instant::now() >= deadline { return Err("Saved Soloist pairing did not become ready".into()); }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let original_volume = handle.snapshot().map(|s| s.volume).unwrap_or(50);
+    handle.control(&soloist::Control::Volume(0))?;
+    struct Cleanup(std::sync::Arc<service::Handle>, u8);
+    impl Drop for Cleanup { fn drop(&mut self) { let _ = self.0.control(&soloist::Control::Pause); let _ = self.0.control(&soloist::Control::Volume(self.1)); } }
+    let _cleanup = Cleanup(handle.clone(), original_volume);
+    let saved = catalog_invoke("DZFavoritesJSON", &[])?;
+    let tracks: Vec<_> = crate::catalog::entries(&saved, "track").into_iter().filter(|e| e.playable()).take(3).collect();
+    if tracks.len() < 2 { return Err("At least two saved tracks are needed".into()); }
+    let mut state = crate::audio::Snapshot::default();
+    let mut queue = playback::Queue::default();
+    for (label, command) in [
+        ("first_single_click", crate::audio::Command::PlayEntry(Box::new(tracks[0].clone()), tracks.clone())),
+        ("change_single_click", crate::audio::Command::PlayEntry(Box::new(tracks[1].clone()), tracks.clone())),
+        ("queue_add", crate::audio::Command::QueueAddLast(Box::new(tracks[0].clone()))),
+        ("pause", crate::audio::Command::SetPlaying(false)),
+        ("resume", crate::audio::Command::SetPlaying(true)),
+        ("seek", crate::audio::Command::SeekMs(5000)),
+        ("queue_clear", crate::audio::Command::QueueClear),
+    ] {
+        playback::update(&mut state, &handle, &mut queue);
+        let expected = match &command { crate::audio::Command::PlayEntry(e, _) => Some(e.id.clone()), _ => None };
+        let began = Instant::now();
+        let result = playback::dispatch(&command, &handle, &mut state, &mut queue);
+        let dispatch_ms = began.elapsed().as_millis();
+        let mut observed = false;
+        while began.elapsed() < Duration::from_secs(8) {
+            playback::update(&mut state, &handle, &mut queue);
+            if let Some(local) = handle.snapshot() {
+                let uri = local.item.get("uri").and_then(serde_json::Value::as_str).or_else(|| local.item.get("id").and_then(serde_json::Value::as_str));
+                observed = match label {
+                    "first_single_click" | "change_single_click" => uri == expected.as_deref() && local.status == "playing",
+                    "pause" => local.status == "paused",
+                    "resume" => local.status == "playing",
+                    "seek" => local.position_ms.abs_diff(5000) < 3000,
+                    "queue_add" => result.is_ok() && state.queue.iter().any(crate::audio::is_manual_queue_entry),
+                    "queue_clear" => result.is_ok() && began.elapsed() >= Duration::from_secs(4) && state.queue.iter().map(|entry| &entry.id).eq(tracks.iter().map(|entry| &entry.id)) && state.queue_index==1 && !state.queue.iter().any(crate::audio::is_manual_queue_entry),
+                    _ => result.is_ok(),
+                };
+            }
+            if observed { break; }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        results.push(serde_json::json!({"test":label,"dispatch_ms":dispatch_ms,"observed_ms":began.elapsed().as_millis(),"accepted":result.is_ok(),"observed":observed,"artist_present":!state.now.subtitle.is_empty(),"queue_len":state.queue.len(),"manual_count":state.queue.iter().filter(|entry|crate::audio::is_manual_queue_entry(entry)).count(),"missing_titles":state.queue.iter().filter(|entry|entry.title.is_empty()).count(),"error":result.err()}));
+        std::fs::write(report_path, serde_json::to_vec_pretty(&results).unwrap()).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 pub(crate) fn run_cli() -> Result<(), String> {
     let args: Vec<_> = std::env::args().collect();
     let action = args
@@ -12980,6 +13953,10 @@ pub(crate) fn run_cli() -> Result<(), String> {
         .map(String::as_str)
         .unwrap_or("help");
     match action {
+        "playback-bench" => {
+            let path = args.iter().position(|s| s == "playback-bench").and_then(|i| args.get(i + 1)).ok_or("Provide a private report path")?;
+            return playback_bench(std::path::Path::new(path));
+        }
         "jam-doctor" => {
             let report = match jam::run(jam::Operation::Refresh) {
                 Ok(session) => {

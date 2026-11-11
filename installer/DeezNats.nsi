@@ -54,7 +54,6 @@ Section "DeezNats"
   File "${PROJECT}\NOTICE.md"
   File /oname=qbsdiff.LICENSE "${PROJECT}\assets\licenses\qbsdiff.txt"
   File "${PROJECT}\SOURCE-AND-DEPENDENCIES.md"
-  File "${OUTPUT}\DeezNats-Source.zip"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
   StrCmp $TestMode "1" test_install
   WriteRegStr HKCU "Software\DeezNats" "InstallDir" "$INSTDIR"

@@ -28,4 +28,4 @@ try {
     } finally { $ErrorActionPreference = $previousErrorAction }
     if ($buildExit -ne 0) { throw 'Update package generation failed.' }
 } finally { Pop-Location }
-Write-Output "Publish the manifest and referenced assets from $OutputDirectory alongside the installer and corresponding source archive."
+Write-Output "Publish the manifest and referenced assets from $OutputDirectory alongside the installer."

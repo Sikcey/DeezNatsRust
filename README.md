@@ -6,29 +6,20 @@ an unofficial project and is not affiliated with those services.
 
 ## Features
 
-- Personalized home shelves, discovery, search, artist pages, albums and playlists.
-- Favorites, liked albums, podcasts, Flow and a playback queue. Upcoming queue
-  items can be reordered by dragging their grip icons.
-- Flow's **Style Mix** button starts with languages, checks Deezer for playable matching playlists, then shows the available genres. Pick a genre to build a mix such as Turkish Pop or Japanese Rock. Playlist labels guide the selection; individual tracks are not language-verified.
-- Synchronized lyrics, equalizer, ReplayGain, gapless and crossfade controls.
-- Background downloads with persistent pending jobs, automatic retries, cancellation and verified offline library entries.
-  Music is stored as encrypted files in `mediacache` inside the active data folder, with playback metadata in `mediacache/index.json`; it is not exported as MP3/FLAC files. Podcast episodes use the engine download folder (`Podcasts/<id>.mp3`). Unfinished and failed tracks resume after Deezer connects on the next launch.
-- Acrylic, artwork backgrounds, custom images, gradients and importable [themes](THEMES.md).
-- English, Turkish and Azerbaijani interface, plus Discord presence.
-- Windows media controls with track details, artwork and seeking; standard keyboard
-  media keys work automatically. Optional global shortcuts can be assigned in
-  Settings > Keyboard shortcuts and reset individually to the media-key defaults.
-- In-app updates with binary delta downloads and restart-to-apply controls in
-  Settings > General. Release update assets must be published to enable delivery.
-- Connect hosting with a browser client and MP3 audio streaming. See
-  [Connect audio](docs/CONNECT-AUDIO.md) for provider-specific behavior.
+- Browse personalized home shelves, discovery, search, artists, albums and playlists across Deezer, Spotify and YouTube Music.
+- Play favorites and saved collections, manage the queue, and use provider-specific Flow and Style Mix selections. Spotify and YouTube Music offer a searchable genre picker; Spotify includes the bundled Every Noise index.
+- View synchronized lyrics and use Windows media controls, keyboard media keys and optional global shortcuts.
+- Customize the interface with acrylic, artwork backgrounds, images, gradients and importable [themes](THEMES.md). The interface supports English, Turkish and Azerbaijani, with optional Discord presence.
+- Host a browser client with [Connect audio](docs/CONNECT-AUDIO.md), browse and control supported providers, and stream audio where supported.
+- Install in-app updates when release update assets are available.
 
-See [Spotify](docs/SPOTIFY.md) and [YouTube Music](docs/YOUTUBE-MUSIC.md) for
-account setup, supported features and provider limitations.
+Provider support differs:
 
-Full playback and available quality depend on your account's entitlements.
-Saved sessions are encrypted for the current Windows user with DPAPI.
-Availability and functionality vary by provider and account.
+- **Deezer:** Playback uses a modified OpenDeezer engine. Downloads support persistent jobs, retries and offline playback; downloaded music is encrypted in the active data folder and is not exported as MP3 or FLAC. Podcast episodes use the engine download folder. Equalizer, ReplayGain, gapless playback and crossfade are available through the Deezer engine.
+- **Spotify:** Browse and manage music through Spotify's web integration and play through a paired Soloist device. Local Flow uses Spotify playlists and the bundled Every Noise genre radio links. Offline downloads and Deezer's audio effects are unavailable for Soloist playback.
+- **YouTube Music:** Browse, search, manage supported library and playlist actions, and play music through the native client. Flow and Style Mix use YouTube Music recommendations. Offline downloads and crossfade are unavailable.
+
+See [Spotify](docs/SPOTIFY.md) and [YouTube Music](docs/YOUTUBE-MUSIC.md) for setup, account requirements and provider limitations. Full playback and available quality depend on your account's entitlements. Saved sessions are encrypted for the current Windows user with DPAPI.
 
 ## Requirements
 

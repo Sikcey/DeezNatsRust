@@ -93,11 +93,7 @@ fn save_file(file: &str, session: &str) -> Result<(), String> {
             return Err("Windows could not protect the session".into());
         }
         let protected = std::slice::from_raw_parts(output.pbData, output.cbData as usize);
-        let result = if file.starts_with("spotify") || file == "youtube-lyrics.dat" {
-            atomic_write(&directory.join(file), protected)
-        } else {
-            std::fs::write(directory.join(file), protected).map_err(|e| e.to_string())
-        };
+        let result = atomic_write(&directory.join(file), protected);
         LocalFree(output.pbData.cast());
         bytes.fill(0);
         result
@@ -147,6 +143,7 @@ fn provider_path(name: &str) -> Result<PathBuf, String> {
             | "spotify-soloist"
             | "spotify-web"
             | "spotify-web-api"
+            | "lastfm"
             | "youtube"
     ) {
         return Err("Unknown credential provider".into());

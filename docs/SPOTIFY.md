@@ -55,12 +55,21 @@ only when returned by the service. Genre/language mixes use matching real Spotif
 mix playlists. Spotify Flow uses local mood and genre selections, rather than
 editing Spotify's personalized mixes. In Customize Flow, choose a mood and any
 genres, then Save and use.
-The picker starts with 30 broad genres. See more expands to a curated list of
-60 recognizable genres and subgenres; See less collapses it again. Search
-covers the full bundled Every Noise index, including genres outside the curated
-list. The menu displays `Search for more genres` above the search field. Selected genres remain visible when collapsed. An unlisted genre can be
-selected with Use genre from the search field.
+The Spotify and YouTube pickers start with 20 genres, with the selected genres
+first. Other genres remain available without entering a search, even when a mood
+is selected. Show more expands to 40 genres; Show less collapses it again.
+Search covers the full bundled Every Noise catalog without displaying it all.
+An unlisted genre can be selected with Use genre from the search field.
 Saved custom genres remain available when reopening the picker.
+
+Last.fm works out of the box using the bundled app-owned API key; end users do
+not need to register or configure a key. Mood recommendations come from artists tagged with the
+mood and their top genre tags. A genre needs evidence from at least two distinct
+artists; up to eight recommendations replace playlist-name defaults. Results
+are shared between Spotify and YouTube and cached for 24 hours. Failed, slow or
+insufficient discovery falls back to stale data or local/provider defaults.
+Saved selections, including an explicitly empty selection, are never overwritten.
+The picker remains limited to 20/40 genres; see [Last.fm setup and details](FLOW-MOOD-SOURCES.md).
 
 Matching Spotify editorial playlists supply 10 tracks initially; See more
 appends the next batch of up to 10 unique playable

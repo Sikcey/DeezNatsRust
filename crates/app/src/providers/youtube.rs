@@ -1151,7 +1151,7 @@ mod catalog {
     }
 
     fn mood_playlists(mood: &str, directory: &Value) -> Result<Value, String> {
-        flow_cache(&format!("flow-mood-v1:{mood}"), || {
+        flow_cache(&format!("flow-mood-v2:{mood}"), || {
             let api = super::api()?;
             super::runtime().block_on(async {
             if let Some(params) = directory.as_array().into_iter().flatten().find(|item| {
@@ -1163,7 +1163,7 @@ mod catalog {
                 feed(&value, &mut page);
                 let entries: Vec<_> = page.sections.iter().flat_map(|s| &s.entries)
                     .chain(page.rows.iter()).filter(|e| e.kind == "playlist")
-                    .map(|e| json!({"title":e.title,"description":e.subtitle,"artwork":e.artwork})).collect();
+                    .map(|e| json!({"title":e.title,"description":e.subtitle,"artwork":e.artwork,"mood":mood})).collect();
                 if !entries.is_empty() { return Ok(json!(entries)); }
             }
             let entries = api.search_playlists(mood).await?;
@@ -1211,15 +1211,10 @@ mod catalog {
             "DZFlowTunerJSON" | "DZFlowConfigTunerJSON" => {
                 let key = args.first().and_then(Value::as_str).unwrap_or("default");
                 let selection = crate::spotify::flow::Selection::parse(key)?;
-                let directory = flow_directory()?;
-                let playlists = if selection.mood == "default"
-                    || key.starts_with(crate::spotify::flow::PREFIX)
-                {
-                    json!([])
-                } else {
-                    mood_playlists(&selection.mood, &directory)?
-                };
-                return crate::spotify::flow::provider_tuner(key, &directory, &playlists);
+                let directory = flow_directory().unwrap_or_else(|_| json!([]));
+                return crate::lastfm::tuner(key, &directory, || {
+                    mood_playlists(&selection.mood, &directory).unwrap_or_else(|_| json!([]))
+                });
             }
             "DZSaveFlowTunerJSON" | "DZFlowConfigSaveJSON" => {
                 let key = args.first().and_then(Value::as_str).unwrap_or("default");
@@ -1777,6 +1772,61 @@ mod playback {
             })
             .map(super::catalog::track)
     }
+    // Sample the original collection before shuffle or manual queue edits.
+    fn collection_sources(queue: &[Entry]) -> Vec<Entry> {
+        let mut seen=std::collections::HashSet::new();
+        let tracks:Vec<_>=queue.iter().filter(|e| e.kind == "track" && !e.id.is_empty()
+            && e.raw["_youtube_radio"] != true && !crate::audio::is_manual_queue_entry(e)
+            && seen.insert(e.id.clone())).collect();
+        let count=tracks.len().min(24);
+        (0..count).map(|i| tracks[if count == 1 {0} else {i*(tracks.len()-1)/(count-1)}].clone()).collect()
+    }
+
+    fn collection_batch(sources: &[Entry], round: usize) -> Vec<Entry> {
+        let count=sources.len().min(4);
+        let mut selected=std::collections::HashSet::new();
+        let mut artists=std::collections::HashSet::new();
+        let mut batch=Vec::new();
+        for i in 0..count {
+            let target=(round%sources.len()+i*sources.len()/count)%sources.len();
+            let artist=|e: &Entry| if e.artist_id.is_empty() {e.subtitle.clone()} else {e.artist_id.clone()};
+            let candidates=|| (0..sources.len()).map(|offset|(target+offset)%sources.len()).filter(|index|!selected.contains(index));
+            let index=candidates().find(|index| {let key=artist(&sources[*index]);key.is_empty() || !artists.contains(&key)})
+                .or_else(||candidates().next()).unwrap();
+            selected.insert(index);
+            artists.insert(artist(&sources[index]));
+            batch.push(sources[index].clone());
+        }
+        batch
+    }
+
+    fn blend_radio(batches: Vec<Vec<Entry>>, mut known: std::collections::HashSet<String>) -> Vec<Entry> {
+        let mut batches:Vec<_>=batches.into_iter().map(Vec::into_iter).collect();
+        let mut rows=Vec::new();
+        loop {
+            let mut progressed=false;
+            for batch in &mut batches {
+                if let Some(mut row)=batch.next() {
+                    progressed=true;
+                    if row.kind == "track" && !row.id.is_empty() && known.insert(row.id.clone()) {
+                        if !row.raw.is_object() {row.raw=serde_json::json!({});}
+                        row.raw["_youtube_radio"]=serde_json::json!(true);
+                        rows.push(row);
+                    }
+                }
+            }
+            if !progressed {break;}
+        }
+        rows
+    }
+
+    fn advance_index(index: usize, len: usize, repeat: u8, backwards: bool, natural_end: bool) -> Option<usize> {
+        if len == 0 { return None; }
+        let next = if backwards { index.saturating_sub(1) }
+            else if natural_end && repeat == 2 { index }
+            else { index.saturating_add(1) };
+        if next < len { Some(next) } else if repeat == 1 { Some(0) } else { None }
+    }
     pub(crate) struct Player {
         shuffle: crate::audio::PreparedShuffle,
         eq: std::sync::Arc<std::sync::Mutex<super::routing::Eq>>,
@@ -1795,6 +1845,9 @@ mod playback {
         )>,
         radio: Option<mpsc::Receiver<Result<Vec<Entry>, String>>>,
         last_seed: String,
+        collection_sources: Vec<Entry>,
+        collection_round: usize,
+        collection_continuations: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String,String>>>,
     }
     impl Default for Player {
         fn default() -> Self {
@@ -1813,6 +1866,9 @@ mod playback {
                 auth: None,
                 radio: None,
                 last_seed: String::new(),
+                collection_sources: Vec::new(),
+                collection_round: 0,
+                collection_continuations: Default::default(),
             }
         }
     }
@@ -1826,11 +1882,16 @@ mod playback {
             if let Some(s) = self.sink.take() {
                 s.stop();
             }
+            self.output = None;
+            self.audio_bytes = None;
         }
         pub(crate) fn suspend(&mut self) {
             self.stop();
             self.radio = None;
             self.last_seed.clear();
+            self.collection_sources.clear();
+            self.collection_round=0;
+            self.collection_continuations=Default::default();
             if let Some((cancel, _)) = self.auth.take() {
                 cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             }
@@ -1857,6 +1918,15 @@ mod playback {
                 };
                 let _ = tx.send(result);
             });
+        }
+        fn clear_repeat_for_selection(entry: &Entry, snapshot: &mut Snapshot) {
+            if snapshot.repeat == 2 && (snapshot.now.id != entry.id || snapshot.now.kind != entry.kind) {
+                snapshot.repeat = 0;
+            }
+        }
+        fn select(&mut self, entry: Entry, snapshot: &mut Snapshot) {
+            Self::clear_repeat_for_selection(&entry, snapshot);
+            self.start(entry, snapshot);
         }
         fn start(&mut self, entry: Entry, snapshot: &mut Snapshot) {
             self.stop();
@@ -1918,32 +1988,16 @@ mod playback {
                 let _ = tx.send(result);
             });
         }
-        fn advance(&mut self, snapshot: &mut Snapshot, backwards: bool) {
-            if snapshot.queue.is_empty() {
+        fn advance(&mut self, snapshot: &mut Snapshot, backwards: bool, natural_end: bool) {
+            let Some(index) = advance_index(snapshot.queue_index, snapshot.queue.len(), snapshot.repeat, backwards, natural_end) else {
                 self.stop();
                 snapshot.state = "Stopped".into();
                 return;
-            }
-            let len = snapshot.queue.len();
-            let index = if backwards {
-                snapshot.queue_index.saturating_sub(1)
-            } else if snapshot.repeat == 2 {
-                snapshot.queue_index
-            } else {
-                snapshot.queue_index + 1
             };
-            if index >= len {
-                if snapshot.repeat == 1 {
-                    snapshot.queue_index = 0;
-                } else {
-                    self.stop();
-                    snapshot.state = "Stopped".into();
-                    return;
-                }
-            } else {
-                snapshot.queue_index = index;
-            }
-            self.start(snapshot.queue[snapshot.queue_index].clone(), snapshot);
+            snapshot.queue_index = index;
+            let entry = snapshot.queue[index].clone();
+            if !natural_end { Self::clear_repeat_for_selection(&entry, snapshot); }
+            self.start(entry, snapshot);
         }
         pub(crate) fn handle(&mut self, command: &Command, snapshot: &mut Snapshot) {
             match command {
@@ -1973,26 +2027,31 @@ mod playback {
                     if !q.iter().any(|t| t.id == e.id) {
                         q.insert(0, (**e).clone());
                     }
+                    self.collection_sources=collection_sources(&q);
+                    if self.collection_sources.is_empty() {self.collection_sources.push((**e).clone());}
+                    self.collection_round=0;
+                    self.collection_continuations=Default::default();
                     crate::audio::mark_queue_fallback(&mut q);
                     snapshot.queue_index = q.iter().position(|t| t.id == e.id).unwrap_or(0);
                     if snapshot.shuffle {
                         self.shuffle.prepare(&mut q, snapshot.queue_index);
                     }
                     snapshot.queue = q.into();
-                    self.start((**e).clone(), snapshot);
+                    self.select((**e).clone(), snapshot);
                 }
                 Command::Play(id) => {
                     if let Some(i) = snapshot.queue.iter().position(|t| t.id == *id) {
                         snapshot.queue_index = i;
-                        self.start(snapshot.queue[i].clone(), snapshot);
+                        self.select(snapshot.queue[i].clone(), snapshot);
                     }
                 }
                 Command::PlayQueueIndex(i) if *i < snapshot.queue.len() => {
                     snapshot.queue_index = *i;
-                    self.start(snapshot.queue[*i].clone(), snapshot);
+                    self.select(snapshot.queue[*i].clone(), snapshot);
                 }
-                Command::Next => self.advance(snapshot, false),
-                Command::Previous => self.advance(snapshot, true),
+                Command::Next => self.advance(snapshot, false, false),
+                Command::Previous if snapshot.position > 3_000 => self.seek(0, snapshot),
+                Command::Previous => self.advance(snapshot, true, false),
                 Command::Toggle => {
                     self.paused = !self.paused;
                     if let Some(s) = &self.sink {
@@ -2188,6 +2247,12 @@ mod playback {
                 let known = snapshot.queue.iter().map(|t| t.id.clone()).collect();
                 if seed != self.last_seed {
                     self.last_seed = seed.clone();
+                    if self.collection_sources.is_empty() {
+                        self.collection_sources=collection_sources(&snapshot.queue);
+                    }
+                    let sources=collection_batch(&self.collection_sources,self.collection_round);
+                    self.collection_round=self.collection_round.wrapping_add(1);
+                    let continuations=self.collection_continuations.clone();
                     let (tx, rx) = mpsc::sync_channel(1);
                     self.radio = Some(rx);
                     std::thread::spawn(move || {
@@ -2198,12 +2263,32 @@ mod playback {
                                         super::catalog::continue_flow(&api, &key, offset, known)
                                             .await
                                     } else {
-                                        super::catalog::station(
-                                            &api,
-                                            super::catalog::bare(&seed),
-                                            None,
-                                        )
-                                        .await
+                                        let mut batches=Vec::new();
+                                        let mut failure=None;
+                                        for source in sources {
+                                            let token=continuations.lock().unwrap().get(&source.id).cloned();
+                                            let request=super::catalog::station(&api,super::catalog::bare(&source.id),token.as_deref());
+                                            let result=tokio::time::timeout(Duration::from_secs(10),request).await;
+                                            match result {
+                                                Ok(Ok((mut rows,next))) => {
+                                                    if let Some(name)=source.raw.get("queue_context_name") {
+                                                        for row in &mut rows {row.raw["queue_context_name"]=name.clone();}
+                                                    }
+                                                    let token=serde_json::from_str::<serde_json::Value>(&next).ok()
+                                                        .and_then(|v|v["radio"].as_str().map(str::to_owned));
+                                                    let mut tokens=continuations.lock().unwrap();
+                                                    if let Some(token)=token {tokens.insert(source.id.clone(),token);} else {tokens.remove(&source.id);}
+                                                    batches.push(rows);
+                                                }
+                                                Ok(Err(error)) => failure=Some(error),
+                                                Err(_) => failure=Some(anyhow::anyhow!("YouTube collection radio timed out")),
+                                            }
+                                        }
+                                        if batches.is_empty() {
+                                            Err(failure.unwrap_or_else(||anyhow::anyhow!("No collection radio sources")))
+                                        } else {
+                                            Ok((blend_radio(batches,known),String::new()))
+                                        }
                                     }
                                 })
                                 .map(|(rows, _)| rows)
@@ -2245,7 +2330,7 @@ mod playback {
                     && !self.paused
                     && (self.radio.is_none() || snapshot.queue_index + 1 < snapshot.queue.len())
                 {
-                    self.advance(snapshot, false);
+                    self.advance(snapshot, false, true);
                 }
             }
         }
@@ -2266,6 +2351,114 @@ mod playback {
     #[cfg(test)]
     mod tests {
         use super::*;
+        fn radio_track(id: &str) -> Entry {
+            Entry {id:id.into(),kind:"track".into(),..Default::default()}
+        }
+
+        #[test]
+        fn collection_radio_samples_whole_original_collection_and_excludes_queue_edits() {
+            let mut tracks:Vec<_>=(0..100).map(|i|radio_track(&format!("song{i}"))).collect();
+            tracks.push(crate::audio::explicit_queue_entry(radio_track("manual")));
+            let mut radio=radio_track("generated");radio.raw=serde_json::json!({"_youtube_radio":true});tracks.push(radio);
+            tracks.push(tracks[0].clone());
+            let sources=collection_sources(&tracks);
+            assert_eq!(sources.len(),24);
+            assert_eq!(sources.first().unwrap().id,"song0");
+            assert_eq!(sources.last().unwrap().id,"song99");
+            assert!(!sources.iter().any(|e|matches!(e.id.as_str(),"manual"|"generated")));
+            let first=collection_batch(&sources,0);
+            assert_eq!(first.iter().map(|e|e.id.as_str()).collect::<Vec<_>>(),vec!["song0","song25","song51","song77"]);
+            let mut covered=std::collections::HashSet::new();
+            for round in 0..sources.len() {for e in collection_batch(&sources,round) {covered.insert(e.id);}}
+            assert_eq!(covered.len(),24);
+            assert!(collection_batch(&[],0).is_empty());
+            assert_eq!(collection_batch(&[radio_track("only")],99)[0].id,"only");
+        }
+
+        #[test]
+        fn collection_radio_avoids_sampling_only_one_artist_in_alternating_playlists() {
+            let sources:Vec<_>=(0..24).map(|i| {let mut row=radio_track(&format!("song{i}"));row.artist_id=format!("artist{}",i%2);row}).collect();
+            let batch=collection_batch(&sources,0);
+            assert_eq!(batch.iter().map(|e|e.artist_id.as_str()).collect::<std::collections::HashSet<_>>().len(),2);
+            assert_eq!(batch.iter().map(|e|e.id.as_str()).collect::<std::collections::HashSet<_>>().len(),4);
+        }
+
+        #[test]
+        fn manual_next_and_natural_end_follow_distinct_repeat_one_rules() {
+            assert_eq!(advance_index(0, 2, 2, false, false), Some(1));
+            assert_eq!(advance_index(0, 2, 2, false, true), Some(0));
+            assert_eq!(advance_index(1, 2, 2, false, false), None);
+            assert_eq!(advance_index(1, 2, 1, false, false), Some(0));
+        }
+
+        #[test]
+        fn explicit_selection_clears_repeat_only_for_a_different_recording() {
+            let mut snapshot = Snapshot::default();
+            snapshot.now = radio_track("first");
+            snapshot.repeat = 2;
+            Player::clear_repeat_for_selection(&radio_track("first"), &mut snapshot);
+            assert_eq!(snapshot.repeat, 2);
+            Player::clear_repeat_for_selection(&radio_track("second"), &mut snapshot);
+            assert_eq!(snapshot.repeat, 0);
+            snapshot.repeat = 1;
+            Player::clear_repeat_for_selection(&radio_track("third"), &mut snapshot);
+            assert_eq!(snapshot.repeat, 1);
+        }
+
+        #[test]
+        fn stop_cancels_pending_load_and_releases_buffer() {
+            let mut player = Player::default();
+            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (_tx, rx) = std::sync::mpsc::sync_channel(1);
+            player.pending = Some(rx);
+            player.load_cancel = Some(cancel.clone());
+            let bytes: std::sync::Arc<[u8]> = vec![1, 2, 3].into();
+            let weak = std::sync::Arc::downgrade(&bytes);
+            player.audio_bytes = Some(bytes);
+            player.stop();
+            assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+            assert!(player.pending.is_none() && player.output.is_none() && player.sink.is_none());
+            assert!(weak.upgrade().is_none());
+        }
+
+        #[test]
+        fn previous_after_three_seconds_keeps_current_queue_item() {
+            let mut player = Player::default();
+            let mut snapshot = Snapshot::default();
+            snapshot.queue = vec![radio_track("first"), radio_track("second")].into();
+            snapshot.queue_index = 1;
+            snapshot.position = 3_001;
+            player.handle(&Command::Previous, &mut snapshot);
+            assert_eq!(snapshot.queue_index, 1);
+            assert!(player.pending.is_none());
+        }
+
+        #[test]
+        fn collection_radio_blends_styles_and_filters_known_and_duplicate_tracks() {
+            let rows=blend_radio(vec![
+                vec![radio_track("known"),radio_track("a1"),radio_track("shared"),radio_track("a2")],
+                vec![radio_track("b1"),radio_track("shared"),radio_track("b2")],
+            ],std::collections::HashSet::from(["known".into()]));
+            assert_eq!(rows.iter().map(|e|e.id.as_str()).collect::<Vec<_>>(),vec!["b1","a1","shared","b2","a2"]);
+            assert!(rows.iter().all(|e|e.raw["_youtube_radio"]==true));
+            assert!(collection_sources(&rows).is_empty());
+        }
+
+        #[test]
+        fn collection_radio_reset_discards_sources_and_continuations() {
+            let mut player=Player::default();
+            player.collection_sources=vec![radio_track("original")];
+            player.collection_round=7;
+            player.collection_continuations.lock().unwrap().insert("original".into(),"token".into());
+            let old=player.collection_continuations.clone();
+            player.suspend();
+            assert!(player.collection_sources.is_empty());
+            assert_eq!(player.collection_round,0);
+            assert!(player.collection_continuations.lock().unwrap().is_empty());
+            old.lock().unwrap().insert("stale".into(),"late-result".into());
+            assert!(player.collection_continuations.lock().unwrap().is_empty());
+        }
+
         #[test]
         fn prepared_shuffle_toggle_is_stable_restores_order_and_stops_at_end() {
             let mut player = Player::default();

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.8
+- Reduce repeated text geometry and GPU mask generation while scrolling large libraries.
+- Correct manual track selection, repeat-one and YouTube Previous/Stop behavior.
+- Preserve offline download records and recovery jobs, verify libraries in the background, and retain failure summaries.
+- Handle fragmented Connect requests, propagate rejected commands, and improve narrow-screen controls.
+- Validate bounded YouTube media transfers, avoid global lyrics cooldowns on mismatched recordings, and save Deezer credentials atomically.
+- Improve Deezer playback recovery and Spotify/YouTube mood discovery with Last.fm recommendations.
+
 ## 0.1.7
 
 - Improve Spotify catalog, playback recovery, diagnostics and interface behavior.

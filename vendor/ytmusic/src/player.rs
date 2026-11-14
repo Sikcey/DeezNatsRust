@@ -452,6 +452,10 @@ impl YtMusic {
         let Some(total) = format.content_length else {
             return self.download_serial(format).await;
         };
+        anyhow::ensure!(
+            total <= MAX_STREAM_BYTES,
+            "audio exceeds download memory limit"
+        );
         let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(PARALLEL));
         let mut tasks = tokio::task::JoinSet::new();
         let mut offset = 0u64;
@@ -480,21 +484,25 @@ impl YtMusic {
         for (_, chunk) in parts {
             data.extend_from_slice(&chunk);
         }
+        anyhow::ensure!(data.len() as u64 == total, "incomplete audio download");
         Ok(data)
     }
 
     async fn download_serial(&self, format: &AudioFormat) -> Result<Vec<u8>> {
         let mut data = Vec::with_capacity((CHUNK * 2) as usize);
-        let mut offset = 0u64;
-        while offset < MAX_STREAM_BYTES {
-            let end = offset + CHUNK - 1;
-            let chunk = range(&self.http, &format.url, format.user_agent, offset, end).await?;
-            let short = (chunk.len() as u64) < CHUNK;
-            offset += chunk.len() as u64;
+        let mut stream = crate::stream::AudioStream::open(self.http.clone(), format).await?;
+        if let Some(total) = stream.total() {
+            anyhow::ensure!(
+                total <= MAX_STREAM_BYTES,
+                "audio exceeds download memory limit"
+            );
+        }
+        while let Some(chunk) = stream.chunk().await? {
+            anyhow::ensure!(
+                chunk.len() as u64 <= MAX_STREAM_BYTES - data.len() as u64,
+                "audio exceeds download memory limit"
+            );
             data.extend_from_slice(&chunk);
-            if short {
-                break;
-            }
         }
         Ok(data)
     }
@@ -507,9 +515,30 @@ async fn range(
     start: u64,
     end: u64,
 ) -> Result<Vec<u8>> {
-    let response = crate::stream::request(http, url, agent, start, end).await?;
-    let chunk = response.bytes().await.context("cannot read stream chunk")?;
-    Ok(chunk.to_vec())
+    let mut response = tokio::time::timeout(
+        Duration::from_secs(8),
+        crate::stream::request(http, url, agent, start, end),
+    )
+    .await
+    .context("stream request timed out")??;
+    let limit = end - start + 1;
+    let expected = response.content_length();
+    let mut data = Vec::new();
+    while let Some(chunk) = tokio::time::timeout(Duration::from_secs(8), response.chunk())
+        .await
+        .context("stream chunk timed out")?
+        .context("cannot read stream chunk")?
+    {
+        anyhow::ensure!(
+            chunk.len() as u64 <= limit - data.len() as u64,
+            "stream body exceeds requested range"
+        );
+        data.extend_from_slice(&chunk);
+    }
+    if let Some(expected) = expected {
+        anyhow::ensure!(data.len() as u64 == expected, "incomplete stream chunk");
+    }
+    Ok(data)
 }
 
 struct Ciphered {
@@ -788,6 +817,40 @@ fn audio_format(format: &Value, client: Client) -> Option<AudioFormat> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn range_body_is_bounded_even_without_content_length() {
+        use std::io::{Read, Write};
+        for (body, succeeds) in [
+            ("4\r\nabcd\r\n0\r\n\r\n", true),
+            ("5\r\nabcde\r\n0\r\n\r\n", false),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = [0; 4096];
+                socket.read(&mut request).unwrap();
+                write!(socket, "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/4\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{body}").unwrap();
+            });
+            let result = range(
+                &reqwest::Client::new(),
+                &format!("http://{address}"),
+                "test",
+                0,
+                3,
+            )
+            .await;
+            assert_eq!(result.is_ok(), succeeds);
+            if succeeds {
+                assert_eq!(result.unwrap(), b"abcd");
+            }
+            server.join().unwrap();
+        }
+    }
 
     #[test]
     fn skips_ciphered_formats() {

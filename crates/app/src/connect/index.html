@@ -1007,7 +1007,7 @@
     .lyric-translation { font-size:.55em; font-weight:500; margin-top:10px; color:rgba(255,255,255,.65); }
     @media(prefers-reduced-motion:reduce) { #lyrics-lines {scroll-behavior:auto} .lyric-line {transition:none} }
   </style>
-  <link rel="stylesheet" href="/ui.css?v=required-nickname-1">
+  <link rel="stylesheet" href="/ui.css?v=compact-header-2">
 </head>
 <body>
   <!-- Real Audio Stream Element -->
@@ -1024,6 +1024,7 @@
         <span id="header-stream-icon">🔊</span>
         <span id="header-stream-label">Listen live</span>
       </button>
+      <button class="btn-act" onclick="refreshCurrentPage()" title="Refresh">Refresh</button>
       <select id="language-select" aria-label="Language" onchange="JamUI.setLanguage(this.value)"><option value="en">English</option><option value="tr">Türkçe</option></select>
       <button id="settings-btn" class="btn-ctrl" onclick="switchTab('settings')" aria-label="Settings" title="Settings"><i class="native-icon" aria-hidden="true">&#xe713;</i></button>
     </div>
@@ -1117,6 +1118,7 @@
         <div style="display:flex; gap:10px; flex-wrap:wrap; justify-content:center;">
           <button class="btn-act" onclick="switchTab('style-mix')">Style Mix</button>
           <button class="btn-flow-start" onclick="startFlow(currentFlowId)">▶ Start Flow</button>
+          <button class="btn-act" onclick="loadFlow(currentFlowId, true)">Refresh</button>
           <button class="btn-act" style="padding:14px 22px; border-radius:999px; font-weight:700; font-size:0.95rem; display:flex; align-items:center; gap:8px;" onclick="toggleTunerExpanded(true)">
             <span>🎛️ Customize Flow</span>
           </button>
@@ -1862,6 +1864,45 @@ function showLyricsError(message) {
       setTimeout(() => t.classList.remove("show"), 2200);
     }
 
+    // Catalog data survives navigation; live playback state keeps its own polling.
+    const catalogResponses = new Map();
+    async function catalogData(url, refresh = false, options = {}) {
+      const key = JSON.stringify([currentState?.provider || 'deezer', url]);
+      if (refresh) catalogResponses.delete(key);
+      let pending = catalogResponses.get(key);
+      if (!pending) {
+        pending = (async () => {
+          const response = await fetch(url, options);
+          const data = await response.json();
+          if (!response.ok || data.error) throw new Error(data.error || 'Could not load this page');
+          return data;
+        })();
+        catalogResponses.set(key, pending);
+        if (catalogResponses.size > 80) catalogResponses.delete(catalogResponses.keys().next().value);
+        pending.catch(() => { if (catalogResponses.get(key) === pending) catalogResponses.delete(key); });
+      }
+      return pending;
+    }
+    let modalSelection = null;
+    function refreshCurrentPage() {
+      if (document.getElementById('collection-modal').classList.contains('open') && modalSelection) {
+        return openCollection(...modalSelection, true);
+      }
+      const tab = document.querySelector('.view-panel.active')?.id;
+      if (tab === 'view-discover') return loadDiscover(true);
+      if (tab === 'view-search') return executeSearch(true);
+      if (tab === 'view-flow') return loadFlow(currentFlowId, true);
+      if (tab === 'view-style-mix') {
+        if (styleMixGenre !== null) return buildStyleMix(styleMixGenre, true);
+        if (styleMixRegion !== null) return loadStyleMixGenres(styleMixRegion, true);
+        styleMixOptionsPromise = null;
+        return loadStyleMixOptions();
+      }
+      if (tab === 'view-lyrics') { lyricTrack = null; return loadLyrics(); }
+      queueSnapshot = null;
+      return fetchState();
+    }
+
     let lyricsReturnTab = 'queue';
     function toggleLyricsPage() {
       if (document.getElementById('view-lyrics').classList.contains('active')) switchTab(lyricsReturnTab);
@@ -1900,7 +1941,7 @@ function showLyricsError(message) {
       if (tabId === "style-mix") loadStyleMixOptions();
       if (tabId === "flow") {
         loadFlow(currentFlowId);
-        loadFlowTuner(currentFlowId);
+        if (!flowTunerGenres.length) loadFlowTuner(currentFlowId);
       }
     }
 
@@ -1978,7 +2019,7 @@ function showLyricsError(message) {
       updateStyleMixChoices('region');
       document.getElementById('style-mix-spinner').hidden = true;
     }
-    async function loadStyleMixGenres(region) {
+    async function loadStyleMixGenres(region, refresh = false) {
       styleMixGenresRequest?.abort();
       styleMixGenresRequest = new AbortController();
       styleMixRegion = region;
@@ -1998,10 +2039,9 @@ function showLyricsError(message) {
       spinner.hidden = false;
       status.textContent = tr('Checking available genres...');
       try {
-        const response = await fetch('/api/style-mix/genres?region='+region,{signal:styleMixGenresRequest.signal});
-        const data = await response.json();
+        const data = await catalogData('/api/style-mix/genres?region='+region, refresh, {signal:styleMixGenresRequest.signal});
         if (generation !== styleMixGeneration) return;
-        if (!response.ok || data.error) throw new Error(data.error || 'Could not check genres. Please try again.');
+        if (data.error) throw new Error(data.error);
         choices.replaceChildren(...data.genres.map(genre => {
           const button = document.createElement('button');
           button.className='btn-act style-mix-photo'; button.textContent=tr(genre.title);
@@ -2020,7 +2060,7 @@ function showLyricsError(message) {
         if (generation === styleMixGeneration) spinner.hidden = true;
       }
     }
-    async function buildStyleMix(genre) {
+    async function buildStyleMix(genre, refresh = false) {
       if (styleMixRegion === null) return;
       styleMixGenre = genre;
       clearStyleMix();
@@ -2032,10 +2072,9 @@ function showLyricsError(message) {
       spinner.hidden=false;
       status.textContent = tr('Finding matching music...');
       try {
-        const response = await fetch('/api/style-mix?selection=' + encodeURIComponent(selection));
-        const data = await response.json();
+        const data = await catalogData('/api/style-mix?selection=' + encodeURIComponent(selection), refresh);
         if (generation !== styleMixGeneration) return;
-        if (!response.ok || data.error) throw new Error(data.error || 'Could not build this mix');
+        if (data.error) throw new Error(data.error);
         styleMixSelection = selection;
         status.textContent = data.tracks.length ? data.title + ' · ' + data.tracks.length + ' songs' : tr('No playable tracks found in matching playlists. Try another language or genre.');
         document.getElementById('style-mix-tracks').replaceChildren(...data.tracks.map(track => {
@@ -2347,13 +2386,15 @@ function showLyricsError(message) {
 
     // Discover (Discover) Loading
     let discoverLoaded = false;
-    async function loadDiscover() {
-      if (discoverLoaded) return;
+    let discoverRequest = 0;
+    async function loadDiscover(refresh = false) {
+      if (discoverLoaded && !refresh) return;
+      const request = ++discoverRequest;
       const container = document.getElementById("discover-container");
       container.innerHTML = "<div style='color:var(--text-muted); text-align:center; padding:30px;'>Loading Discover...</div>";
       try {
-        const res = await fetch("/api/discover");
-        const data = await res.json();
+        const data = await catalogData("/api/discover", refresh);
+        if (request !== discoverRequest) return;
         if (data.error) throw new Error(data.error);
         discoverLoaded = true;
 
@@ -2383,6 +2424,8 @@ function showLyricsError(message) {
           </div>
         `).join("");
       } catch (e) {
+        if (request !== discoverRequest) return;
+        discoverLoaded = false;
         container.innerHTML = "<div style='color:var(--accent); text-align:center;'>Could not load Discover.</div>";
       }
     }
@@ -2401,7 +2444,8 @@ function showLyricsError(message) {
 
     // Collection Modal (Album/Playlist inspect)
     let modalRequest = 0;
-    async function openCollection(kind, id, initialTitle = "", initialArtwork = "") {
+    async function openCollection(kind, id, initialTitle = "", initialArtwork = "", refresh = false) {
+      modalSelection = [kind, id, initialTitle, initialArtwork];
       const request = ++modalRequest;
       currentModalTracks = [];
       const modal = document.getElementById("collection-modal");
@@ -2412,8 +2456,7 @@ function showLyricsError(message) {
       modal.classList.add("open");
 
       try {
-        const res = await fetch(`/api/collection?kind=${encodeURIComponent(kind)}&id=${encodeURIComponent(id)}`);
-        const data = await res.json();
+        const data = await catalogData(`/api/collection?kind=${encodeURIComponent(kind)}&id=${encodeURIComponent(id)}`, refresh);
         if (request !== modalRequest) return;
         if (data.title) document.getElementById("modal-title").innerText = data.title;
         if (data.artwork) document.getElementById("modal-cover").src = data.artwork;
@@ -2487,6 +2530,12 @@ function showLyricsError(message) {
     // Flow & Flow Tuner State
     let currentFlowId = "default";
     let flowTunerGenres = [];
+    let flowRequest = 0;
+    let flowTunerRequest = 0;
+    let flowSavePending = false;
+    const personalFlows = new Map();
+    const flowResponses = new Map();
+    const flowProvider = () => currentState?.provider || 'deezer';
     let tunerFilter = "";
     let tunerExpanded = false;
 
@@ -2517,12 +2566,16 @@ function showLyricsError(message) {
 
     async function loadFlowTuner(flowId = currentFlowId) {
       currentFlowId = flowId || "default";
+      const requestedId = currentFlowId;
+      const request = ++flowTunerRequest;
       const badge = document.getElementById("flow-tuner-badge");
       const statusMsg = document.getElementById("tuner-status-msg");
       if (badge) badge.innerText = "Loading...";
       try {
         const res = await fetch(`/api/flow/tuner?id=${encodeURIComponent(currentFlowId)}`);
         const data = await res.json();
+        if (request !== flowTunerRequest || requestedId !== currentFlowId) return;
+        if (!res.ok || data.error) throw new Error(data.error || "Could not load Flow genres");
         const rawGenres = data.genres || [];
         flowTunerGenres = rawGenres.map(g => ({
           id: String(g.id || g.clusterId),
@@ -2534,6 +2587,7 @@ function showLyricsError(message) {
         updateTunerBadge();
         if (statusMsg) statusMsg.innerText = `${flowTunerGenres.length} genres ready`;
       } catch (e) {
+        if (request !== flowTunerRequest || requestedId !== currentFlowId) return;
         console.error("Flow tuner load error:", e);
         if (badge) badge.innerText = "Could not load";
       }
@@ -2565,12 +2619,18 @@ function showLyricsError(message) {
       }
 
       container.innerHTML = filtered.map(g => `
-        <div class="genre-chip ${g.isEnabled ? 'active' : ''}" onclick="toggleGenre('${escapeHtml(g.id)}')">
+        <div class="genre-chip ${g.isEnabled ? 'active' : ''}" data-genre-index="${flowTunerGenres.indexOf(g)}">
           <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(g.title)}</span>
           <span class="genre-icon">${g.isEnabled ? '✓' : '+'}</span>
         </div>
       `).join("");
     }
+
+    document.getElementById('flow-genres-container').addEventListener('click', event => {
+      const chip = event.target.closest('[data-genre-index]');
+      const genre = chip && flowTunerGenres[Number(chip.dataset.genreIndex)];
+      if (genre && !flowSavePending) toggleGenre(genre.id);
+    });
 
     function toggleGenre(id) {
       const g = flowTunerGenres.find(x => x.id === id);
@@ -2609,6 +2669,9 @@ function showLyricsError(message) {
     }
 
     async function saveFlowTuner() {
+      if (flowSavePending) return;
+      const savedId = currentFlowId;
+      const savedGenres = flowTunerGenres.map(g => ({...g}));
       const anyEnabled = flowTunerGenres.some(g => g.isEnabled);
       if (!anyEnabled) {
         showToast("⚠️ Select at least one genre!");
@@ -2621,12 +2684,13 @@ function showLyricsError(message) {
       const origText1 = btn1 ? btn1.innerHTML : "";
       const origText2 = btn2 ? btn2.innerHTML : "";
 
+      flowSavePending = true;
       if (btn1) btn1.innerHTML = "<span>⏳ Saving...</span>";
       if (btn2) btn2.innerHTML = "<span>⏳ Saving...</span>";
       if (statusMsg) statusMsg.innerText = "Saving your Flow preferences...";
 
       try {
-        const edits = flowTunerGenres
+        const edits = savedGenres
           .filter(g => g.isEnabled !== g.originalEnabled)
           .map(g => ({
             clusterId: g.id,
@@ -2635,12 +2699,12 @@ function showLyricsError(message) {
           }));
 
         const payload = {
-          flow_id: currentFlowId,
-          genres: flowTunerGenres.map(g => ({
+          flow_id: savedId,
+          genres: savedGenres.map(g => ({
             id: g.id,
             isEnabled: g.isEnabled
           })),
-          edits: edits.length > 0 ? edits : flowTunerGenres.map(g => ({
+          edits: edits.length > 0 ? edits : savedGenres.map(g => ({
             clusterId: g.id,
             isEnabled: g.isEnabled,
             isEditedByUser: true
@@ -2654,8 +2718,14 @@ function showLyricsError(message) {
         });
 
         const data = await res.json();
-        if (res.ok && !data.error) {
-          if (data.id) currentFlowId = data.id;
+        if (savedId !== currentFlowId) return;
+        if (res.ok && data.ok !== false && data.saved !== false && !data.error) {
+          if (data.id) {
+            currentFlowId = data.id;
+            if (savedId === 'default' || savedId === personalFlows.get(flowProvider())) {
+              personalFlows.set(flowProvider(), data.id);
+            }
+          }
           flowTunerGenres.forEach(g => { g.originalEnabled = g.isEnabled; });
           showToast("✓ Flow preferences saved!");
           if (statusMsg) statusMsg.innerText = data.verified === false ? "Saved. Could not refresh the selection." : "Flow preferences saved.";
@@ -2669,7 +2739,7 @@ function showLyricsError(message) {
             renderGenreChips();
             updateTunerBadge();
           }
-          loadFlow(currentFlowId);
+          loadFlow(currentFlowId, true);
         } else {
           showToast("⚠️ " + (data.error || "Could not save"));
           if (statusMsg) statusMsg.innerText = data.error || "Something went wrong";
@@ -2678,17 +2748,34 @@ function showLyricsError(message) {
         console.error(e);
         showToast("⚠️ Connection error while saving");
       } finally {
+        flowSavePending = false;
         if (btn1) btn1.innerHTML = origText1;
         if (btn2) btn2.innerHTML = origText2;
       }
     }
 
     // Flow Loading
-    async function loadFlow(configId = currentFlowId) {
+    async function loadFlow(configId = currentFlowId, refresh = false) {
       currentFlowId = configId || "default";
+      const requestedId = currentFlowId;
+      const request = ++flowRequest;
       try {
-        const res = await fetch(`/api/flow?config=${encodeURIComponent(currentFlowId)}`);
-        const data = await res.json();
+        const key = JSON.stringify([flowProvider(), requestedId]);
+        if (refresh) flowResponses.delete(key);
+        let pending = flowResponses.get(key);
+        if (!pending) {
+          pending = (async () => {
+            const res = await fetch(`/api/flow?config=${encodeURIComponent(requestedId)}`);
+            const data = await res.json();
+            if (!res.ok || data.error) throw new Error(data.error || "Could not load Flow");
+            return data;
+          })();
+          flowResponses.set(key, pending);
+          pending.catch(() => { if (flowResponses.get(key) === pending) flowResponses.delete(key); });
+        }
+        const data = await pending;
+
+        if (request !== flowRequest || requestedId !== currentFlowId) return;
 
         // Render moods
         const moodsContainer = document.getElementById("flow-moods");
@@ -2727,22 +2814,25 @@ function showLyricsError(message) {
     }
 
     async function onMoodSelect(configId) {
+      configId = configId === 'default' ? (personalFlows.get(flowProvider()) || configId) : configId;
       currentFlowId = configId;
-      startFlow(configId);
+      flowTunerGenres = [];
+      clearTunerSearch();
+      loadFlow(configId);
       loadFlowTuner(configId);
     }
 
     async function startFlow(configId = currentFlowId) {
-      showToast("Starting Flow...");
-      await fetch("/api/flow/start", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ config: configId })
-      });
-      setTimeout(() => {
-        loadFlow(configId);
+      try {
+        const response = await fetch("/api/flow/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ config: configId, added_by: BrowserProfiles.nickname() })
+        });
+        const data = await response.json();
+        if (!response.ok || data.ok === false || data.error) throw new Error(data.error || "Could not start Flow");
         fetchState();
-      }, 600);
+      } catch (error) { showToast(error.message); }
     }
 
     // Search is performed by the host using the desktop's authenticated engine.
@@ -2789,16 +2879,14 @@ function showLyricsError(message) {
       }
       if (!container.children.length) container.textContent = 'No results found.';
     }
-    async function executeSearch() {
+    async function executeSearch(refresh = false) {
       const query = document.getElementById('search-input').value.trim();
       const request = ++searchRequest;
       const container = document.getElementById('search-results');
       if (!query) { searchData=null;renderSearchResults();return; }
       container.textContent = 'Searching Deezer...';
       try {
-        const response = await fetch('/api/search?q='+encodeURIComponent(query));
-        if (!response.ok) throw new Error('Search failed');
-        const data = await response.json();
+        const data = await catalogData('/api/search?q='+encodeURIComponent(query), refresh);
         if (request !== searchRequest) return;
         searchData=data;renderSearchResults();
       } catch(error) { if(request===searchRequest) container.textContent='Search failed. Please try again.'; }

@@ -1,11 +1,14 @@
 param(
     [string]$EngineRoot = 'E:\DeezerNative',
     [string]$OutputDirectory = '',
-    [string]$Compiler = ''
+    [string]$Compiler = '',
+    [string]$EngineSourceDirectory = '',
+    [string]$GoExecutable = ''
 )
 $ErrorActionPreference = 'Stop'
 if (!$OutputDirectory) { $OutputDirectory = Join-Path (Split-Path $PSScriptRoot -Parent) 'target/debug' }
-$go = Join-Path $EngineRoot '.tools/go-sdk/go/bin/go.exe'
+$go = $GoExecutable
+if (!$go) { $go = Join-Path $EngineRoot '.tools/go-sdk/go/bin/go.exe' }
 if (!(Test-Path -LiteralPath $go)) { $go = (Get-Command go.exe -ErrorAction Stop).Source }
 if (!$Compiler) {
     $Compiler = Get-ChildItem "$EngineRoot/.tools/compiler-fast/*/bin/x86_64-w64-mingw32-clang.exe" | Select-Object -First 1 -ExpandProperty FullName
@@ -15,7 +18,9 @@ New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 $output = Join-Path (Resolve-Path -LiteralPath $OutputDirectory).Path 'libdeezercore.dll'
 $previousCgo = $env:CGO_ENABLED
 $previousCompiler = $env:CC
-Push-Location (Join-Path $EngineRoot 'vendor/opendeezer')
+if (!$EngineSourceDirectory) { $EngineSourceDirectory = Join-Path $EngineRoot 'vendor/opendeezer' }
+& (Join-Path $PSScriptRoot 'Apply-EnginePlaybackFix.ps1') -EngineSourceDirectory $EngineSourceDirectory
+Push-Location $EngineSourceDirectory
 try {
     $env:CGO_ENABLED = '1'
     $env:CC = $Compiler

@@ -1,0 +1,380 @@
+--- a/internal/audio/player.go
++++ b/internal/audio/player.go
+@@ -155,6 +155,7 @@
+ 	sb          *streamBuffer
+ 	ring        *pcmRing
+ 	eof         atomic.Bool  // decoder reached end and ring will not grow
++	rebuffering atomic.Bool  // hold PCM after starvation until a useful reserve returns
+ 	seekTo      atomic.Int64 // pending PCM-byte seek target, or -1
+ 	dead        atomic.Bool
+ 	errMsg      atomic.Value  // string: download/decode error, if any
+@@ -216,6 +217,7 @@
+ 	crossfadeMS        atomic.Int64
+ 	cbCount            atomic.Int64 // audio callbacks served (diagnostics)
+ 	cbUnderrun         atomic.Int64 // callbacks with a short read (ring starvation)
++	cbRebuffers        atomic.Int64 // starvation recoveries; logged outside the callback
+ 	onFinish           atomic.Pointer[finishCallback]
+ 	onListen           atomic.Pointer[listenCallback]
+ 
+@@ -478,8 +480,22 @@
+ 		tapBroadcast(out)
+ 		return 0
+ 	}
++	// Do not consume each tiny producer refill immediately after starvation.
++	// Keep this on the source rather than changing the lifecycle state: pause,
++	// seek, stop and queue advancement retain their existing semantics.
++	if cur.rebuffering.Load() {
++		if cur.seekTo.Load() >= 0 || (!cur.eof.Load() && cur.ring.buffered() < bytesPerSec) {
++			tapBroadcast(out)
++			return 0
++		}
++		cur.rebuffering.Store(false)
++		p.fadeLeft.Store(fadeInFrames)
++	}
+ 
+ 	n := cur.ring.read(out)
++	if n < len(out) && !cur.eof.Load() && !cur.dead.Load() && cur.rebuffering.CompareAndSwap(false, true) {
++		p.cbRebuffers.Add(1)
++	}
+ 	cur.listen.add(n)
+ 	gainApplied := false
+ 
+@@ -743,11 +759,16 @@
+ 	ticker := time.NewTicker(40 * time.Millisecond)
+ 	defer ticker.Stop()
+ 	ticks := 0
++	var reportedRebuffers int64
+ 	for {
+ 		select {
+ 		case <-p.stopMgr:
+ 			return
+ 		case <-ticker.C:
++			if count := p.cbRebuffers.Load(); count != reportedRebuffers {
++				reportedRebuffers = count
++				odlog.Warn("audio: PCM starvation; rebuilding playback reserve (events=%d)", count)
++			}
+ 			p.ReportCurrentListen()
+ 			// Sleep timer (duration mode): fade out over the last few seconds, then
+ 			// pause exactly at the deadline. End-of-track mode is handled in the
+@@ -1330,8 +1351,10 @@
+ // which download() then validates — instead of a 206 of the wrong entity. The
+ // per-source context cancels a stalled read on kill().
+ func (s *source) openStream(url string, offset int64, validator string) (*http.Response, error) {
+-	req, err := http.NewRequestWithContext(s.ctx, http.MethodGet, url, nil)
++	ctx, cancel := context.WithCancel(s.ctx)
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+ 	if err != nil {
++		cancel()
+ 		return nil, err
+ 	}
+ 	// A browser User-Agent: Deezer's own CDN is permissive, but third-party
+@@ -1347,8 +1370,13 @@
+ 	}
+ 	resp, err := streamHTTPClient.Do(req)
+ 	if err != nil {
++		cancel()
+ 		return nil, err
+ 	}
++	// Time only an actual HTTP body Read, never preload/decoder backpressure
++	// or pacing. A cancelled body follows the existing validated Range-resume
++	// path without discarding decoded audio or resetting the track position.
++	resp.Body = &idleStreamBody{ReadCloser: resp.Body, cancel: cancel, timeout: streamReadIdleTimeout}
+ 	odlog.Debug("stream %s: HTTP %d %s (%s) off=%d", s.plan.TrackID, resp.StatusCode,
+ 		resp.Header.Get("Content-Type"), s.format, offset)
+ 	return resp, nil
+--- /dev/null
++++ b/internal/audio/stream_idle.go
+@@ -0,0 +1,46 @@
++package audio
++
++import (
++	"context"
++	"errors"
++	"io"
++	"sync/atomic"
++	"time"
++)
++
++const streamReadIdleTimeout = 5 * time.Second
++
++var errStreamReadIdle = errors.New("audio stream stopped delivering data")
++
++// No whole-track deadline: long streams and paused/preloaded sources are valid.
++// Cancellation unblocks the net/http read without starting a goroutine per read.
++type idleStreamBody struct {
++	io.ReadCloser
++	cancel  context.CancelFunc
++	timeout time.Duration
++	stalled atomic.Bool
++}
++
++func (b *idleStreamBody) Read(p []byte) (int, error) {
++	if len(p) == 0 {
++		return 0, nil
++	}
++	if b.stalled.Load() {
++		return 0, errStreamReadIdle
++	}
++	timer := time.AfterFunc(b.timeout, func() {
++		b.stalled.Store(true)
++		b.cancel()
++	})
++	n, err := b.ReadCloser.Read(p)
++	timer.Stop()
++	if b.stalled.Load() {
++		return n, errStreamReadIdle
++	}
++	return n, err
++}
++
++func (b *idleStreamBody) Close() error {
++	b.cancel()
++	return b.ReadCloser.Close()
++}
+--- /dev/null
++++ b/internal/audio/stream_idle_test.go
+@@ -0,0 +1,112 @@
++package audio
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strconv"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/Cycl0o0/OpenDeezer/v3/internal/deezer"
++)
++
++type cancelBlockedBody struct{ ctx context.Context }
++
++func (b cancelBlockedBody) Read([]byte) (int, error) { <-b.ctx.Done(); return 0, b.ctx.Err() }
++func (b cancelBlockedBody) Close() error             { return nil }
++
++func TestStreamIdleCancelsBlockedReadWithoutKillingSource(t *testing.T) {
++	parent, stop := context.WithCancel(context.Background())
++	defer stop()
++	ctx, cancel := context.WithCancel(parent)
++	body := &idleStreamBody{ReadCloser: cancelBlockedBody{ctx}, cancel: cancel, timeout: 20 * time.Millisecond}
++	defer body.Close()
++	if _, err := body.Read(make([]byte, 100)); !errors.Is(err, errStreamReadIdle) {
++		t.Fatalf("read: %v", err)
++	}
++	if parent.Err() != nil {
++		t.Fatal("idle timeout cancelled entire source, preventing resume")
++	}
++}
++
++func TestStreamIdleDoesNotTimeBackpressure(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	body := &idleStreamBody{ReadCloser: io.NopCloser(bytes.NewReader([]byte("abcdef"))), cancel: cancel, timeout: 10 * time.Millisecond}
++	defer body.Close()
++	buf := make([]byte, 3)
++	if _, err := io.ReadFull(body, buf); err != nil {
++		t.Fatal(err)
++	}
++	time.Sleep(40 * time.Millisecond) // preload gate / paused decoder, not a network read
++	if ctx.Err() != nil {
++		t.Fatal("backpressure expired the request")
++	}
++	if _, err := io.ReadFull(body, buf); err != nil || string(buf) != "def" {
++		t.Fatalf("resume after backpressure: %q %v", buf, err)
++	}
++	body.Close()
++	if ctx.Err() == nil {
++		t.Fatal("Close did not release request context")
++	}
++}
++
++// A CDN can leave TCP open indefinitely without returning an error. Verify
++// actual net/http cancellation and the production encrypted Range-resume path,
++// including the non-aligned decryption offset and exact final byte sequence.
++func TestStreamIdleDownloadResumesStalledEncryptedBody(t *testing.T) {
++	const trackID = "3135556"
++	cipher := make([]byte, 180003)
++	for i := range cipher {
++		cipher[i] = byte((i*7 + 3) % 251)
++	}
++	want, err := deezer.DecryptTrack(trackID, cipher)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var requests atomic.Int32
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		requests.Add(1)
++		if r.Header.Get("Range") != "" {
++			start := parseRangeStart(t, r.Header.Get("Range"))
++			if start == 0 || start >= len(cipher) {
++				t.Errorf("invalid resume offset %d", start)
++				return
++			}
++			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, len(cipher)-1, len(cipher)))
++			w.Header().Set("Content-Length", strconv.Itoa(len(cipher)-start))
++			w.WriteHeader(http.StatusPartialContent)
++			w.Write(cipher[start:])
++			return
++		}
++		w.Header().Set("Content-Length", strconv.Itoa(len(cipher)))
++		w.Write(cipher[:90001])
++		w.(http.Flusher).Flush()
++		<-r.Context().Done() // stays connected until the read-idle deadline cancels it
++	}))
++	defer server.Close()
++	s := newSource(&deezer.StreamPlan{CDNURL: server.URL, TrackID: trackID, Format: "MP3_320", Encrypted: true}, 30000)
++	defer s.kill()
++	done := make(chan struct{})
++	go func() { s.download(); close(done) }()
++	select {
++	case <-done:
++	case <-time.After(streamReadIdleTimeout + 5*time.Second):
++		s.kill()
++		t.Fatal("stalled download did not recover")
++	}
++	if requests.Load() != 2 {
++		t.Fatalf("requests=%d, want exactly one Range resume", requests.Load())
++	}
++	if s.lastErr() != "" {
++		t.Fatalf("download failed: %s", s.lastErr())
++	}
++	if got := drainStreamBuffer(s.sb); !bytes.Equal(got, want) {
++		t.Fatalf("resumed audio corrupt: got %d bytes, want %d", len(got), len(want))
++	}
++}
+--- /dev/null
++++ b/internal/audio/rebuffer_test.go
+@@ -0,0 +1,129 @@
++package audio
++
++import (
++	"bytes"
++	"math"
++	"testing"
++
++	"github.com/Cycl0o0/OpenDeezer/v3/internal/deezer"
++)
++
++func starvationPlayer(t *testing.T) (*Player, *source) {
++	t.Helper()
++	p := &Player{out: &mockOutput{}}
++	p.setVolume(1)
++	p.sleepGain.Store(math.Float64bits(1))
++	s := newSource(&deezer.StreamPlan{Format: "MP3"}, 30000)
++	t.Cleanup(s.kill)
++	p.cur.Store(s)
++	p.state.Store(int32(Playing))
++	return p, s
++}
++
++func TestStarvationWaitsForReserveAndPreservesPCM(t *testing.T) {
++	p, s := starvationPlayer(t)
++	out := make([]byte, bytesPerSec/50) // a normal 20ms device callback
++	if p.readPCM(out) != 0 {
++		t.Fatal("expected initial starvation")
++	}
++	// Emulate a connection recovering in tiny bursts. The previous callback
++	// consumed each burst immediately, producing repeated audible gaps.
++	chunk := bytes.Repeat([]byte{0x12, 0x23, 0x34, 0x45}, len(out)/frameBytes)
++	for i := 0; i < 49; i++ {
++		s.ring.write(chunk, s.ring.seq())
++		if p.readPCM(out) != 0 {
++			t.Fatalf("consumed insufficient reserve at burst %d", i)
++		}
++		if !bytes.Equal(out, make([]byte, len(out))) {
++			t.Fatal("buffering leaked audio")
++		}
++	}
++	if p.PositionMS() != 0 || s.ring.buffered() != 49*len(chunk) {
++		t.Fatal("buffering advanced or lost PCM")
++	}
++	s.ring.write(chunk, s.ring.seq())
++	if n := p.readPCM(out); n != len(out) {
++		t.Fatalf("did not resume: %d", n)
++	}
++	// Only the initial anti-click ramp differs from the original PCM.
++	if !bytes.Equal(out[fadeInFrames*frameBytes:], chunk[fadeInFrames*frameBytes:]) {
++		t.Fatal("recovery changed PCM")
++	}
++	for i := 1; i < 50; i++ {
++		if p.readPCM(out) != len(out) || !bytes.Equal(out, chunk) {
++			t.Fatalf("lost/reordered PCM at callback %d", i)
++		}
++	}
++	if p.PositionMS() != 1000 || p.cbRebuffers.Load() != 1 {
++		t.Fatal("incorrect position or repeated recovery")
++	}
++}
++
++func TestStarvationEOFTailDoesNotWaitForFullReserve(t *testing.T) {
++	p, s := starvationPlayer(t)
++	out := make([]byte, 4096)
++	p.readPCM(out)
++	s.ring.write(bytes.Repeat([]byte{1, 2, 3, 4}, 100), s.ring.seq())
++	s.eof.Store(true)
++	if n := p.readPCM(out); n != 400 {
++		t.Fatalf("EOF tail stranded: %d", n)
++	}
++	if p.readPCM(out) != 0 || s.rebuffering.Load() {
++		t.Fatal("EOF triggered another recovery")
++	}
++}
++
++func TestStarvationPauseResumeRetainsReserveGate(t *testing.T) {
++	p, s := starvationPlayer(t)
++	out := make([]byte, 4096)
++	p.readPCM(out)
++	p.Pause()
++	if p.State() != Paused {
++		t.Fatal("could not pause while buffering")
++	}
++	s.ring.write(make([]byte, 8192), s.ring.seq())
++	p.Resume()
++	if p.State() != Playing || p.readPCM(out) != 0 || s.ring.buffered() != 8192 {
++		t.Fatal("resume bypassed reserve gate")
++	}
++	s.ring.write(make([]byte, bytesPerSec), s.ring.seq())
++	if p.readPCM(out) != len(out) {
++		t.Fatal("resume failed after reserve filled")
++	}
++}
++
++func TestStarvationDoesNotHoldReplacementSource(t *testing.T) {
++	p, old := starvationPlayer(t)
++	out := make([]byte, 4096)
++	p.readPCM(out)
++	p.Stop()
++	if !old.dead.Load() {
++		t.Fatal("stop retained starved source")
++	}
++	next := newSource(&deezer.StreamPlan{Format: "MP3"}, 30000)
++	t.Cleanup(next.kill)
++	next.ring.write(make([]byte, len(out)), next.ring.seq())
++	p.cur.Store(next)
++	p.state.Store(int32(Playing))
++	if p.readPCM(out) != len(out) {
++		t.Fatal("previous recovery leaked to replacement")
++	}
++}
++
++func TestStarvationSeekWaitsForNewPCM(t *testing.T) {
++	p, s := starvationPlayer(t)
++	out := make([]byte, 4096)
++	p.readPCM(out)
++	p.SeekMS(5000)
++	s.ring.write(make([]byte, bytesPerSec), s.ring.seq())
++	if p.readPCM(out) != 0 {
++		t.Fatal("consumed PCM before seek completed")
++	}
++	s.seekTo.Store(-1) // decoder publishes completion after refreshing its ring
++	if p.readPCM(out) != len(out) {
++		t.Fatal("seek recovery failed")
++	}
++	if p.PositionMS() < 5000 {
++		t.Fatal("seek position reset")
++	}
++}

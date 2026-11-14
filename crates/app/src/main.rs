@@ -279,6 +279,9 @@ mod session;
 #[cfg(windows)]
 #[path = "providers/spotify.rs"]
 mod spotify;
+#[cfg(windows)]
+#[path = "providers/lastfm.rs"]
+mod lastfm;
 #[path = "providers/spotify_diagnostics.rs"]
 mod spotify_diagnostics;
 #[cfg(windows)]
@@ -321,14 +324,18 @@ fn main() {
                     0x606060,
                 ],
             )
-        } else if std::env::args().any(|a| a == "--spotify") {
+        } else if std::env::args().any(|a| a == "--spotify" || a == "--lastfm") {
             unsafe {
                 use windows_sys::Win32::System::Console::*;
                 if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
                     AllocConsole();
                 }
             }
-            spotify::run_cli()
+            if args.iter().any(|arg| arg == "--lastfm") {
+                lastfm::run_cli()
+            } else {
+                spotify::run_cli()
+            }
         } else if std::env::args().any(|a| a == "--integration-test") {
             integration::run()
         } else if std::env::args().any(|a| a == "--deezer-playback-test") {

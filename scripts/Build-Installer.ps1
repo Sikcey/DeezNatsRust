@@ -19,8 +19,8 @@ New-Item -ItemType Directory -Force $OutputDirectory | Out-Null
 $OutputDirectory = (Resolve-Path -LiteralPath $OutputDirectory).Path
 $AppDirectory = (Resolve-Path -LiteralPath $AppDirectory).Path
 $engineHash = (Get-FileHash -LiteralPath (Join-Path $AppDirectory 'libdeezercore.dll') -Algorithm SHA256).Hash
-if ($engineHash -ne 'C86910F53E259B6DE3D9C94DE548010289998E89B25B430F75CFEFAADEAB488C') {
-    throw 'Engine differs from v0.1.6; update the source and license information before packaging.'
+if ($engineHash -ne '3B3A434D5C107A7380B759DE30C52FBE03562466C0D3B139C5367601699D935B') {
+    throw 'Engine differs from the v0.1.8 playback recovery build; update the source and license information before packaging.'
 }
 & $Compiler "/DPROJECT=$project" "/DPAYLOAD=$AppDirectory" "/DOUTPUT=$OutputDirectory" "/DAPPVERSION=$appVersion" "/DPRODUCTVERSION=$productVersion" (Join-Path $project 'installer/DeezNats.nsi')
 if ($LASTEXITCODE -ne 0) { throw 'Installer build failed.' }

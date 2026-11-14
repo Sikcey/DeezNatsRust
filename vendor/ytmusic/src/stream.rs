@@ -124,15 +124,19 @@ impl AudioStream {
             };
             match tokio::time::timeout(STALL, response.chunk()).await {
                 Ok(Ok(Some(chunk))) => {
+                    anyhow::ensure!(
+                        chunk.len() as u64 <= self.end + 1 - self.offset,
+                        "stream body exceeds requested range"
+                    );
                     self.offset += chunk.len() as u64;
                     self.failures = 0;
                     return Ok(Some(chunk));
                 }
                 Ok(Ok(None)) => {
                     self.response = None;
-                    // Without a length, a range that ended early is the end of the file.
-                    if self.total.is_none() && self.offset <= self.end {
-                        return Ok(None);
+                    if self.offset <= self.end {
+                        self.retry(anyhow::anyhow!("stream body ended before requested range"))?;
+                        continue;
                     }
                 }
                 Ok(Err(error)) => self.retry(anyhow::Error::new(error))?,
@@ -151,7 +155,35 @@ impl AudioStream {
         let response = tokio::time::timeout(STALL, sent)
             .await
             .context("the stream host did not answer")??;
-        self.end = end;
+        if let Some(value) = response
+            .headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+        {
+            if let Some((_, total)) = value.split_once('/') {
+                if let Ok(total) = total.parse::<u64>() {
+                    if let Some(expected) = self.total {
+                        anyhow::ensure!(expected == total, "stream length changed");
+                    }
+                    self.total = Some(total);
+                }
+            }
+        } else if self.offset == 0 {
+            self.total = response.content_length().or(self.total);
+        }
+        self.end = response
+            .headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split_once('/'))
+            .and_then(|(bounds, _)| bounds.rsplit_once('-'))
+            .and_then(|(_, last)| last.parse().ok())
+            .unwrap_or_else(|| {
+                response
+                    .content_length()
+                    .map(|length| self.offset + length - 1)
+                    .unwrap_or(end)
+            });
         self.response = Some(response);
         Ok(())
     }
@@ -248,5 +280,90 @@ pub(crate) async fn request(
     if !status.is_success() {
         bail!(Refused(status));
     }
+    validate_range_response(status, response.headers(), start, end)?;
     Ok(response)
+}
+
+fn validate_range_response(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    start: u64,
+    end: u64,
+) -> Result<()> {
+    anyhow::ensure!(end >= start, "invalid requested range");
+    if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        let value = headers
+            .get("content-range")
+            .context("missing Content-Range")?
+            .to_str()
+            .context("invalid Content-Range")?;
+        let (bounds, total) = value
+            .strip_prefix("bytes ")
+            .and_then(|v| v.split_once('/'))
+            .context("invalid Content-Range")?;
+        let (first, last) = bounds.split_once('-').context("invalid Content-Range")?;
+        let first: u64 = first.parse()?;
+        let last: u64 = last.parse()?;
+        anyhow::ensure!(
+            first == start && last >= first && last <= end,
+            "unexpected Content-Range"
+        );
+        if total != "*" {
+            let total: u64 = total.parse()?;
+            anyhow::ensure!(
+                last < total && (last == end || last + 1 == total),
+                "incomplete Content-Range"
+            );
+        } else {
+            anyhow::ensure!(last == end, "incomplete range with unknown total");
+        }
+        if let Some(length) = headers.get("content-length") {
+            anyhow::ensure!(
+                length.to_str()?.parse::<u64>()? == last - first + 1,
+                "range length mismatch"
+            );
+        }
+    } else {
+        let length: u64 = headers
+            .get("content-length")
+            .context("unbounded non-range response")?
+            .to_str()?
+            .parse()?;
+        anyhow::ensure!(
+            status == reqwest::StatusCode::OK
+                && start == 0
+                && length > 0
+                && length <= end - start + 1,
+            "host ignored requested range"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+    use reqwest::{StatusCode, header::HeaderMap};
+
+    #[test]
+    fn range_headers_reject_wrong_offsets_and_unbounded_bodies() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-range", "bytes 10-19/100".parse().unwrap());
+        headers.insert("content-length", "10".parse().unwrap());
+        assert!(validate_range_response(StatusCode::PARTIAL_CONTENT, &headers, 10, 19).is_ok());
+        assert!(validate_range_response(StatusCode::PARTIAL_CONTENT, &headers, 0, 9).is_err());
+        headers.insert("content-length", "11".parse().unwrap());
+        assert!(validate_range_response(StatusCode::PARTIAL_CONTENT, &headers, 10, 19).is_err());
+        assert!(validate_range_response(StatusCode::OK, &HeaderMap::new(), 0, 9).is_err());
+        assert!(validate_range_response(StatusCode::OK, &headers, 10, 19).is_err());
+    }
+
+    #[test]
+    fn final_range_may_be_short_only_at_object_end() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-range", "bytes 10-14/15".parse().unwrap());
+        assert!(validate_range_response(StatusCode::PARTIAL_CONTENT, &headers, 10, 19).is_ok());
+        headers.insert("content-range", "bytes 10-14/100".parse().unwrap());
+        assert!(validate_range_response(StatusCode::PARTIAL_CONTENT, &headers, 10, 19).is_err());
+    }
 }

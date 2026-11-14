@@ -2,7 +2,7 @@
 use crate::engine::Engine as Deezer;
 
 mod autoplay {
-    //! One host-owned radio station; recommendations stay private until needed.
+    //! Prepare a station early and expose its batch when the source queue reaches its end.
     use super::{sync_queue, Snapshot};
     use crate::{catalog::Entry, engine::Engine};
     use std::{
@@ -32,6 +32,8 @@ mod autoplay {
         pool: VecDeque<Entry>,
         recent: VecDeque<String>,
         pending: Option<Pending>,
+        prefetch: Option<Pending>,
+        prefetch_attempted: bool,
         radio_id: String,
         radio_version: i64,
     }
@@ -64,9 +66,14 @@ mod autoplay {
             self.generation = self.generation.wrapping_add(1);
             self.pending = None;
             if reset_station {
+                self.prefetch = None;
+                self.prefetch_attempted = false;
                 self.seed = None;
                 self.pool.clear();
                 self.radio_id.clear();
+            } else if let Some(prefetch) = &mut self.prefetch {
+                // Transport controls do not change the station being prepared.
+                prefetch.stamp.generation = self.generation;
             }
         }
 
@@ -92,6 +99,7 @@ mod autoplay {
                     && !self.recent.contains(&item.id)
                     && !s.queue.iter().any(|queued| queued.id == item.id)
                 {
+                    self.prefetch_attempted = false;
                     return Some(item);
                 }
             }
@@ -118,7 +126,7 @@ mod autoplay {
             s: &mut Snapshot,
             version: &mut i64,
             stamp: &Stamp,
-            item: Entry,
+            mut item: Entry,
         ) -> Result<(), String> {
             if !self.valid(stamp, s, *version) {
                 return Ok(());
@@ -126,7 +134,8 @@ mod autoplay {
             if item.id.starts_with("spotify:") {
                 return Err("Spotify radio must use the Spotify playback queue".into());
             }
-            // Insert exactly one row, preserving the native shuffle cycle/history.
+            self.mark_radio(&mut item);
+            // Insert the first radio row before appending the prepared batch.
             let index = s.queue_index + 1;
             dz.invoke(
                 "DZQueueInsertNext",
@@ -168,7 +177,7 @@ mod autoplay {
             let in_radio = self.radio_id == s.now.id
                 && !self.radio_id.is_empty()
                 && self.radio_version == *version;
-            if !manual_radio(s, in_radio) {
+            if !manual_radio(s, in_radio) || s.queue_index + 1 < s.queue.len() {
                 return Ok(false);
             }
             unsafe {
@@ -188,9 +197,7 @@ mod autoplay {
             allow_start: bool,
         ) {
             self.remember(&s.now);
-            s.radio_active = self.radio_id == s.now.id
-                && !self.radio_id.is_empty()
-                && self.radio_version == *version;
+            s.radio_active = super::is_radio_queue_entry(&s.now);
             let Ok(count) = dz
                 .invoke("DZFinishedCount", &[])
                 .and_then(|v| v.as_i64().ok_or("Invalid finish count".into()))
@@ -219,10 +226,74 @@ mod autoplay {
                     }
                 }
             }
-            if !ended || !allow_start || !eligible(s, false) || self.pending.is_some() {
-                return;
+            if let Some(prefetch) = self.prefetch.take() {
+                if prefetch.stamp.generation == self.generation {
+                    match prefetch.result.try_recv() {
+                        Ok(Ok(tracks)) => self.pool = tracks.into(),
+                        Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {}
+                        Err(mpsc::TryRecvError::Empty) => self.prefetch = Some(prefetch),
+                    }
+                }
             }
-            self.begin_next(dz, s, version, false);
+            if ended && allow_start && eligible(s, false) && self.pending.is_none() {
+                self.begin_next(dz, s, version, false);
+            } else if allow_start
+                && s.autoplay
+                && s.connected
+                && s.repeat == 0
+                && s.state == "Playing"
+                && self.seed.is_some()
+                && self.pool.is_empty()
+                && s.queue.iter().skip(s.queue_index + 1).filter(|e| super::is_radio_queue_entry(e)).count() < 3
+                && self.pending.is_none()
+                && self.prefetch.is_none()
+                && !self.prefetch_attempted
+            {
+                self.prefetch_attempted = true;
+                let stamp = Stamp {
+                    manual: false,
+                    generation: self.generation,
+                    version: *version,
+                    index: s.queue_index,
+                    finished_id: s.now.id.clone(),
+                };
+                self.prefetch = self.fetch(dz, s, stamp);
+            }
+            if allow_start && s.autoplay && s.repeat == 0 && s.state == "Playing"
+                && !self.pool.is_empty()
+                && s.queue.iter().skip(s.queue_index + 1).all(|e| super::is_radio_queue_entry(e))
+            {
+                let mut tracks = (*s.queue).clone();
+                while let Some(mut item) = self.take_candidate(s) {
+                    if tracks.iter().any(|e| e.id == item.id) { continue; }
+                    self.mark_radio(&mut item);
+                    tracks.push(item);
+                }
+                if tracks.len() != s.queue.len() {
+                    match super::set_queue(dz, &tracks, s.queue_index) {
+                        Ok(()) => {
+                            s.queue = Arc::new(tracks);
+                            *version = -1;
+                            if let Err(error) = sync_queue(dz, s, version) { s.message = error; }
+                        }
+                        Err(error) => s.message = error,
+                    }
+                }
+            }
+        }
+
+        fn mark_radio(&self, item: &mut Entry) {
+            if !item.raw.is_object() { item.raw = serde_json::json!({}); }
+            item.raw[super::QUEUE_RADIO] = serde_json::json!(true);
+            item.raw[super::QUEUE_MANUAL] = serde_json::json!(false);
+            item.raw[super::QUEUE_FALLBACK] = serde_json::json!(true);
+            if let Some(seed) = &self.seed {
+                let name = seed.raw["queue_context_name"].as_str().unwrap_or(&seed.title);
+                item.raw["queue_context_name"] = serde_json::json!(name);
+                if let Some(style) = seed.raw.get(crate::style_mix::MARKER) {
+                    item.raw[crate::style_mix::MARKER] = style.clone();
+                }
+            }
         }
 
         fn begin_next(
@@ -245,9 +316,17 @@ mod autoplay {
                 }
                 return;
             }
-            let Some(seed) = self.seed.clone() else {
-                return;
-            };
+            if let Some(mut prefetch) = self.prefetch.take() {
+                prefetch.stamp = stamp;
+                self.pending = Some(prefetch);
+            } else {
+                self.pending = self.fetch(dz, s, stamp);
+            }
+            self.prefetch_attempted = false;
+        }
+
+        fn fetch(&self, dz: &Arc<Engine>, s: &Snapshot, stamp: Stamp) -> Option<Pending> {
+            let seed = self.seed.clone()?;
             let engine = Arc::clone(dz);
             let excluded: Vec<_> = s
                 .queue
@@ -256,7 +335,7 @@ mod autoplay {
                 .chain(self.recent.iter().cloned())
                 .collect();
             let (tx, result) = mpsc::channel();
-            self.pending = Some(Pending { stamp, result });
+            let pending = Pending { stamp, result };
             std::thread::spawn(move || {
                 let fetch = |name, id| {
                     let value = if seed.id.starts_with("spotify:") {
@@ -290,6 +369,7 @@ mod autoplay {
                 }
                 let _ = tx.send(tracks);
             });
+            Some(pending)
         }
     }
 
@@ -398,6 +478,50 @@ mod autoplay {
             assert!(!a.natural_finish(5));
             assert!(!a.natural_finish(0)); // Engine restart resets the baseline.
             assert!(a.natural_finish(1));
+        }
+
+        #[test]
+        fn radio_batch_retains_source_and_is_separate_from_manual_items() {
+            let mut a = Autoplay::default();
+            let mut seed=track("seed");
+            seed.raw=serde_json::json!({"queue_context_name":"Flow - Happy"});
+            a.remember(&seed);
+            a.remember(&track("last"));
+            let mut item=track("recommendation");
+            a.mark_radio(&mut item);
+            assert!(super::super::is_radio_queue_entry(&item));
+            assert!(!super::super::is_manual_queue_entry(&item));
+            assert_eq!(item.raw["queue_context_name"],"Flow - Happy");
+            let manual=super::super::explicit_queue_entry(item);
+            assert!(!super::super::is_radio_queue_entry(&manual));
+        }
+
+        #[test]
+        fn prefetch_keeps_initial_seed_as_flow_advances_and_resets_on_new_playback() {
+            let mut a = Autoplay::default();
+            a.remember(&track("flow-first"));
+            a.remember(&track("flow-last"));
+            assert_eq!(a.seed.as_ref().unwrap().id, "flow-first");
+            let (_tx, result) = mpsc::channel();
+            a.prefetch = Some(Pending {
+                stamp: Stamp {
+                    manual: false,
+                    generation: a.generation,
+                    version: 1,
+                    index: 0,
+                    finished_id: "flow-first".into(),
+                },
+                result,
+            });
+            a.prefetch_attempted = true;
+            a.cancel(false);
+            assert_eq!(a.prefetch.as_ref().unwrap().stamp.generation, a.generation);
+            assert_eq!(a.seed.as_ref().unwrap().id, "flow-first");
+            a.cancel(true);
+            assert!(a.prefetch.is_none());
+            assert!(!a.prefetch_attempted);
+            a.remember(&track("new-session"));
+            assert_eq!(a.seed.as_ref().unwrap().id, "new-session");
         }
 
         #[test]
@@ -1197,6 +1321,31 @@ fn is_song_selection(command: &Command) -> bool {
     match command { Command::Selection(_, inner) => is_song_selection(inner),
         Command::Play(_) | Command::PlayEntry(..) | Command::PlayQueueIndex(_) => true, _ => false }
 }
+pub(crate) fn manual_repeat_changes(snapshot: &Snapshot, item: &crate::catalog::Entry) -> bool {
+    snapshot.repeat == 2 && (snapshot.now.id != item.id || snapshot.now.kind != item.kind)
+}
+
+fn clear_manual_repeat(dz: &Deezer, snapshot: &mut Snapshot, item: &crate::catalog::Entry) -> Result<(), String> {
+    if manual_repeat_changes(snapshot, item) {
+        dz.invoke("DZSetRepeat", &[serde_json::json!(0)])?;
+        snapshot.repeat = 0;
+    }
+    Ok(())
+}
+#[test]
+fn repeat_one_only_clears_for_a_different_manual_track() {
+    let mut snapshot = Snapshot::default();
+    snapshot.now.id = "first".into();
+    snapshot.now.kind = "track".into();
+    let mut next = snapshot.now.clone();
+    for repeat in [0, 1, 2] {
+        snapshot.repeat = repeat;
+        assert!(!manual_repeat_changes(&snapshot, &next));
+        next.id = "second".into();
+        assert_eq!(manual_repeat_changes(&snapshot, &next), repeat == 2);
+        next.id = "first".into();
+    }
+}
 fn is_command_boundary(command: &Command) -> bool {
     match command { Command::Selection(_, inner) => is_command_boundary(inner),
         Command::SwitchProvider(_) | Command::Logout | Command::Quit => true, _ => false }
@@ -1267,6 +1416,10 @@ pub struct Snapshot {
 }
 // Collection tracks are the fallback after explicitly queued items.
 pub(crate) const QUEUE_FALLBACK: &str = "_queue_fallback";
+pub(crate) const QUEUE_RADIO: &str = "_queue_radio";
+pub(crate) fn is_radio_queue_entry(entry: &crate::catalog::Entry) -> bool {
+    entry.raw[QUEUE_RADIO].as_bool() == Some(true) && !is_manual_queue_entry(entry)
+}
 pub(crate) const QUEUE_MANUAL: &str = "_queue_manual";
 pub(crate) fn mark_queue_fallback(items: &mut [crate::catalog::Entry]) {
     for item in items {
@@ -1391,7 +1544,7 @@ fn adopt_queue(snapshot: &mut Snapshot, value: &serde_json::Value) -> Result<i64
             if let Some(fallback) = old.raw.get(QUEUE_FALLBACK) {
                 entry.raw[QUEUE_FALLBACK] = fallback.clone();
             }
-            for key in [QUEUE_MANUAL,"queue_context_name"] { if let Some(value)=old.raw.get(key) {entry.raw[key]=value.clone();} }
+            for key in [QUEUE_MANUAL,QUEUE_RADIO,"queue_context_name"] { if let Some(value)=old.raw.get(key) {entry.raw[key]=value.clone();} }
 
             if let Some(selection) = old.raw.get(crate::style_mix::MARKER) {
                 entry.raw[crate::style_mix::MARKER] = selection.clone();
@@ -2312,7 +2465,8 @@ impl Worker {
                             | Ok(Command::Login(_))
                             | Ok(Command::Logout)
                     );
-                    autoplay.cancel(reset);
+                    let radio_jump = matches!(&command, Ok(Command::PlayQueueIndex(index)) if snapshot.queue.get(*index).is_some_and(is_radio_queue_entry));
+                    autoplay.cancel(reset && !radio_jump);
                 }
                 #[cfg(feature = "diagnostics")]
                 let play_timing = matches!(
@@ -2457,6 +2611,7 @@ impl Worker {
                             if !item.playable() || item.id.is_empty() {
                                 return Err("Only tracks and episodes can be played".into());
                             }
+                            clear_manual_repeat(dz, &mut snapshot, &item)?;
 
                             let mut tracks: Vec<_> =
                                 items.into_iter().filter(|e| e.playable()).collect();
@@ -2500,6 +2655,7 @@ impl Worker {
                                 return Err("Queue index out of bounds".into());
                             }
                             let item = queue[index].clone();
+                            clear_manual_repeat(dz, &mut snapshot, &item)?;
                             dz.invoke("DZQueueSetIndex", &[serde_json::json!(index)])?;
                             snapshot.queue_index = index;
                             failed_index = Some(index);
@@ -2646,6 +2802,8 @@ impl Worker {
                                 (current + 1) % queue.len()
                             };
                             let item = &queue[index];
+                            let item = item.clone();
+                            clear_manual_repeat(dz, &mut snapshot, &item)?;
                             dz.invoke("DZQueueSetIndex", &[serde_json::json!(index)])?;
                             failed_index = Some(index);
                             if dz
@@ -2694,6 +2852,19 @@ impl Worker {
                         }
                         Ok(Command::Autoplay(value)) => {
                             snapshot.autoplay = value;
+                            if !value {
+                                if let Some(dz) = &engine {
+                                    let tracks: Vec<_> = snapshot.queue.iter().enumerate()
+                                        .filter(|(index, item)| *index <= snapshot.queue_index || !is_radio_queue_entry(item))
+                                        .map(|(_, item)| item.clone()).collect();
+                                    if tracks.len() != snapshot.queue.len() {
+                                        set_queue(dz, &tracks, snapshot.queue_index)?;
+                                        snapshot.queue = Arc::new(tracks);
+                                        queue_version = -1;
+                                        sync_queue(dz, &mut snapshot, &mut queue_version)?;
+                                    }
+                                }
+                            }
                         }
                         Ok(Command::Discord(value)) => {
                             snapshot.discord_settings = discord.configure(&value)?;
@@ -2848,7 +3019,9 @@ impl Worker {
                             }
                         }
                         if let Some(source) = snapshot.queue.get(snapshot.queue_index).filter(|entry| entry.id == snapshot.now.id) {
-                        if let Some(name) = source.raw.get("queue_context_name") { snapshot.now.raw["queue_context_name"] = name.clone(); }
+                        for key in ["queue_context_name", QUEUE_RADIO, QUEUE_MANUAL] {
+                            if let Some(value) = source.raw.get(key) { snapshot.now.raw[key] = value.clone(); }
+                        }
                     }
                     if snapshot.now.id.is_empty() && snapshot.queue_index < snapshot.queue.len()
                         {

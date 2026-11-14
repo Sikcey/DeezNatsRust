@@ -12,6 +12,7 @@ pub struct Request {
     pub cancelled: Arc<AtomicBool>,
 }
 pub enum Event {
+    OfflineLoaded(Vec<Entry>),
     Maintenance(Result<String, String>),
     Started(u64, String),
     Removed(Result<(), String>),
@@ -26,6 +27,7 @@ struct Job {
     quality: usize,
 }
 enum Message {
+    LoadOffline,
     Maintenance(bool),
     Download(Request),
     Remove(Option<Arc<Engine>>),
@@ -39,6 +41,9 @@ pub struct Worker {
     pub updates: mpsc::Receiver<Event>,
 }
 impl Worker {
+    pub fn reload_offline(&self) {
+        let _ = self.requests.send(Message::LoadOffline);
+    }
     pub fn maintenance(&self, clean: bool) -> Result<(), String> {
         self.requests
             .send(Message::Maintenance(clean))
@@ -50,9 +55,18 @@ impl Worker {
         let removing = Arc::new(AtomicBool::new(false));
         let (tx, updates) = mpsc::sync_channel(8);
         std::thread::spawn(move || {
+            if tx.send(Event::OfflineLoaded(load_offline())).is_err() {
+                return;
+            }
             let mut last_engine = None;
             while let Ok(message) = rx.recv() {
                 let request = match message {
+                    Message::LoadOffline => {
+                        if tx.send(Event::OfflineLoaded(load_offline())).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
                     Message::Maintenance(clean) => {
                         let result =
                             crate::storage::data_dir().and_then(|dir| maintenance_at(&dir, clean));
@@ -147,7 +161,9 @@ impl Worker {
                     });
                     let result = result.and_then(|receipt| {
                         item.raw["_offline"] = receipt.clone();
-                        let mut offline = load_offline();
+                        // Preserve recoverable records and fail closed on an unreadable library.
+                        // Download completion must not re-hash the existing audio collection.
+                        let mut offline = load_offline_at(&crate::storage::data_dir()?)?;
                         if let Some(previous) = offline
                             .iter()
                             .find(|e| e.id == item.id && e.kind == item.kind)
@@ -432,7 +448,7 @@ pub fn missing_downloads() -> Result<Vec<Entry>, String> {
     let directory = crate::storage::data_dir()?;
     Ok(load_offline_at(&directory)?
         .into_iter()
-        .filter(|item| verified_path(&directory, item, None).is_err())
+        .filter(|item| !offline_valid(&directory, item))
         .collect())
 }
 
@@ -700,6 +716,29 @@ fn job_path(id: u64) -> Result<std::path::PathBuf, String> {
         .join("download-jobs")
         .join(format!("{id}.json")))
 }
+pub fn next_job_id(current_max: u64) -> Result<u64, String> {
+    next_job_id_at(&crate::storage::data_dir()?.join("download-jobs"), current_max)
+}
+
+fn next_job_id_at(directory: &std::path::Path, current_max: u64) -> Result<u64, String> {
+    let files = match std::fs::read_dir(directory) {
+        Ok(files) => files,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return current_max.checked_add(1).ok_or("Download job ID exhausted".into());
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut highest = current_max;
+    for file in files {
+        let path = file.map_err(|e| e.to_string())?.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("json") {
+            if let Some(id) = path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse::<u64>().ok()) {
+                highest = highest.max(id);
+            }
+        }
+    }
+    highest.checked_add(1).ok_or("Download job ID exhausted".into())
+}
 fn remove_job(id: u64) -> Result<(), String> {
     match std::fs::remove_file(job_path(id)?) {
         Ok(()) => Ok(()),
@@ -927,18 +966,16 @@ pub fn load_offline() -> Vec<Entry> {
         .unwrap_or_default();
     items
         .into_iter()
-        .filter(|item| {
-            let Ok(path) = verified_path(&directory, item, None) else {
-                return false;
-            };
-            // Legacy rows must pass the engine index/file checks; new rows also detect corruption.
-            item.raw.get("_offline").is_none_or(|expected| {
-                receipt(&path).is_ok_and(|actual| {
-                    actual["size"] == expected["size"] && actual["sha256"] == expected["sha256"]
-                })
-            })
-        })
+        .filter(|item| offline_valid(&directory, item))
         .collect()
+}
+fn offline_valid(directory: &std::path::Path, item: &Entry) -> bool {
+    let Ok(path) = verified_path(directory, item, None) else { return false; };
+    item.raw.get("_offline").is_none_or(|expected| {
+        receipt(&path).is_ok_and(|actual| {
+            actual["size"] == expected["size"] && actual["sha256"] == expected["sha256"]
+        })
+    })
 }
 fn persist_offline(items: &[Entry]) -> Result<(), String> {
     persist_offline_at(&crate::storage::data_dir()?, items)
@@ -1061,6 +1098,18 @@ mod tests {
     }
 
     #[test]
+    fn job_ids_include_recoverable_files_and_reject_overflow() {
+        let directory = temporary_directory();
+        std::fs::write(directory.join("41.json"), b"broken but recoverable").unwrap();
+        assert_eq!(next_job_id_at(&directory, 0).unwrap(), 42);
+        assert_eq!(next_job_id_at(&directory, 99).unwrap(), 100);
+        assert!(next_job_id_at(&directory, u64::MAX).is_err());
+        std::fs::write(directory.join("offline.json"), b"invalid").unwrap();
+        assert!(load_offline_at(&directory).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn maintenance_reports_missing_saved_audio() {
         let directory = temporary_directory();
         let root = directory.join("mediacache");
@@ -1083,6 +1132,16 @@ mod tests {
         let rows = load_offline_at(&directory).unwrap();
         assert!(verified_path(&directory, &rows[0], None).is_ok());
         assert!(verified_path(&directory, &rows[1], None).is_err());
+        let mut saved = rows[0].clone();
+        saved.raw["_offline"] = receipt(&root.join("saved")).unwrap();
+        assert!(offline_valid(&directory, &saved));
+        std::fs::write(root.join("saved"), b"other").unwrap();
+        assert!(!offline_valid(&directory, &saved));
+        // Persisting a new record must keep the unavailable record and its repair metadata.
+        let mut merged = load_offline_at(&directory).unwrap();
+        merged.push(Entry { id: "3".into(), kind: "track".into(), title: "New download".into(), ..Default::default() });
+        persist_offline_at(&directory, &merged).unwrap();
+        assert_eq!(load_offline_at(&directory).unwrap().len(), 3);
         assert_eq!(rows[1].raw["_download_groups"][0]["id"], "9");
         std::fs::remove_dir_all(directory).unwrap();
     }

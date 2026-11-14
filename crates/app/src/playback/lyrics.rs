@@ -417,10 +417,7 @@ mod extras {
                     .unwrap_or(0)
                     .saturating_mul(1000),
             ) {
-                gate.blocked = Some(Instant::now() + Duration::from_secs(600));
-                return Err(
-                    "Musixmatch returned a different recording; ignored and cooling down".into(),
-                );
+                return Err("Musixmatch returned a different recording; ignored".into());
             }
             return mxm_parse(calls);
         }

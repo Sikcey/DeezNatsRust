@@ -1121,8 +1121,6 @@ pub(crate) mod flow {
         )
     }
 
-    /// Derive mood genres from explicitly named genres in mood playlist titles.
-    /// Saved selections always win over discovery, including an explicitly empty selection.
     pub(crate) fn provider_tuner(
         key: &str,
         directory: &Value,
@@ -1130,12 +1128,7 @@ pub(crate) mod flow {
     ) -> Result<Value, String> {
         let mut selection = Selection::parse(key)?;
         let saved = key.starts_with(PREFIX);
-        if !saved && selection.mood != "default" && playlists.as_array().is_none_or(Vec::is_empty) {
-            return Err(
-                "The provider returned no playlists for this mood. Try again after reconnecting."
-                    .into(),
-            );
-        }
+        let defaults = mood_genres(&selection.mood);
         if !saved {
             selection.genres.clear();
         }
@@ -1172,8 +1165,10 @@ pub(crate) mod flow {
                 let pattern = searchable(name);
                 let source = sources
                     .iter()
-                    .find(|(text, _)| {
-                        text.contains(&searchable(&selection.mood)) && text.contains(&pattern)
+                    .find(|(text, item)| {
+                        (item["mood"].as_str() == Some(selection.mood.as_str())
+                            || text.contains(&searchable(&selection.mood)))
+                            && text.contains(&pattern)
                     })
                     .map(|(_, item)| *item);
                 let native = directory.as_array().into_iter().flatten().find(|genre| {
@@ -1186,19 +1181,22 @@ pub(crate) mod flow {
                     .filter(|s| !s.is_empty())
                     .or_else(|| source.and_then(|item| item["artwork"].as_str()))
                     .unwrap_or_default();
+                let recommended = defaults.iter().any(|genre| genre.eq_ignore_ascii_case(name))
+                    || source.is_some();
                 let enabled = if saved {
                     selection
                         .genres
                         .iter()
                         .any(|g| g.eq_ignore_ascii_case(name))
                 } else {
-                    selection.mood != "default" && source.is_some()
+                    selection.mood != "default" && recommended
                 };
                 json!({"id":name,"title":name,"isEnabled":enabled,"artwork":artwork,
-                    "isMoodGenre":selection.mood == "default" || source.is_some()})
+                    "isMoodGenre":selection.mood == "default" || recommended})
             })
             .collect();
-        Ok(json!({"id":key,"customizable":true,"genres":genres,"moodSource":"provider-playlists"}))
+        Ok(json!({"id":key,"customizable":true,"genres":genres,
+            "moodSource":"curated-and-provider-playlists"}))
     }
 
     pub(crate) fn artwork_key(provider: crate::catalog::Provider, genre: &str) -> String {
@@ -1261,6 +1259,21 @@ pub(crate) mod flow {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default()
+    }
+
+    /// Deezer returns all editable clusters, including genres disabled for this mood.
+    /// Only this configuration's IDs can be sent back to its tuner.
+    pub(crate) fn deezer_tuner(tuner: &Value) -> Value {
+        let mut tuner = tuner.clone();
+        let personal = tuner["id"].as_str() == Some("default");
+        if let Some(genres) = tuner["genres"].as_array_mut() {
+            for genre in genres {
+                genre["isMoodGenre"] = json!(personal
+                    || genre["isEnabled"] == true
+                    || genre["isEditedByUser"] == true);
+            }
+        }
+        searchable_catalog(&tuner, &[])
     }
 
     pub(crate) fn searchable_catalog(tuner: &Value, cached: &[Value]) -> Value {
@@ -1643,7 +1656,7 @@ pub(crate) mod flow {
         fn live_spotify_mood_catalog_and_genre_artwork() {
             let tuner =
                 crate::spotify::catalog_invoke("DZFlowTunerJSON", &[json!("focus")]).unwrap();
-            assert_eq!(tuner["moodSource"], "provider-playlists");
+            assert!(matches!(tuner["moodSource"].as_str(), Some("curated-and-provider-playlists" | "lastfm-artist-tags")));
             assert!(tuner["genres"]
                 .as_array()
                 .unwrap()
@@ -1658,7 +1671,7 @@ pub(crate) mod flow {
         #[ignore = "requires a saved YouTube Music session and network access"]
         fn live_youtube_mood_catalog_and_genre_artwork() {
             let tuner = crate::youtube::invoke("DZFlowTunerJSON", &[json!("focus")]).unwrap();
-            assert_eq!(tuner["moodSource"], "provider-playlists");
+            assert!(matches!(tuner["moodSource"].as_str(), Some("curated-and-provider-playlists" | "lastfm-artist-tags")));
             assert!(tuner["genres"]
                 .as_array()
                 .unwrap()
@@ -1670,7 +1683,7 @@ pub(crate) mod flow {
         }
 
         #[test]
-        fn provider_mood_results_replace_presets_and_preserve_explicit_edits() {
+        fn provider_mood_results_supplement_defaults_and_preserve_explicit_edits() {
             let directory = json!([
                 {"title":"New provider genre","kind":"genre"},
                 {"title":"A provider mood","kind":"mood"}
@@ -1695,9 +1708,9 @@ pub(crate) mod flow {
                     .any(|g| g["id"] == genre && g["isEnabled"] == true)
             };
             assert!(enabled(&spotify, "Ambient"));
-            assert!(!enabled(&spotify, "Classical"));
+            assert!(enabled(&spotify, "Classical"));
             assert!(enabled(&youtube, "Jazz"));
-            assert!(!enabled(&youtube, "Ambient"));
+            assert!(enabled(&youtube, "Ambient"));
             assert!(spotify["genres"]
                 .as_array()
                 .unwrap()
@@ -1729,10 +1742,46 @@ pub(crate) mod flow {
                     .iter()
                     .all(|g| g["isEnabled"] == false)
             );
-            assert!(provider_tuner("focus", &directory, &json!([])).is_err());
+            let fallback = provider_tuner("focus", &directory, &json!([])).unwrap();
+            assert!(enabled(&fallback, "Ambient"));
+            assert!(enabled(&fallback, "Classical"));
+            assert!(!enabled(&fallback, "Rock"));
         }
 
         #[test]
+    fn provider_mood_page_does_not_require_mood_in_playlist_title() {
+        let tuner = provider_tuner(
+            "focus",
+            &json!([]),
+            &json!([
+                {"title":"Jazz Classics", "mood":"focus"},
+                {"title":"Rock Classics", "mood":"party"},
+                {"title":"Metal Essentials"}
+            ]),
+        ).unwrap();
+        let enabled: Vec<_> = tuner["genres"].as_array().unwrap().iter()
+            .filter(|genre| genre["isEnabled"] == true)
+            .map(|genre| genre["id"].as_str().unwrap())
+            .collect();
+        assert!(enabled.contains(&"Jazz"));
+        assert!(!enabled.contains(&"Rock"));
+        assert!(!enabled.contains(&"Metal"));
+    }
+
+    #[test]
+    fn every_mood_has_defaults_without_provider_discovery() {
+        for (mood, _) in MOODS {
+            let tuner = provider_tuner(mood, &json!([]), &json!([])).unwrap();
+            let enabled: Vec<_> = tuner["genres"].as_array().unwrap().iter()
+                .filter(|genre| genre["isEnabled"] == true)
+                .map(|genre| genre["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(enabled.len(), mood_genres(mood).len(), "{mood}");
+            assert!(mood_genres(mood).iter().all(|genre| enabled.contains(&genre.as_str())));
+        }
+    }
+
+    #[test]
     fn mood_defaults_ignore_descriptions_and_unrelated_search_results() {
         let tuner = provider_tuner(
             "focus",
@@ -1765,12 +1814,35 @@ pub(crate) mod flow {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|g| g["id"] == "Pop" && g["isEnabled"] == true));
+                .any(|g| g["id"] == "Hip Hop" && g["isEnabled"] == true));
             assert_eq!(
                 resolve_artwork("flow-genre:image:https://example.test/cover.jpg", None).unwrap(),
                 "https://example.test/cover.jpg"
             );
             assert!(resolve_artwork("flow-genre:image:file:///private", None).is_err());
+        }
+
+        #[test]
+        fn deezer_mood_uses_enabled_clusters_and_preserves_explicit_edits() {
+            let tuner = json!({"id":"sad","customizable":true,"genres":[
+                {"id":"sad-house","title":"House","isEnabled":true},
+                {"id":"sad-pop","title":"Pop","isEnabled":false},
+                {"id":"sad-rock","title":"Rock","isEnabled":false,"isEditedByUser":true}
+            ]});
+            let result = deezer_tuner(&tuner);
+            let genres = result["genres"].as_array().unwrap();
+            assert_eq!(genres.len(), 3);
+            assert_eq!(genres[0]["isMoodGenre"], true);
+            assert_eq!(genres[1]["isMoodGenre"], false);
+            assert_eq!(genres[2]["isMoodGenre"], true);
+            assert_eq!(genres[2]["isEnabled"], false);
+            assert_eq!(genres[2]["configurations"][0]["id"], "sad-rock");
+            assert_eq!(deezer_tuner(&result), result);
+
+            let mut personal = tuner;
+            personal["id"] = json!("default");
+            assert!(deezer_tuner(&personal)["genres"].as_array().unwrap()
+                .iter().all(|genre| genre["isMoodGenre"] == true));
         }
 
         #[test]
@@ -3052,7 +3124,16 @@ mod jam_auth {
     }
 }
 pub(crate) mod playback {
-    //! Audio worker adapter: Spotify controls never enter the Deezer ABI or PCM pipeline.
+    pub(super) fn manual_skip_clears_repeat(command: &crate::audio::Command, s: &crate::audio::Snapshot) -> bool {
+        if s.repeat != 2 || s.queue.is_empty() { return false; }
+        let index = match command {
+            crate::audio::Command::Next => (s.queue_index + 1) % s.queue.len(),
+            crate::audio::Command::Previous if s.position <= 3000 && s.queue_index > 0 => s.queue_index - 1,
+            _ => return false,
+        };
+        s.queue.get(index).is_some_and(|item| crate::audio::manual_repeat_changes(s, item))
+    }
+    // Audio worker adapter: Spotify controls never enter the Deezer ABI or PCM pipeline.
     use super::{service::Handle, soloist::Control};
     use crate::{
         audio::{Command, Snapshot},
@@ -3425,6 +3506,12 @@ pub(crate) mod playback {
                             metadata(item, entry);
                         }
                     }
+                }
+                if matches!(command, Command::PlayEntry(..) | Command::PlayQueueIndex(_))
+                    && items.get(index).is_some_and(|item| crate::audio::manual_repeat_changes(s, item))
+                {
+                    web_devices::control_on("repeat", Some(0), s.now.raw["spotify_device_id"].as_str())?;
+                    s.repeat = 0;
                 }
                 self.replace(
                     s,
@@ -4182,7 +4269,11 @@ pub(crate) mod playback {
         if queue.dispatch(command, snapshot)? {
             return Ok(());
         }
-        let control = match command {
+                if manual_skip_clears_repeat(command, snapshot) {
+                    handle.control(&Control::Repeat("off".into()))?;
+                    snapshot.repeat = 0;
+                }
+                let control = match command {
             Command::SwitchProvider(_) => return Ok(()),
             Command::Play(uri) => Control::Play(Some(uri.clone())),
             Command::PlayEntry(..) => unreachable!(),
@@ -4699,7 +4790,11 @@ pub(crate) mod remote {
         if queue.dispatch(command, s)? {
             return Ok(());
         }
-        let (action, value) = match command {
+                if super::playback::manual_skip_clears_repeat(command, s) {
+                    super::web_devices::control_on("repeat", Some(0), s.now.raw["spotify_device_id"].as_str())?;
+                    s.repeat = 0;
+                }
+                let (action, value) = match command {
             Command::Play(uri) => {
                 return super::web_devices::play_context(
                     uri,
@@ -7864,13 +7959,9 @@ mod web_catalog {
             "DZFlowTunerJSON" | "DZFlowConfigTunerJSON" => {
                 let key = args.first().and_then(Value::as_str).unwrap_or("default");
                 let selection = super::flow::Selection::parse(key)?;
-                let playlists =
-                    if selection.mood == "default" || key.starts_with(super::flow::PREFIX) {
-                        json!([])
-                    } else {
-                        mood_playlists(&selection.mood)?
-                    };
-                super::flow::provider_tuner(key, &json!([]), &playlists)
+                crate::lastfm::tuner(key, &json!([]), || {
+                    mood_playlists(&selection.mood).unwrap_or_else(|_| json!([]))
+                })
             }
             "DZSaveFlowTunerJSON" | "DZFlowConfigSaveJSON" => {
                 let key = arg(args, 0)?;
@@ -7878,12 +7969,9 @@ mod web_catalog {
                     super::flow::save(key, arg(args, 1)?)
                 } else {
                     let selection = super::flow::Selection::parse(key)?;
-                    let playlists = if selection.mood == "default" {
-                        json!([])
-                    } else {
-                        mood_playlists(&selection.mood)?
-                    };
-                    let tuner = super::flow::provider_tuner(key, &json!([]), &playlists)?;
+                    let tuner = crate::lastfm::tuner(key, &json!([]), || {
+                        mood_playlists(&selection.mood).unwrap_or_else(|_| json!([]))
+                    })?;
                     super::flow::save_provider_tuner(key, arg(args, 1)?, &tuner)
                 }
             }

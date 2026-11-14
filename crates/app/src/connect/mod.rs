@@ -3,9 +3,9 @@ use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     sync::{
+        Arc, RwLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::SyncSender,
-        Arc, RwLock,
     },
     thread,
     time::{Duration, Instant},
@@ -77,7 +77,7 @@ mod mp3 {
                 let packet = match format.next_packet() {
                     Ok(packet) => packet,
                     Err(Error::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                        break
+                        break;
                     }
                     Err(e) => panic!("invalid MP3 response: {e}"),
                 };
@@ -399,26 +399,25 @@ mod spotify_audio {
     use crate::spotify::service::AudioTarget;
     use std::{
         mem::ManuallyDrop,
-        sync::{mpsc, Arc},
+        sync::{Arc, mpsc},
         time::{Duration, Instant},
     };
     use windows::{
-        core::{implement, Interface, Ref, HRESULT},
         Win32::{
             Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0},
             Media::Audio::*,
             System::{
                 Com::{
-                    CoInitializeEx, CoUninitialize,
+                    BLOB, COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize,
                     StructuredStorage::{
                         PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0,
                     },
-                    BLOB, COINIT_MULTITHREADED,
                 },
                 Threading::{CreateEventW, WaitForSingleObject},
                 Variant::VT_BLOB,
             },
         },
+        core::{HRESULT, Interface, Ref, implement},
     };
 
     pub(super) const RATE: u32 = 44_100;
@@ -451,7 +450,9 @@ mod spotify_audio {
     }
 
     fn unavailable(stage: &str, error: impl std::fmt::Display) -> String {
-        format!("Spotify process-isolated audio unavailable ({stage}: {error}). Requires Windows application-loopback support (build 20348 or newer). No system audio fallback is used.")
+        format!(
+            "Spotify process-isolated audio unavailable ({stage}: {error}). Requires Windows application-loopback support (build 20348 or newer). No system audio fallback is used."
+        )
     }
 
     struct Apartment;
@@ -736,7 +737,7 @@ mod spotify_audio {
                     Err(mpsc::TryRecvError::Empty)
                         if started.elapsed() < Duration::from_secs(5) =>
                     {
-                        return Ok(())
+                        return Ok(());
                     }
                     _ => return Err(unavailable("process activation", "completion timed out")),
                 }
@@ -856,9 +857,11 @@ mod spotify_audio {
                 _storage: storage,
             }
             .into();
-            assert!(handler
-                .cast::<windows::Win32::System::Com::IAgileObject>()
-                .is_ok());
+            assert!(
+                handler
+                    .cast::<windows::Win32::System::Com::IAgileObject>()
+                    .is_ok()
+            );
             let os_reference = handler.clone();
             drop(handler);
             assert!(weak.upgrade().is_some());
@@ -918,7 +921,7 @@ mod spotify_audio {
             };
             let _apartment = Apartment::new().unwrap();
             unsafe {
-                use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+                use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
                 let devices: IMMDeviceEnumerator =
                     CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).unwrap();
                 let device = devices.GetDefaultAudioEndpoint(eRender, eConsole).unwrap();
@@ -1649,6 +1652,9 @@ impl ConnectHub {
                         break;
                     }
                     if let Ok(mut stream) = stream {
+                        if stream.set_nonblocking(false).is_err() {
+                            continue;
+                        }
                         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                         let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
                         let st = state_clone.clone();
@@ -1754,6 +1760,7 @@ fn handle_client(
     if !active.load(Ordering::Relaxed) {
         return;
     }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let mut buffer = vec![0u8; 16384];
     let mut bytes_read = match stream.read(&mut buffer) {
         Ok(n) if n > 0 => n,
@@ -1768,6 +1775,12 @@ fn handle_client(
             break pos + 4;
         }
         if bytes_read == buffer.len() {
+            return;
+        }
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            return;
+        };
+        if stream.set_read_timeout(Some(remaining)).is_err() {
             return;
         }
         match stream.read(&mut buffer[bytes_read..]) {
@@ -1790,6 +1803,12 @@ fn handle_client(
         buffer.resize(total, 0);
     }
     while bytes_read < total {
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            return;
+        };
+        if stream.set_read_timeout(Some(remaining)).is_err() {
+            return;
+        }
         match stream.read(&mut buffer[bytes_read..total]) {
             Ok(n) if n > 0 => bytes_read += n,
             _ => return,
@@ -1916,7 +1935,10 @@ fn handle_client(
             } else {
                 (include_str!("translations.json"), "application/json")
             };
-            let head = format!("HTTP/1.1 200 OK\r\nContent-Type: {mime}; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n", content.len());
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {mime}; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+                content.len()
+            );
             let _ = stream.write_all(head.as_bytes());
             let _ = stream.write_all(content.as_bytes());
         }
@@ -1927,7 +1949,10 @@ fn handle_client(
                 } else {
                     "image/webp"
                 };
-                let head = format!("HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nCache-Control: public, max-age=86400\r\nConnection: close\r\n\r\n", bytes.len());
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nCache-Control: public, max-age=86400\r\nConnection: close\r\n\r\n",
+                    bytes.len()
+                );
                 let _ = stream.write_all(head.as_bytes());
                 let _ = stream.write_all(bytes);
             } else {
@@ -1940,7 +1965,10 @@ fn handle_client(
                 .unwrap_or_else(|| "C:/Windows".into())
                 .join("Fonts/segmdl2.ttf");
             if let Ok(bytes) = std::fs::read(font) {
-                let head = format!("HTTP/1.1 200 OK\r\nContent-Type: font/ttf\r\nContent-Length: {}\r\nCache-Control: public, max-age=86400\r\nConnection: close\r\n\r\n", bytes.len());
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: font/ttf\r\nContent-Length: {}\r\nCache-Control: public, max-age=86400\r\nConnection: close\r\n\r\n",
+                    bytes.len()
+                );
                 let _ = stream.write_all(head.as_bytes());
                 let _ = stream.write_all(&bytes);
             }
@@ -2019,7 +2047,9 @@ fn handle_client(
             } else {
                 "audio/wav"
             };
-            let http_head = format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nAccept-Ranges: none\r\nConnection: close\r\nCache-Control: no-cache, no-store, must-revalidate\r\nPragma: no-cache\r\nExpires: 0\r\nAccess-Control-Allow-Origin: *\r\n\r\n");
+            let http_head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nAccept-Ranges: none\r\nConnection: close\r\nCache-Control: no-cache, no-store, must-revalidate\r\nPragma: no-cache\r\nExpires: 0\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
+            );
             // Reserve bounded jitter headroom. Native clients retain the 500 ms
             // default; browsers can request more for mobile links and recovery.
             let buffer_bytes = stream_buffer_bytes(query);
@@ -2275,10 +2305,9 @@ fn handle_client(
                     Ok((selection, tracks)) => {
                         response["selection"] = serde_json::json!(selection.key());
                         response["title"] = serde_json::json!(selection.title());
-                        response["tracks"] = serde_json::json!(tracks
-                            .iter()
-                            .map(style_mix_track)
-                            .collect::<Vec<_>>());
+                        response["tracks"] = serde_json::json!(
+                            tracks.iter().map(style_mix_track).collect::<Vec<_>>()
+                        );
                     }
                     Err(error) => response["error"] = serde_json::json!(error),
                 }
@@ -2355,9 +2384,10 @@ fn handle_client(
                         .map(|entry| attribute_entry(entry, &payload))
                         .collect();
                     if let Some(first) = tracks.first() {
-                        let _ =
-                            command_tx.send(Command::PlayEntry(Box::new(first.clone()), tracks));
-                        send_ok(stream);
+                        send_command_result(
+                            stream,
+                            command_tx.send(Command::PlayEntry(Box::new(first.clone()), tracks)),
+                        );
                         return;
                     }
                 }
@@ -2513,11 +2543,13 @@ fn handle_client(
         ("POST", "/api/queue/add-last") | ("POST", "/api/queue") => {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(body_slice) {
                 if let Some(track) = ConnectTrack::from_value(&val) {
-                    let _ = command_tx.send(Command::QueueAddLast(Box::new(attribute_entry(
-                        track.to_entry(),
-                        &val,
-                    ))));
-                    send_ok(stream);
+                    send_command_result(
+                        stream,
+                        command_tx.send(Command::QueueAddLast(Box::new(attribute_entry(
+                            track.to_entry(),
+                            &val,
+                        )))),
+                    );
                     return;
                 }
             }
@@ -2527,11 +2559,13 @@ fn handle_client(
         ("POST", "/api/queue/insert-next") => {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(body_slice) {
                 if let Some(track) = ConnectTrack::from_value(&val) {
-                    let _ = command_tx.send(Command::QueueInsertNext(Box::new(attribute_entry(
-                        track.to_entry(),
-                        &val,
-                    ))));
-                    send_ok(stream);
+                    send_command_result(
+                        stream,
+                        command_tx.send(Command::QueueInsertNext(Box::new(attribute_entry(
+                            track.to_entry(),
+                            &val,
+                        )))),
+                    );
                     return;
                 }
             }
@@ -2548,12 +2582,14 @@ fn handle_client(
                         let st = state.read().unwrap();
                         st.snapshot.queue.iter().map(|t| t.id.clone()).collect()
                     };
-                    let _ = command_tx.send(Command::QueueMove {
-                        from: from as usize,
-                        to: to as usize,
-                        expected,
-                    });
-                    send_ok(stream);
+                    send_command_result(
+                        stream,
+                        command_tx.send(Command::QueueMove {
+                            from: from as usize,
+                            to: to as usize,
+                            expected,
+                        }),
+                    );
                     return;
                 }
             }
@@ -2563,8 +2599,10 @@ fn handle_client(
         ("POST", "/api/queue/play-index") => {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(body_slice) {
                 if let Some(idx) = val.get("index").and_then(serde_json::Value::as_u64) {
-                    let _ = command_tx.send(Command::PlayQueueIndex(idx as usize));
-                    send_ok(stream);
+                    send_command_result(
+                        stream,
+                        command_tx.send(Command::PlayQueueIndex(idx as usize)),
+                    );
                     return;
                 }
             }
@@ -2572,17 +2610,17 @@ fn handle_client(
         }
         // Queue editing: Clear queue
         ("POST", "/api/queue/clear") => {
-            let _ = command_tx.send(Command::QueueClear);
-            send_ok(stream);
+            send_command_result(stream, command_tx.send(Command::QueueClear));
         }
         // Direct Play Track
         ("POST", "/api/play") => {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(body_slice) {
                 if let Some(track) = ConnectTrack::from_value(&val) {
                     let entry = attribute_entry(track.to_entry(), &val);
-                    let _ =
-                        command_tx.send(Command::PlayEntry(Box::new(entry.clone()), vec![entry]));
-                    send_ok(stream);
+                    send_command_result(
+                        stream,
+                        command_tx.send(Command::PlayEntry(Box::new(entry.clone()), vec![entry])),
+                    );
                     return;
                 }
             }
@@ -2598,9 +2636,10 @@ fn handle_client(
                         .map(|t| attribute_entry(t.to_entry(), &val))
                         .collect();
                     if let Some(first) = entries.first() {
-                        let _ =
-                            command_tx.send(Command::PlayEntry(Box::new(first.clone()), entries));
-                        send_ok(stream);
+                        send_command_result(
+                            stream,
+                            command_tx.send(Command::PlayEntry(Box::new(first.clone()), entries)),
+                        );
                         return;
                     }
                 }
@@ -2608,16 +2647,13 @@ fn handle_client(
             send_error(stream, "Invalid collection");
         }
         ("POST", "/api/toggle") => {
-            let _ = command_tx.send(Command::Toggle);
-            send_ok(stream);
+            send_command_result(stream, command_tx.send(Command::Toggle));
         }
         ("POST", "/api/next") => {
-            let _ = command_tx.send(Command::Next);
-            send_ok(stream);
+            send_command_result(stream, command_tx.send(Command::Next));
         }
         ("POST", "/api/previous") => {
-            let _ = command_tx.send(Command::Previous);
-            send_ok(stream);
+            send_command_result(stream, command_tx.send(Command::Previous));
         }
         ("POST", "/api/shuffle") | ("POST", "/api/repeat") | ("POST", "/api/autoplay") => {
             if !state.read().map(|s| s.snapshot.connected).unwrap_or(false) {
@@ -2649,8 +2685,7 @@ fn handle_client(
         ("POST", "/api/seek") => {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(body_slice) {
                 if let Some(ms) = val.get("position_ms").and_then(serde_json::Value::as_u64) {
-                    let _ = command_tx.send(Command::SeekMs(ms));
-                    send_ok(stream);
+                    send_command_result(stream, command_tx.send(Command::SeekMs(ms)));
                     return;
                 }
             }
@@ -2724,7 +2759,7 @@ fn spotify_station_request(
     _host: &Snapshot,
     commands: &HostCommands<'_>,
 ) -> Option<Result<serde_json::Value, String>> {
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     if !path.starts_with("/api/flow") && !path.starts_with("/api/style-mix") {
         return None;
     }
@@ -2848,7 +2883,7 @@ fn spotify_guest_request(
     query: &str,
     host: &Snapshot,
 ) -> Option<Result<serde_json::Value, String>> {
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     let invoke = |name: &str, args: &[Value]| crate::spotify::catalog_invoke(name, args);
     let result = match (method, path) {
         ("GET", "/api/search") => {
@@ -2944,6 +2979,13 @@ fn send_json(stream: &mut TcpStream, json: &serde_json::Value) {
         body
     );
     let _ = stream.write_all(resp.as_bytes());
+}
+
+fn send_command_result(stream: &mut TcpStream, result: Result<(), String>) {
+    match result {
+        Ok(()) => send_ok(stream),
+        Err(error) => send_error(stream, &error),
+    }
 }
 
 fn send_ok(stream: &mut TcpStream) {
@@ -3061,7 +3103,8 @@ fn fetch_discover(engine: Option<&Deezer>) -> serde_json::Value {
 fn style_mix_track(entry: &Entry) -> serde_json::Value {
     serde_json::json!({"id":entry.id,"title":entry.title,"artist":entry.subtitle,
         "album":entry.album,"artwork":entry.artwork,"duration_ms":entry.duration,
-        "duration":entry.duration/1000,"kind":"track", "style_mix":entry.raw[crate::style_mix::MARKER]})
+        "duration":entry.duration/1000,"kind":entry.kind, "style_mix":entry.raw[crate::style_mix::MARKER],
+        "spotify_station":entry.raw["spotify_station"], "youtube_station":entry.raw["youtube_station"]})
 }
 
 fn fetch_flow(engine: Option<&Deezer>, config_id: &str) -> serde_json::Value {
@@ -3497,6 +3540,49 @@ fn url_encode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn rejected_commands_do_not_report_success() {
+        for disconnected in [false, true] {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            tx.send(Command::Next).unwrap();
+            let _receiver = if disconnected { None } else { Some(rx) };
+            let hub = ConnectHub::start(0, tx).unwrap();
+            let mut stream = TcpStream::connect(("127.0.0.1", hub.port())).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(b"POST /api/queue/clear HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}").unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+            assert!(!response.contains("\"ok\":true"));
+        }
+    }
+
+    #[test]
+    fn fragmented_headers_and_body_are_read_until_complete() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        let hub = ConnectHub::start(0, tx).unwrap();
+        let mut stream = TcpStream::connect(("127.0.0.1", hub.port())).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let body = r#"{"id":"fragmented","nickname":"Alice"}"#;
+        write!(
+            stream,
+            "POST /api/presence HTTP/1.1\r\nHost: localhost\r\nContent-Len"
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        write!(stream, "gth: {}\r\n\r\n{}", body.len(), &body[..10]).unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        stream.write_all(body[10..].as_bytes()).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert_eq!(hub.nicknames(), ["Alice"]);
+    }
+
+    #[test]
     fn presence_tracks_and_expires_browser_sessions() {
         let (tx, _rx) = std::sync::mpsc::sync_channel(1);
         let hub = ConnectHub::start(0, tx).unwrap();
@@ -3639,9 +3725,11 @@ mod tests {
             ("GET", "/api/style-mix", ""),
             ("GET", "/api/collection", "id=123&kind=album"),
         ] {
-            assert!(spotify_guest_request(method, route, query, &host)
-                .unwrap()
-                .is_err());
+            assert!(
+                spotify_guest_request(method, route, query, &host)
+                    .unwrap()
+                    .is_err()
+            );
         }
         let empty = spotify_guest_request("GET", "/api/search", "q=", &host)
             .unwrap()
@@ -3684,9 +3772,11 @@ mod tests {
             "kind=playlist&id=spotify:playlist:abc",
             "kind=album&id=youtube:playlist:abc",
         ] {
-            assert!(youtube_guest_request("GET", "/api/collection", query)
-                .unwrap()
-                .is_err());
+            assert!(
+                youtube_guest_request("GET", "/api/collection", query)
+                    .unwrap()
+                    .is_err()
+            );
         }
         assert!(youtube_guest_request("POST", "/api/play", "").is_none());
         assert!(youtube_guest_request("GET", "/api/flow", "").is_none());
@@ -3703,16 +3793,18 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(options, crate::style_mix::options());
-        assert!(spotify_station_request(
-            "GET",
-            "/api/flow/tuner",
-            "id=invalid-mood",
-            "",
-            &host,
-            &commands
-        )
-        .unwrap()
-        .is_err());
+        assert!(
+            spotify_station_request(
+                "GET",
+                "/api/flow/tuner",
+                "id=invalid-mood",
+                "",
+                &host,
+                &commands
+            )
+            .unwrap()
+            .is_err()
+        );
         let saved = spotify_station_request(
             "POST",
             "/api/flow/tuner/save",
@@ -3726,16 +3818,18 @@ mod tests {
         let restored =
             crate::spotify::flow::Selection::parse(saved["id"].as_str().unwrap()).unwrap();
         assert!(restored.genres.iter().any(|genre| genre == "Jazz"));
-        assert!(spotify_station_request(
-            "GET",
-            "/api/style-mix",
-            "selection=invalid",
-            "",
-            &host,
-            &commands
-        )
-        .unwrap()
-        .is_err());
+        assert!(
+            spotify_station_request(
+                "GET",
+                "/api/style-mix",
+                "selection=invalid",
+                "",
+                &host,
+                &commands
+            )
+            .unwrap()
+            .is_err()
+        );
         assert!(valid_host_payload(
             Provider::YouTube,
             &json!({"provider":"youtube","tracks":[{"id":"youtube:track:abc"}]})
@@ -4198,14 +4292,16 @@ mod tests {
     #[test]
     fn test_fetch_flow_structure() {
         let flow = fetch_flow(None, "default");
-        assert!(flow
-            .get("options")
-            .and_then(serde_json::Value::as_array)
-            .is_some());
-        assert!(flow
-            .get("customizable")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false));
+        assert!(
+            flow.get("options")
+                .and_then(serde_json::Value::as_array)
+                .is_some()
+        );
+        assert!(
+            flow.get("customizable")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        );
     }
 
     #[test]

@@ -4329,6 +4329,16 @@ unsafe fn automatic_text_width(dc: HDC, font: HFONT, text: &str) -> i32 {
     })
 }
 
+fn artist_credit_marquee_elapsed(key: String, rect: RECT, hovered: bool, now: std::time::Instant) -> f64 {
+    if !hovered { return 0.0; }
+    AUTO_MARQUEES.with(|states| {
+        let mut states = states.borrow_mut();
+        let state = states.entry(key).or_insert((rect, now, now));
+        state.0 = rect;
+        state.2 = now;
+        now.saturating_duration_since(state.1).as_secs_f64()
+    })
+}
 fn reset_marquees() {
     AUTO_MARQUEES.with(|states| states.borrow_mut().clear());
     MARQUEE.with(|state| *state.borrow_mut() = None);
@@ -4483,7 +4493,6 @@ struct App {
     query: String,
     navigation: Vec<(View, Option<crate::catalog::Entry>, String, i32)>,
     lyrics_id: String,
-    lyrics_settled: bool,
     background: Option<Arc<crate::catalog::Bitmap>>,
     background_source: String,
     background_requested: bool,
@@ -4892,10 +4901,32 @@ fn colors(light: bool) -> [u32; 6] {
         ]
     }
 }
+thread_local! {
+    static FITTING_FONTS: std::cell::RefCell<HashMap<([usize; 4], i32, String), usize>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
 unsafe fn select_fitting_font(dc: HDC, fonts: &[HFONT; 13], text: &str, avail_w: i32) -> HFONT {
     if text.is_empty() || avail_w <= 0 {
         return fonts[0];
     }
+    let handles = [fonts[0], fonts[9], fonts[7], fonts[6]].map(|font| font as usize);
+    let key = (handles, avail_w, text.to_owned());
+    if let Some(font) = FITTING_FONTS.with(|cache| cache.borrow().get(&key).copied()) {
+        return font as HFONT;
+    }
+    let result = select_fitting_font_uncached(dc, fonts, text, avail_w);
+    FITTING_FONTS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= 512 {
+            cache.clear();
+        }
+        cache.insert(key, result as usize);
+    });
+    result
+}
+
+unsafe fn select_fitting_font_uncached(dc: HDC, fonts: &[HFONT; 13], text: &str, avail_w: i32) -> HFONT {
     let wide_text = wide(text);
     // Candidates in descending size order: fonts[0] (~10pt / 13.3px), fonts[9] (~9pt / 12px), fonts[7] (~8pt / 10.7px), fonts[6] (~7pt / 9.3px)
     let candidates = [fonts[0], fonts[9], fonts[7], fonts[6]];
@@ -4923,6 +4954,31 @@ unsafe fn select_fitting_font(dc: HDC, fonts: &[HFONT; 13], text: &str, avail_w:
         }
     }
     fonts[6]
+}
+
+#[test]
+fn fitting_font_cache_preserves_gdi_selection_across_dpi_changes() {
+    unsafe {
+        let dc = CreateCompatibleDC(null_mut());
+        assert!(!dc.is_null());
+        for scale in [1.0, 1.25, 2.0] {
+            let fonts = make_fonts(scale);
+            assert!(FITTING_FONTS.with(|cache| cache.borrow().is_empty()));
+            for text in ["Short", "A long translated preset name", "Türkçe 日本語"] {
+                for width in [1, 32, 96, 500] {
+                    let expected = select_fitting_font_uncached(dc, &fonts, text, width);
+                    assert_eq!(select_fitting_font(dc, &fonts, text, width), expected);
+                    assert_eq!(select_fitting_font(dc, &fonts, text, width), expected);
+                }
+            }
+            assert_eq!(select_fitting_font(dc, &fonts, "", 0), fonts[0]);
+            for font in fonts {
+                DeleteObject(font);
+            }
+        }
+        FITTING_FONTS.with(|cache| cache.borrow_mut().clear());
+        DeleteDC(dc);
+    }
 }
 
 unsafe fn draw_text(dc: HDC, font: HFONT, value: &str, mut rect: RECT, color: u32, flags: u32) {
@@ -7548,10 +7604,6 @@ fn button_viewport(app: &App, index: usize, node: &ui::Button, w: i32, h: i32) -
         default
     }
 }
-unsafe fn show_lyrics_toast(hwnd: HWND, app: &mut App, message: &'static str) {
-    show_action_notice(hwnd, app, cursor_screen_point(), message);
-}
-
 unsafe fn cursor_screen_point() -> POINT {
     let mut point: POINT = zeroed();
     GetCursorPos(&mut point);
@@ -8043,7 +8095,6 @@ unsafe fn data_request(app: &mut App, job: crate::catalog::Job) {
             crate::catalog::Job::Lyrics(..) | crate::catalog::Job::LyricsWindow(..)
         );
         if lyrics {
-            app.lyrics_settled = false;
             app.ui.lyrics_loading = true;
         }
         let request = crate::catalog::Request {
@@ -9452,14 +9503,19 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
     while let Ok((key, texture)) = app.backdrop_worker.updates.try_recv() {
         if key == app.background_source && app.background_requested {
             app.background = Some(texture);
-            app.background_transition
-                .texture_ready(std::time::Instant::now());
+            reveal_background_when_ready(hwnd, app);
             start_animation_timer(hwnd, 2);
             repaint = true;
         }
     }
     while let Ok(event) = app.downloads.updates.try_recv() {
         match event {
+            crate::downloads::Event::OfflineLoaded(items) => {
+                app.ui.offline = items;
+                app.page_cache.clear();
+                if matches!(app.ui.view, View::Offline | View::Podcasts) { load_page(app); }
+                dirty = true;
+            }
             crate::downloads::Event::Maintenance(result) => {
                 app.ui.library_storage = match result {
                     Ok(summary) => summary,
@@ -9470,7 +9526,7 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
             }
             crate::downloads::Event::RemovedSelection(result) => {
                 app.downloads.finish_removal();
-                app.ui.offline = crate::downloads::load_offline();
+                app.downloads.reload_offline();
                 app.page_cache.clear();
                 app.notice = match result {
                     Ok(()) => "Download removed".into(),
@@ -9485,7 +9541,7 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
                 app.downloads.finish_removal();
                 app.ui.downloads.clear();
                 app.download_cancels.clear();
-                app.ui.offline = crate::downloads::load_offline();
+                app.downloads.reload_offline();
                 app.page_cache.clear();
                 app.catalog.session.invalidate();
                 app.notice = match result {
@@ -9526,7 +9582,12 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
                 }
                 dirty = true;
             }
-            crate::downloads::Event::Finished(id, _cancelled) => {
+            crate::downloads::Event::Finished(id, cancelled) => {
+                if let Some(job) = app.ui.downloads.iter().find(|job| job.id == id) {
+                    if job.failed > 0 || cancelled {
+                        app.notice = format!("Download {}: {} of {} processed, {} failed{}. Use Repair in Downloads settings to retry. Last status: {}", job.title, job.done, job.total, job.failed, if cancelled { " (cancelled)" } else { "" }, job.message);
+                    }
+                }
                 app.ui.downloads.retain(|job| job.id != id);
                 app.download_cancels.remove(&id);
                 app.page_cache.clear();
@@ -10013,17 +10074,6 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
                                     .map(|(id, _)| id.clone())
                                     .unwrap_or_default();
                             }
-                            if app.ui.provider == crate::catalog::Provider::Deezer
-                                && app.ui.flow_id != "default"
-                            {
-                                data_request(
-                                    app,
-                                    crate::catalog::Job::Api(
-                                        "DZFlowTunerJSON".into(),
-                                        vec![serde_json::json!("default")],
-                                    ),
-                                );
-                            }
                             data_request(
                                 app,
                                 crate::catalog::Job::Api(
@@ -10033,11 +10083,16 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
                             );
                             app.notice = "Loading Flow genres...".into();
                         } else if name == "DZFlowTunerJSON" {
-                            let value = crate::spotify::flow::searchable_catalog(
-                                &value,
-                                &crate::spotify::flow::cached_catalog(app.ui.provider),
-                            );
-                            crate::spotify::flow::persist_catalog(app.ui.provider, &value);
+                            let value = if app.ui.provider == crate::catalog::Provider::Deezer {
+                                crate::spotify::flow::deezer_tuner(&value)
+                            } else {
+                                let value = crate::spotify::flow::searchable_catalog(
+                                    &value,
+                                    &crate::spotify::flow::cached_catalog(app.ui.provider),
+                                );
+                                crate::spotify::flow::persist_catalog(app.ui.provider, &value);
+                                value
+                            };
                             if value["id"].as_str() != Some(app.ui.flow_id.as_str()) {
                                 continue;
                             }
@@ -10118,7 +10173,9 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
                                     }
                                 }
                             }
-                            if app.ui.flow_genre_order.is_empty() {
+                            if app.ui.provider != crate::catalog::Provider::Deezer
+                                || app.ui.flow_genre_order.is_empty()
+                            {
                                 app.ui.freeze_flow_order();
                             }
                             if app.ui.provider == crate::catalog::Provider::Deezer
@@ -10154,8 +10211,12 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
                                     );
                                 }
                             }
-                            app.notice =
-                                format!("Flow genres loaded from {}", app.ui.provider.label());
+                            app.notice = format!("Flow genres loaded from {}",
+                                if value["moodSource"] == "lastfm-artist-tags" {
+                                    "Last.fm"
+                                } else {
+                                    app.ui.provider.label()
+                                });
                             if let Some(expected) = app.flow_save_expected.clone() {
                                 if expected.iter().all(|(id, enabled)| {
                                     app.ui.genres.iter().any(|g| g.0 == *id && g.3 == *enabled)
@@ -10227,27 +10288,7 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
                     && id == app.snapshot.now.id
                     && sources == app.ui.lyrics_sources & crate::lyrics::SUPPORTED_SOURCES =>
             {
-                app.lyrics_settled = settled && result.is_ok();
                 app.ui.lyrics_loading = !settled;
-                if settled && result.is_ok() {
-                    SetTimer(hwnd, 92, 5000, None);
-                    if app.ui.view == View::Lyrics
-                        && result.as_ref().map_or(true, |(_, lines)| lines.is_empty())
-                    {
-                        show_lyrics_toast(
-                            hwnd,
-                            app,
-                            if result
-                                .as_ref()
-                                .is_ok_and(|(source, _)| source == "Instrumental")
-                            {
-                                "This song is instrumental."
-                            } else {
-                                "No lyrics returned for this track."
-                            },
-                        );
-                    }
-                }
                 match result {
                     Ok((provider, lines)) => {
                         let changed = app.ui.lyrics_provider != provider
@@ -10269,15 +10310,7 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
                         app.ui.lyrics =
                             lines.iter().map(|l| (l.start_ms, l.text.clone())).collect();
                         if app.ui.view == View::Lyrics {
-                            app.notice = if app.ui.lyrics.is_empty() {
-                                if app.ui.lyrics_provider == "Instrumental" {
-                                    "This song is instrumental.".into()
-                                } else {
-                                    "No lyrics returned for this track.".into()
-                                }
-                            } else {
-                                String::new()
-                            };
+                            app.notice.clear();
                         }
                     }
                     Err(error) => {
@@ -10420,6 +10453,7 @@ unsafe fn process_data(hwnd: HWND, app: &mut App) {
         }
     }
     if artwork_changed {
+        reveal_background_when_ready(hwnd, app);
         let (_, height) = size(hwnd, app);
         trim_artwork(app, height);
         request_art(app, height);
@@ -10540,6 +10574,35 @@ unsafe fn theme_path(hwnd: HWND, save: bool) -> Option<PathBuf> {
         ))
     })
 }
+// Keep the existing ambient transition until the artwork shown beside the
+// lyrics is available too. Either resolution can satisfy the cover; if both
+// requests fail, do not leave the backdrop waiting indefinitely.
+unsafe fn reveal_background_when_ready(hwnd: HWND, app: &mut App) {
+    if app.background.is_none()
+        || !matches!(
+            app.background_transition,
+            BackgroundTransition::AmbientHold | BackgroundTransition::FadeOut { ready_at: None, .. }
+        )
+    {
+        return;
+    }
+    let cover_key = crate::catalog::cover_artwork_key(&app.ui.now.artwork);
+    let wait_for_cover = app.ui.view == View::Lyrics
+        && app.ui.background_mode == 1
+        && !app.ui.now.artwork.is_empty()
+        && !crate::catalog::is_default_cover(&app.ui.now.artwork)
+        && !app.images.contains_key(&app.ui.now.artwork)
+        && !app.images.contains_key(&cover_key)
+        && !(app.image_retry_at.contains_key(&app.ui.now.artwork)
+            && (app.image_retry_at.contains_key(&cover_key)
+                || !app.scene.pictures.iter().any(|(_, key)| key == &cover_key)));
+    if !wait_for_cover {
+        app.background_transition
+            .texture_ready(std::time::Instant::now());
+        start_animation_timer(hwnd, 2);
+    }
+}
+
 unsafe fn update_background(hwnd: HWND, app: &mut App) {
     if app.render_suspended {
         app.layout_dirty = true;
@@ -10613,6 +10676,7 @@ unsafe fn update_background(hwnd: HWND, app: &mut App) {
         app.background_requested = false;
         start_animation_timer(hwnd, 2);
     }
+    reveal_background_when_ready(hwnd, app);
     if app.ui.background_mode == 1 {
         let high_key = source_key.clone();
         if !app.images.contains_key(&high_key) {
@@ -11206,30 +11270,6 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
                 app.ui.genres.clear();
                 app.ui.flow_loaded = false;
                 app.notice = "Loading Flow genres...".into();
-                if app.ui.provider == crate::catalog::Provider::Deezer && !app.ui.flow_personal {
-                    let key = format!("{}:{}", app.ui.provider.label(), app.ui.flow_id);
-                    if let Some(defaults) = app
-                        .ui
-                        .flow_mood_defaults
-                        .get(&key)
-                        .filter(|_| app.ui.flow_edited_moods.contains(&key))
-                    {
-                        let edits: Vec<_> = defaults.iter().map(|(id, enabled)|
-                            serde_json::json!({"clusterId":id,"isEnabled":enabled,"isEditedByUser":false})).collect();
-                        data_request(
-                            app,
-                            crate::catalog::Job::Api(
-                                "DZSaveFlowTunerJSON".into(),
-                                vec![
-                                    serde_json::json!(app.ui.flow_id),
-                                    serde_json::json!(serde_json::to_string(&edits).unwrap()),
-                                ],
-                            ),
-                        );
-                        rebuild(hwnd, app);
-                        return;
-                    }
-                }
                 data_request(
                     app,
                     crate::catalog::Job::Api(
@@ -11805,7 +11845,10 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
                 }
                 .into();
             } else {
-                let id = app.ui.downloads.iter().map(|j| j.id).max().unwrap_or(0) + 1;
+                let id = match crate::downloads::next_job_id(app.ui.downloads.iter().map(|j| j.id).max().unwrap_or(0)) {
+        Ok(id) => id,
+        Err(error) => { app.notice = error; return; }
+    };
                 let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let title = app
                     .ui
@@ -11969,16 +12012,9 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
             app.notice.clear();
             if view == View::Lyrics {
                 start_animation_timer(hwnd, 2);
-                if !app.snapshot.now.id.is_empty()
-                    && app.ui.lyrics.is_empty()
-                    && app.ui.rich_lyrics.is_empty()
-                {
-                    SetTimer(hwnd, 92, 5000, None);
-                }
                 let id = app.snapshot.now.id.clone();
                 if !id.is_empty() {
                     app.lyrics_id = id.clone();
-                    app.lyrics_settled = false;
                     app.ui.lyrics_loading = true;
                     data_request(
                         app,
@@ -12025,12 +12061,6 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
                 if view == View::Lyrics {
                     settle_scroll(app, 0);
                     app.ui.lyrics_manual_scroll = false;
-                    if !app.snapshot.now.id.is_empty()
-                        && app.ui.lyrics.is_empty()
-                        && app.ui.rich_lyrics.is_empty()
-                    {
-                        SetTimer(hwnd, 92, 5000, None);
-                    }
                 } else if app.ui.scroll_animation {
                     app.scroll_target = scroll;
                     app.scroll_origin = app.ui.scroll;
@@ -12367,7 +12397,8 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
             app.notice.clear();
         }
         Action::Previous | Action::Next => {
-            if matches!(action, Action::Previous) && app.snapshot.position > 3000 {
+            let rewind = matches!(action, Action::Previous) && app.snapshot.position > 3000;
+            if rewind {
                 app.snapshot.position = 0;
                 app.playback_clock = PlaybackClock::default();
                 app.ui.position = 0;
@@ -12385,7 +12416,9 @@ unsafe fn activate(hwnd: HWND, app: &mut App, action: Action) {
             }
             command(
                 app,
-                if matches!(action, Action::Previous) {
+                if rewind {
+                    Command::SeekMs(0)
+                } else if matches!(action, Action::Previous) {
                     Command::Previous
                 } else {
                     Command::Next
@@ -14525,6 +14558,7 @@ unsafe fn render_region(
                 .and_then(|p| p.entity.as_ref())
                 .is_some_and(|e| e.kind == "artist");
         render_mark!("buttons");
+        let mut offline_podcast_artwork = None;
         for (picture_index, (rect, url)) in app.scene.pictures.iter().enumerate() {
             let layer = if app.scene.content_pictures.contains(&picture_index) {
                 gpu::Layer::Main
@@ -14583,7 +14617,27 @@ unsafe fn render_region(
 if app.ui.view != View::Offline {
 return None;
 }
-            let podcast = matches!(app.ui.view, View::Podcasts | View::Show) || app.scene.buttons.iter().any(|node| matches!(&node.action, Action::OpenItem(item) if matches!(item.kind.as_str(), "podcast" | "episode") && ((!url.is_empty() && item.artwork == *url) || (url.is_empty() && item.artwork.is_empty() && rect.y >= node.rect.y && rect.y < node.rect.y + node.rect.h))));
+            let (urls, empty_rows) = offline_podcast_artwork.get_or_insert_with(|| {
+                let mut urls = HashSet::new();
+                let mut empty_rows = Vec::new();
+                for node in &app.scene.buttons {
+                    if let Action::OpenItem(item) = &node.action {
+                        if matches!(item.kind.as_str(), "podcast" | "episode") {
+                            if item.artwork.is_empty() {
+                                empty_rows.push((node.rect.y, node.rect.y + node.rect.h));
+                            } else {
+                                urls.insert(item.artwork.as_str());
+                            }
+                        }
+                    }
+                }
+                (urls, empty_rows)
+            });
+            let podcast = if url.is_empty() {
+                empty_rows.iter().any(|&(top, bottom)| rect.y >= top && rect.y < bottom)
+            } else {
+                urls.contains(url.as_str())
+            };
             Some(fallback_cover(podcast))
         }) {
                 let saved = SaveDC(memory);
@@ -14790,7 +14844,15 @@ return None;
             if app.ui.view == View::Lyrics && matches!(label.kind, 12 | 13 | 14 | 15) {
                 if let Some(area) = app.scene.lyrics_area {
                     let area = app.rect(area);
-                    IntersectClipRect(memory, area.left, area.top, area.right, area.bottom);
+                    // Let glyphs and their blur extend to the client edges while
+                    // keeping them within the lyrics column.
+                    IntersectClipRect(
+                        memory,
+                        area.left - app.px(32),
+                        0,
+                        area.right + app.px(32),
+                        bounds.bottom,
+                    );
                 }
             }
             let padding = app.px(if app.ui.view == View::Lyrics { 32 } else { 2 });
@@ -14923,19 +14985,6 @@ return None;
                 let foreground = if is_light { palette[4] } else { 0x00ffffff };
                 blend_pixel(foreground, palette[0], (opacity * 255.0).round() as u32) & 0x00ffffff
             });
-            let color = if app.ui.view == View::Lyrics && matches!(label.kind, 12 | 13 | 14 | 15) {
-                app.scene.lyrics_area.map_or(color, |area| {
-                    let size = label.rect.h as f32 / 1.375;
-                    let fade = size * 1.25;
-                    let center = label.rect.y as f32 + label.rect.h as f32 * 0.5;
-                    let edge = ((center - area.y as f32).min((area.y + area.h) as f32 - center)
-                        / fade.max(1.0))
-                    .clamp(0.0, 1.0);
-                    blend_pixel(color, palette[0], (edge * 255.0).round() as u32) & 0x00ffffff
-                })
-            } else {
-                color
-            };
             let blur_radius = inactive_look.map_or(2.0, |(_, radius)| radius);
             let drawn_blur = if label.kind == 12
                 && app.ui.blur_inactive_lyrics
@@ -16549,14 +16598,8 @@ unsafe fn draw_button(hwnd: HWND, app: &App, draw: &DRAWITEMSTRUCT) {
                 "group:{}:{}:{}:{}:{}",
                 group_rect.left, group_rect.top, group_rect.right, group_rect.bottom, group_text
             );
-            let elapsed = if group_hovered { AUTO_MARQUEES.with(|states| {
-                let mut states = states.borrow_mut();
-                let state = states.entry(key).or_insert((group_rect, now, now));
-                state.0 = group_rect;
-                state.2 = now;
-                state.1.elapsed().as_secs_f64()
-            }) } else { 0.0 };
-            if group_hovered { start_animation_timer(hwnd, 4); }
+            let elapsed = artist_credit_marquee_elapsed(key, group_rect, group_hovered, now);
+        if group_hovered { start_animation_timer(hwnd, 4); }
             let shift = marquee_offset(elapsed, overflow as f64, 36. * app.scale) as i32;
             let text_rect = RECT {
                 left: group_rect.left + current_offset - shift,
@@ -17165,69 +17208,44 @@ mod playlist_menu_membership_tests {
     }
 }
 
+unsafe fn context_item_at(app: &App, pt: POINT, w: i32, h: i32) -> Option<crate::catalog::Entry> {
+    if app.ui.friends_sidebar_open && app.scene.queue_frame.is_some_and(|frame| PtInRect(&app.rect(frame), pt) != 0) {
+        return None;
+    }
+    for (index, button) in app.scene.buttons.iter().enumerate().rev() {
+        let item = match &button.action {
+            Action::OpenItem(item) => item.clone(),
+            Action::QueueJump(index) => match app.ui.queue.get(*index) {
+                Some(item) => item.clone(),
+                None => continue,
+            },
+            _ => continue,
+        };
+        // Media may only receive context clicks inside its visible viewport.
+        // In particular, scrolled content must not receive sidebar clicks.
+        if !button.enabled
+            || PtInRect(&app.rect(button_viewport(app, index, button, w, h)), pt) == 0
+        {
+            continue;
+        }
+        let rect = if is_track_row(button) {
+            track_row_rect(button, w, app.ui.right_sidebar_width(w),
+                app.ui.content_left() + 4 + (10. * app.ui.sidebar_values().0).round() as i32,
+                app.ui.view == View::Lyrics)
+        } else {
+            button.rect
+        };
+        let rect = app.rect(rect);
+        if PtInRect(&rect, pt) != 0 {
+            return Some(item);
+        }
+    }
+    None
+}
+
 unsafe fn show_context_menu(hwnd: HWND, app: &mut App, pt: POINT, quick: bool) {
     let (w, h) = size(hwnd, app);
-    // Activity has direct navigation links; its background has no context actions.
-    if !quick && app.ui.friends_sidebar_open && app.scene.queue_frame.is_some_and(|frame| PtInRect(&app.rect(frame), pt) != 0) { return; }
-    let hit = app.scene.buttons.iter().find(|b| {
-        let r = app.rect(b.rect);
-        PtInRect(&r, pt) != 0
-    });
-    let target_item = if quick {
-        Some(app.ui.now.clone())
-    } else if app.ui.view == View::Lyrics
-        && hit.is_some_and(|b| matches!(b.action, Action::Go(View::Add)))
-    {
-        Some(app.ui.now.clone())
-    } else if let Some(btn) = hit.filter(|b| matches!(b.action, Action::OpenItem(_))) {
-        if let Action::OpenItem(item) = &btn.action {
-            Some(item.clone())
-        } else {
-            None
-        }
-    } else {
-        // Check if pt is on any track row
-        app.scene
-            .buttons
-            .iter()
-            .find_map(|b| {
-                if let Action::OpenItem(item) = &b.action {
-                    let r = app.rect(b.rect);
-                    let is_card = !b.artwork.is_empty();
-                    if !is_card
-                        && !b.text_link
-                        && (item.playable() || item.kind == "track" || b.rect.h <= 50)
-                        && pt.y >= r.top
-                        && pt.y < r.bottom
-                        && pt.x >= app.px(180)
-                        && pt.x <= w - app.px(20)
-                    {
-                        return Some(item.clone());
-                    }
-                    if is_card
-                        && pt.x >= r.left
-                        && pt.x <= r.right
-                        && pt.y >= r.top
-                        && pt.y <= r.bottom + app.px(64)
-                    {
-                        return Some(item.clone());
-                    }
-                }
-                None
-            })
-            .or_else(|| {
-                if pt.y >= (h - app.px(96)) && app.ui.queue_index < app.ui.queue.len() {
-                    Some(app.ui.queue[app.ui.queue_index].clone())
-                } else if pt.y >= (h - app.px(96)) && !app.ui.now.id.is_empty() {
-                    Some(app.ui.now.clone())
-                } else if pt.y < app.px(app.scene.content_top) {
-                    app.entity.clone()
-                } else {
-                    None
-                }
-            })
-    };
-
+    let target_item = if quick { Some(app.ui.now.clone()) } else { context_item_at(app, pt, w, h) };
     if let Some(mut item) = target_item {
         if app.ui.provider == crate::catalog::Provider::Deezer {
             crate::catalog::restore_playlist_owner(&mut item, &app.ui.account);
@@ -18672,19 +18690,6 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
             }
             0
         }
-        WM_TIMER if wp == 92 => {
-            KillTimer(hwnd, 92);
-            if app.ui.view == View::Lyrics
-                && app.lyrics_settled
-                && !app.snapshot.now.id.is_empty()
-                && app.ui.lyrics.is_empty()
-                && app.ui.rich_lyrics.is_empty()
-                && !app.ui.lyrics_cover_mode
-            {
-                activate(hwnd, app, Action::ToggleLyricsCoverMode);
-            }
-            0
-        }
         WM_TIMER if wp == 91 => {
             KillTimer(hwnd, 91);
             app.link_copied_at = None;
@@ -19126,7 +19131,9 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                 if visualizer_only {
                     let region = RECT {
                         left: 0,
-                        top: (client.bottom - 220 - app.px(4)).max(caption_height(hwnd)),
+                        // Include curve overshoot and the broad glow, not only the
+                        // nominal 220px wave height.
+                        top: (client.bottom - 220 - app.px(64)).max(caption_height(hwnd)),
                         right: client.right,
                         bottom: client.bottom,
                     };
@@ -19468,14 +19475,10 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                         settle_scroll(app, 0);
                     }
                     app.lyrics_id = app.snapshot.now.id.clone();
-                    app.lyrics_settled = false;
                     app.ui.lyrics_loading = true;
                     app.ui.lyrics.clear();
                     app.ui.rich_lyrics.clear();
                     app.ui.lyrics_provider.clear();
-                    if app.ui.view == View::Lyrics {
-                        SetTimer(hwnd, 92, 5000, None);
-                    }
                     if app.snapshot.now.kind == "track" {
                         let neighbors =
                             adjacent_lyric_tracks(&app.snapshot.queue, app.snapshot.queue_index);
@@ -19724,6 +19727,8 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
     }
 }
 unsafe fn make_fonts(scale: f64) -> [HFONT; 13] {
+    // GDI may recycle font handles after a DPI change or window recreation.
+    FITTING_FONTS.with(|cache| cache.borrow_mut().clear());
     let mut fonts = [null_mut(); 13];
     for (i, (height, weight, face)) in [
         (-13.333, 400, "Segoe UI"),
@@ -19946,7 +19951,6 @@ pub fn run() -> Result<(), String> {
             query: String::new(),
             navigation: Vec::new(),
             lyrics_id: String::new(),
-            lyrics_settled: false,
             background: None,
             background_source: String::new(),
             background_requested: false,
@@ -20268,7 +20272,6 @@ mod behavior_tests {
             query: String::new(),
             navigation: Vec::new(),
             lyrics_id: String::new(),
-            lyrics_settled: false,
             link_copied_at: None,
             playlist_notice_point: None,
             queue_notice_point: None,
@@ -20421,6 +20424,71 @@ mod behavior_tests {
             for font in app.fonts {
                 DeleteObject(font);
             }
+            DeleteObject(app.brush);
+        }
+    }
+    #[test]
+    fn context_menu_targets_only_media_and_visible_queue_rows() {
+        unsafe {
+            let mut app = test_app();
+            app.scale = 1.0;
+        app.ui.sidebar_collapsed = true;
+            app.ui.now.id = "playing".into();
+            app.ui.queue = vec![crate::catalog::Entry { id: "queued".into(), ..Default::default() }];
+            app.scene.buttons = vec![
+                ui::Button { rect: Rect::new(200, 100, 80, 80), artwork: "cover".into(),
+                    action: Action::OpenItem(crate::catalog::Entry { id: "album".into(), ..Default::default() }), ..Default::default() },
+                ui::Button { rect: Rect::new(700, 120, 200, 40), action: Action::QueueJump(0), ..Default::default() },
+            ];
+            app.scene.queue_viewport = Some(Rect::new(700, 100, 200, 100));
+            app.scene.queue_row_buttons = 1..2;
+        assert_eq!(context_item_at(&app, POINT { x: 210, y: 110 }, 1000, 800).unwrap().id, "album");
+        assert!(context_item_at(&app, POINT { x: 210, y: 181 }, 1000, 800).is_none());
+            assert_eq!(context_item_at(&app, POINT { x: 710, y: 130 }, 1000, 800).unwrap().id, "queued");
+            assert!(context_item_at(&app, POINT { x: 400, y: 790 }, 1000, 800).is_none());
+            assert!(context_item_at(&app, POINT { x: 400, y: 20 }, 1000, 800).is_none());
+            app.scene.queue_viewport = Some(Rect::new(700, 160, 200, 100));
+            assert!(context_item_at(&app, POINT { x: 710, y: 130 }, 1000, 800).is_none());
+            DeleteObject(app.brush);
+        }
+    }
+
+    #[test]
+    fn context_menu_clips_media_to_content_and_ignores_navigation() {
+        unsafe {
+            let mut app = test_app();
+            app.scene.content_top = 80;
+            app.scene.buttons = vec![
+                ui::Button {
+                    rect: Rect::new(0, 40, 500, 200),
+                    artwork: "cover".into(),
+                    action: Action::OpenItem(crate::catalog::Entry {
+                        id: "album".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                ui::Button {
+                    rect: Rect::new(10, 100, 180, 37),
+                    action: Action::Go(View::Home),
+                    ..Default::default()
+                },
+            ];
+            app.scene.content_buttons = 0..1;
+            for scale in [1.0, 2.0] {
+                app.scale = scale;
+                for collapsed in [false, true] {
+                    app.ui.sidebar_collapsed = collapsed;
+                    let point = |x, y| POINT { x: app.px(x), y: app.px(y) };
+                    assert!(context_item_at(&app, point(20, 110), 1000, 800).is_none());
+                    assert!(context_item_at(&app, point(300, 60), 1000, 800).is_none());
+                    assert_eq!(context_item_at(&app, point(300, 110), 1000, 800).unwrap().id, "album");
+                    assert!(context_item_at(&app, point(300, 250), 1000, 800).is_none());
+                }
+            }
+            app.scale = 1.0;
+            app.scene.buttons[0].enabled = false;
+            assert!(context_item_at(&app, POINT { x: 300, y: 110 }, 1000, 800).is_none());
             DeleteObject(app.brush);
         }
     }
@@ -21833,107 +21901,18 @@ mod behavior_tests {
 
     #[test]
     fn artist_credit_group_names_scroll_together_with_shared_marquee() {
-        unsafe {
-            let class = wide("ArtistCreditMarqueeTest");
-            let instance = GetModuleHandleW(null());
-            let wnd_class = WNDCLASSEXW {
-                cbSize: size_of::<WNDCLASSEXW>() as u32,
-                lpfnWndProc: Some(DefWindowProcW),
-                hInstance: instance,
-                lpszClassName: class.as_ptr(),
-                ..zeroed()
-            };
-            RegisterClassExW(&wnd_class);
-            let hwnd = CreateWindowExW(
-                0,
-                class.as_ptr(),
-                class.as_ptr(),
-                WS_POPUP,
-                0,
-                0,
-                600,
-                400,
-                null_mut(),
-                null_mut(),
-                instance,
-                null_mut(),
-            );
-            assert!(!hwnd.is_null());
-            let dc = GetDC(hwnd);
-            let mut app = test_app();
-            let fonts = make_fonts(1.0);
-            app.fonts = fonts;
-
-            let group = Rect::new(50, 50, 100, 20);
-            let group_rect = app.rect(group);
-
-            let artists = vec![
-                ui::Button {
-                    text: "Kendrick Lamar".into(),
-                    text_link: true,
-                    rect: Rect::new(50, 50, 60, 20),
-                    artist_credit_group: Some(group),
-                    ..Default::default()
-                },
-                ui::Button {
-                    text: ", SZA".into(),
-                    text_link: true,
-                    rect: Rect::new(110, 50, 40, 20),
-                    artist_credit_group: Some(group),
-                    ..Default::default()
-                },
-            ];
-            app.scene.buttons = artists;
-
-            AUTO_MARQUEES.with(|states| states.borrow_mut().clear());
-
-            let draw0 = DRAWITEMSTRUCT {
-                CtlID: 1000,
-                hwndItem: hwnd,
-                hDC: dc,
-                rcItem: app.rect(app.scene.buttons[0].rect),
-                ..zeroed()
-            };
-            let draw1 = DRAWITEMSTRUCT {
-                CtlID: 1001,
-                hwndItem: hwnd,
-                hDC: dc,
-                rcItem: app.rect(app.scene.buttons[1].rect),
-                ..zeroed()
-            };
-
-            draw_button(hwnd, &app, &draw0);
-            draw_button(hwnd, &app, &draw1);
-
-            let states_count = AUTO_MARQUEES.with(|states| states.borrow().len());
-            assert_eq!(
-                states_count, 1,
-                "both buttons in group must share a single marquee entry"
-            );
-
-            let has_group_key = AUTO_MARQUEES.with(|states| {
-                let states = states.borrow();
-                states.keys().any(|k| {
-                    k.starts_with(&format!(
-                        "group:{}:{}:{}:{}",
-                        group_rect.left, group_rect.top, group_rect.right, group_rect.bottom
-                    ))
-                })
-            });
-            assert!(
-                has_group_key,
-                "group marquee key must match group rectangle"
-            );
-
-            ReleaseDC(hwnd, dc);
-            for f in fonts {
-                DeleteObject(f);
-            }
-            DestroyWindow(hwnd);
-            UnregisterClassW(class.as_ptr(), instance);
-            let mut msg: MSG = zeroed();
-            while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {}
-        }
+        AUTO_MARQUEES.with(|states| states.borrow_mut().clear());
+        let rect = RECT { left: 50, top: 50, right: 150, bottom: 70 };
+        let key = "group:50:50:150:70:Kendrick Lamar, SZA".to_owned();
+        let start = std::time::Instant::now();
+        assert_eq!(artist_credit_marquee_elapsed(key.clone(), rect, false, start), 0.0);
+        AUTO_MARQUEES.with(|states| assert!(states.borrow().is_empty()));
+        assert_eq!(artist_credit_marquee_elapsed(key.clone(), rect, true, start), 0.0);
+        let elapsed = artist_credit_marquee_elapsed(key, rect, true, start + std::time::Duration::from_secs(2));
+        assert_eq!(elapsed, 2.0);
+        AUTO_MARQUEES.with(|states| assert_eq!(states.borrow().len(), 1));
+        assert_eq!(marquee_offset(elapsed, 120.0, 40.0), 52.0);
+        AUTO_MARQUEES.with(|states| states.borrow_mut().clear());
     }
 
     #[test]
@@ -23205,7 +23184,6 @@ mod behavior_tests {
                 query: String::new(),
                 navigation: Vec::new(),
                 lyrics_id: String::new(),
-                lyrics_settled: false,
                 link_copied_at: None,
                 playlist_notice_point: None,
                 queue_notice_point: None,

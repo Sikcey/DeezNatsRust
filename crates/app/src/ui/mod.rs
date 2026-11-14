@@ -2803,7 +2803,7 @@ impl Ui {
     }
     pub fn load_preferences() -> Self {
         let mut ui = Self {
-            offline: crate::downloads::load_offline(),
+            offline: Vec::new(),
             ..Self::default()
         };
         ui.spotify_configured = crate::session::provider_exists("spotify-soloist")
@@ -2942,7 +2942,8 @@ impl Ui {
             .filter(|p| (1..=65535).contains(p))
             .unwrap_or(crate::connect::DEFAULT_PORT as u64) as u16;
         ui.jam_enabled = false;
-        ui.autoplay = value["Autoplay"].as_bool().unwrap_or(true);
+        // Autoplay starts enabled each session; users can disable it for this session.
+        ui.autoplay = true;
         ui.karaoke_lyrics = value["KaraokeLyrics"].as_bool().unwrap_or(true);
         ui.blur_inactive_lyrics = value["BlurInactiveLyrics"].as_bool().unwrap_or(true);
         ui.lyrics_size_panel = value["LyricsSizePanel"]
@@ -5021,6 +5022,27 @@ fn build_queue_sidebar(s: &mut Scene, ui: &Ui, qx: i32, qw: i32, h: i32) {
 mod spotify_reference_panel_tests {
     use super::*;
     #[test]
+    fn autoplay_radio_batch_appears_only_at_end_of_source_and_manual_queue() {
+        let mut ui=Ui::default();ui.provider=crate::catalog::Provider::Deezer;ui.autoplay=true;
+        let mut radio=entry("radio","Radio track",true);
+        radio.raw=serde_json::json!({"_queue_radio":true,"_queue_manual":false,"queue_context_name":"Flow - Happy"});
+        ui.queue=vec![entry("first","First",true),entry("last","Last",true),radio];ui.now=ui.queue[0].clone();
+        let draw=|ui:&Ui| {let mut scene=Scene::default();build_provider_queue(&mut scene,ui,900,360,1400);scene};
+        assert!(!draw(&ui).labels.iter().any(|l|l.text=="Radio track"));
+        ui.queue_index=1;ui.now=ui.queue[1].clone();
+        let scene=draw(&ui);
+        assert!(scene.labels.iter().any(|l|l.text=="Playing from: Flow - Happy Radio"));
+        assert!(scene.labels.iter().any(|l|l.text=="Radio track"));
+        assert!(scene.buttons.iter().any(|b|matches!(b.action,Action::QueueJump(2))));
+        ui.queue.insert(2,crate::audio::explicit_queue_entry(entry("manual","Manual",true)));
+        assert!(!draw(&ui).labels.iter().any(|l|l.text=="Radio track"));
+        ui.queue_index=2;ui.now=ui.queue[2].clone();
+        assert!(draw(&ui).labels.iter().any(|l|l.text=="Radio track"));
+        ui.autoplay=false;
+        assert!(!draw(&ui).labels.iter().any(|l|l.text=="Radio track"));
+    }
+
+    #[test]
     fn playback_source_names_capture_collection_flow_and_style_mix() {
         for provider in [crate::catalog::Provider::Deezer,crate::catalog::Provider::Spotify,crate::catalog::Provider::YouTube] {
             let mut ui=Ui::default();ui.provider=provider;
@@ -5163,7 +5185,9 @@ fn build_provider_queue(s:&mut Scene,ui:&Ui,qx:i32,qw:i32,h:i32) {
     let mut body=Scene::default();let mut y=0;
     let upcoming:Vec<_>=ui.queue.iter().enumerate().skip(ui.queue_index.saturating_add(1)).collect();
     let manual:Vec<_>=upcoming.iter().copied().filter(|(_,e)|crate::audio::is_manual_queue_entry(e)).collect();
-    let context:Vec<_>=upcoming.iter().copied().filter(|(_,e)|!crate::audio::is_manual_queue_entry(e)).collect();
+    let context:Vec<_>=upcoming.iter().copied().filter(|(_,e)|!crate::audio::is_manual_queue_entry(e) && !crate::audio::is_radio_queue_entry(e)).collect();
+    let radio:Vec<_>=upcoming.iter().copied().filter(|(_,e)|crate::audio::is_radio_queue_entry(e)).collect();
+    let show_radio=context.is_empty() && manual.is_empty() && ui.autoplay;
     // Clamp against the new document before virtualizing rows. Clear can shrink it
     // beneath the old scroll offset; culling at that offset would leave a blank list.
     let content_height=if ui.queue_recent {ui.queue_history.len() as i32*80} else {
@@ -5171,6 +5195,7 @@ fn build_provider_queue(s:&mut Scene,ui:&Ui,qx:i32,qw:i32,h:i32) {
         + if ui.provider==crate::catalog::Provider::Spotify && !ui.queue_jam_dismissed {144} else {0}
         + 38 + if manual.is_empty() {40} else {manual.len() as i32*80}
         + if context.is_empty() {0} else {60+context.len() as i32*80}
+        + if show_radio && !radio.is_empty() {60+radio.len() as i32*80} else {0}
     };
     let maximum=(content_height-viewport.h).max(0);
     let requested=ui.queue_scroll.saturating_mul(24).saturating_add(ui.queue_scroll_offset).min(maximum as usize) as i32;
@@ -5199,6 +5224,13 @@ fn build_provider_queue(s:&mut Scene,ui:&Ui,qx:i32,qw:i32,h:i32) {
             body.label_sized(x,y,w,30,heading,0);y+=40;
             for (index,entry) in context {if visible(y) {provider_queue_row(&mut body,entry,Some(index),occurrences[index],x,y,w,false);}y+=80;}
         }
+    }
+    if !ui.queue_recent && show_radio && !radio.is_empty() {
+        y+=20;
+        let name=radio[0].1.raw["queue_context_name"].as_str().filter(|v|!v.is_empty()).unwrap_or("Autoplay");
+        let heading=if ui.language == "tr" {format!("\u{15e}uradan \u{e7}al\u{131}n\u{131}yor: {name} Radyosu")} else {format!("Playing from: {name} Radio")};
+        body.label_sized(x,y,w,30,heading,0);y+=40;
+        for (index,entry) in radio {if visible(y) {provider_queue_row(&mut body,entry,Some(index),occurrences[index],x,y,w,false);}y+=80;}
     }
     debug_assert_eq!(content_height,y);let pixels=requested;
     s.queue_scroll_max=((maximum+23)/24) as usize;s.queue_scroll_pixels_max=maximum;
@@ -5237,11 +5269,13 @@ fn build_lyrics_view(s: &mut Scene, ui: &Ui, w: i32, h: i32, playing: bool, volu
         .lyrics_cover_mix
         .unwrap_or(if ui.lyrics_cover_mode { 1. } else { 0. })
         .clamp(0., 1.);
+    let side_inset = ((w - 900) / 8).clamp(0, 120);
     let left_x = 32 + (col_w - cover_size) / 2;
-    let offset_x = (((w - cover_size) / 2 - left_x) as f32 * mode_mix).round() as i32;
+    let offset_x = side_inset
+        + (((w - cover_size) / 2 - left_x - side_inset) as f32 * mode_mix).round() as i32;
     let cover_x = left_x + offset_x;
     let block_h = cover_size + 130;
-    let left_y = ((h - block_h) / 2).clamp(40, 90);
+    let left_y = ((h - block_h) / 2).max(40);
     let cover_y =
         left_y + ((((h - cover_size - 160) / 2).max(40) - left_y) as f32 * mode_mix).round() as i32;
 
@@ -5413,7 +5447,8 @@ fn build_lyrics_view(s: &mut Scene, ui: &Ui, w: i32, h: i32, playing: bool, volu
         let rw = 740.min(w - 96);
         ((w - rw) / 2, rw)
     } else {
-        (col_w + 32, (w - col_w - 36).max(220))
+        let x = col_w + 32 + side_inset + side_inset / 4;
+        (x, (w - x - 4).max(220))
     };
 
     s.lyrics_area = Some(Rect::new(right_x, 72, right_w, (h - 144).max(1)));
@@ -6429,7 +6464,11 @@ pub fn build(
                     x,
                     yy,
                     cw,
-                    "Showing up to 40 genres. Search all provider genres and subgenres.",
+                    if ui.provider == crate::catalog::Provider::Deezer {
+                        "Showing up to 40 genres. Search all provider genres and subgenres."
+                    } else {
+                        "Selected genres first. Showing up to 40 genres. Search all provider genres and subgenres."
+                    },
                     1,
                 );
                 yy += 24;
@@ -6467,7 +6506,8 @@ pub fn build(
                 let visible: Vec<_> = catalog
                     .into_iter()
                     .filter(|(_, genre)| {
-                        !filter.is_empty()
+                        ui.provider != crate::catalog::Provider::Deezer
+                            || !filter.is_empty()
                             || ui.flow_personal
                             || ui
                                 .flow_mood_genres
@@ -9825,6 +9865,45 @@ mod tests {
         ui.flow_filter.clear();
         ui.flow_personal = true;
         assert_eq!(listed(&ui).len(), 2);
+    }
+
+    #[test]
+    fn playlist_flow_shows_other_genres_after_selected_genres() {
+        for provider in [crate::catalog::Provider::Spotify, crate::catalog::Provider::YouTube] {
+            let mut ui = Ui {
+                provider,
+                view: View::FlowTune,
+                flow_personal: false,
+                flow_mood_genres: Some(["ambient".to_owned()].into_iter().collect()),
+                genres: vec![
+                    ("rock".into(), "Rock".into(), false, false),
+                    ("ambient".into(), "Ambient".into(), true, true),
+                    ("jazz".into(), "Jazz".into(), true, true),
+                ],
+                ..Default::default()
+            };
+            ui.freeze_flow_order();
+            let listed: Vec<_> = build(&ui, (1043, 1200), true, false, "", false, 40)
+                .buttons.into_iter()
+                .filter(|button| matches!(button.action, Action::Genre(_)))
+                .collect();
+            assert_eq!(listed.len(), 3);
+            assert!(listed[..2].iter().all(|button| button.selected));
+            assert_eq!(listed[2].text, "Rock");
+            ui.genres = (0..100).map(|index| (
+                index.to_string(), format!("Genre {index:03}"), index == 99, index == 99
+            )).collect();
+            ui.freeze_flow_order();
+            ui.flow_genre_limit = usize::MAX;
+            let expanded = build(&ui, (1043, 12000), true, false, "", false, 40);
+            let listed: Vec<_> = expanded.buttons.iter()
+                .filter(|button| matches!(button.action, Action::Genre(_))).collect();
+            assert_eq!(listed.len(), 40);
+            assert_eq!(listed[0].text, "Genre 099");
+            assert!(listed[0].selected);
+            assert!(expanded.buttons.iter().any(|button|
+                matches!(button.action, Action::FlowMoreGenres) && button.text == "Show less"));
+        }
     }
 
     #[test]
@@ -14529,6 +14608,87 @@ pub(crate) mod drawing {
         sync::OnceLock,
     };
     pub const LYRICS_UNTRIMMED: u32 = 0x80000000;
+    fn text_cache_limit() -> usize {
+        #[cfg(feature = "diagnostics")]
+        {
+            static LIMIT: OnceLock<usize> = OnceLock::new();
+            return *LIMIT.get_or_init(|| {
+                if std::env::var("DEEZNATS_TEXT_CACHE_ENTRIES").ok().as_deref() == Some("256") { 256 } else { 1024 }
+            });
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        { 1024 }
+    }
+    // Retained scrolling revisits more than one viewport of labels. Cache hits
+    // must not scan that working set; eviction is paid only on insertion.
+    struct TextCache<K, V> {
+        entries: std::collections::HashMap<K, (V, u64, usize)>,
+        clock: u64,
+        bytes: usize,
+    }
+    #[cfg(test)]
+    mod text_cache_tests {
+        use super::TextCache;
+        #[test]
+        fn scrolling_working_set_stays_hot_and_entry_count_is_bounded() {
+            let mut cache = TextCache::new();
+            for key in 0..600 { cache.insert(key, key, 1, 1024); }
+            for key in 0..600 { assert_eq!(cache.get(&key), Some(&key)); }
+            for key in 600..1024 { cache.insert(key, key, 1, 1024); }
+            cache.get(&0);
+            assert_eq!(cache.insert(1024, 1024, 1, 1024), vec![1]);
+            assert_eq!(cache.len(), 1024);
+            assert_eq!(cache.get(&0), Some(&0));
+        }
+        #[test]
+        fn byte_budget_replacement_and_path_invalidation_account_for_resources() {
+            let mut cache = TextCache::new();
+            cache.insert(1, "first", 6, 10);
+            assert_eq!(cache.insert(2, "second", 6, 10), vec!["first"]);
+            assert_eq!(cache.insert(2, "replacement", 4, 10), vec!["second"]);
+            cache.insert(3, "third", 6, 10);
+            cache.retain(|key| *key != 2);
+            assert_eq!(cache.bytes, 6);
+            cache.insert(4, "fourth", 4, 10);
+            assert_eq!(cache.len(), 2);
+            assert_eq!(cache.bytes, 10);
+        }
+    }
+    impl<K: Eq + std::hash::Hash + Clone, V> TextCache<K, V> {
+        fn new() -> Self {
+            Self { entries: Default::default(), clock: 0, bytes: 0 }
+        }
+        fn get(&mut self, key: &K) -> Option<&V> {
+            self.clock = self.clock.saturating_add(1);
+            let entry = self.entries.get_mut(key)?;
+            entry.1 = self.clock;
+            Some(&entry.0)
+        }
+        fn insert(&mut self, key: K, value: V, bytes: usize, budget: usize) -> Vec<V> {
+            let mut removed = Vec::new();
+            if let Some((old, _, size)) = self.entries.remove(&key) {
+                self.bytes -= size;
+                removed.push(old);
+            }
+            while self.entries.len() >= text_cache_limit() || (!self.entries.is_empty() && self.bytes + bytes > budget) {
+                let oldest = self.entries.iter().min_by_key(|(_, e)| e.1).map(|(k, _)| k.clone()).unwrap();
+                let (old, _, size) = self.entries.remove(&oldest).unwrap();
+                self.bytes -= size;
+                removed.push(old);
+            }
+            self.clock = self.clock.saturating_add(1);
+            self.entries.insert(key, (value, self.clock, bytes));
+            self.bytes += bytes;
+            removed
+        }
+        fn retain(&mut self, mut keep: impl FnMut(&K) -> bool) {
+            self.entries.retain(|key, (_, _, bytes)| {
+                if keep(key) { true } else { self.bytes -= *bytes; false }
+            });
+        }
+        #[cfg(test)]
+        fn len(&self) -> usize { self.entries.len() }
+    }
 
     use windows_sys::Win32::{
         Foundation::RECT,
@@ -15246,7 +15406,7 @@ pub(crate) mod drawing {
             stroke_style: ID2D1StrokeStyle,
             image_brush: ID2D1BitmapBrush,
             gdi_matrix: *mut Matrix,
-            text_rasters: VecDeque<((usize, i32, i32), ID2D1Bitmap1, usize)>,
+            text_rasters: super::TextCache<(usize, i32, i32, bool), (ID2D1Bitmap1, D2D_RECT_F)>,
             current_clip: Option<D2D_RECT_F>,
             retained: retained::Retention,
             uploads: usize,
@@ -15415,7 +15575,7 @@ pub(crate) mod drawing {
                 stroke_style,
                 image_brush,
                 gdi_matrix: std::ptr::null_mut(),
-                text_rasters: VecDeque::new(),
+                text_rasters: super::TextCache::new(),
                 current_clip: None,
                 retained: retained::Retention::default(),
                 uploads: 0,
@@ -15889,7 +16049,7 @@ pub(crate) mod drawing {
             let _ = SURFACE.try_with(|s| {
                 if let Some(s) = s.borrow_mut().as_mut() {
                     s.geometries.retain(|g| g.0 != path);
-                    s.text_rasters.retain(|g| g.0 .0 != path);
+                    s.text_rasters.retain(|key| key.0 != path);
                 }
             });
         }
@@ -16024,6 +16184,16 @@ pub(crate) mod drawing {
                 width: i32,
                 height: i32,
             ) -> Result<()> {
+                self.text_mask(path, value, width, height, true)
+            }
+            unsafe fn text_mask(
+                &mut self,
+                path: *mut GpPath,
+                value: u32,
+                width: i32,
+                height: i32,
+                cropped: bool,
+            ) -> Result<()> {
                 if width <= 0 || height <= 0 {
                     return Ok(());
                 }
@@ -16032,19 +16202,30 @@ pub(crate) mod drawing {
                     return self.solid(path, value, None);
                 }
                 // Cache coverage, not color: hover/theme changes reuse the same mask.
-                let key = (path as usize, width, height);
-                let bitmap = if let Some(index) =
-                    self.text_rasters.iter().position(|entry| entry.0 == key)
-                {
-                    let entry = self.text_rasters.remove(index).unwrap();
-                    let bitmap = entry.1.clone();
-                    self.text_rasters.push_back(entry);
-                    bitmap
+                let key = (path as usize, width, height, cropped);
+                let (bitmap, destination) = if let Some(raster) = self.text_rasters.get(&key) {
+                    raster.clone()
                 } else {
+                    #[cfg(feature = "diagnostics")]
+                    let _text_raster_timing = crate::diagnostics::span("text.raster_build", "Text");
+                    // Blank layout space must not consume the glyph-mask budget.
+                    // Preserve the layout origin (including centered/right text)
+                    // and leave a pixel around the 0.3px outline for antialiasing.
+                    let mut destination = D2D_RECT_F { left: 0., top: 0., right: width as f32, bottom: height as f32 };
+                    if cropped {
+                        let ink = self.path(path)?.GetBounds(None)?;
+                        destination.left = (ink.left - 1.).floor().max(0.);
+                        destination.top = (ink.top - 1.).floor().max(0.);
+                        destination.right = (ink.right + 1.).ceil().min(width as f32);
+                        destination.bottom = (ink.bottom + 1.).ceil().min(height as f32);
+                    }
+                    let mask_width = (destination.right - destination.left) as i32;
+                    let mask_height = (destination.bottom - destination.top) as i32;
+                    if mask_width <= 0 || mask_height <= 0 { return Ok(()); }
                     let bitmap = self.context.CreateBitmap(
                         D2D_SIZE_U {
-                            width: width as u32,
-                            height: height as u32,
+                            width: mask_width as u32,
+                            height: mask_height as u32,
                         },
                         None,
                         0,
@@ -16066,7 +16247,7 @@ pub(crate) mod drawing {
                         self.context.PopAxisAlignedClip();
                     }
                     self.context.SetTarget(&bitmap);
-                    self.context.SetTransform(&identity());
+                    self.context.SetTransform(&Matrix3x2 { M31: -destination.left, M32: -destination.top, ..identity() });
                     self.context.Clear(Some(&D2D1_COLOR_F::default()));
                     let result = (|| -> Result<()> {
                         self.solid(path, 0x30ffffff, Some(0.3))?;
@@ -16079,17 +16260,9 @@ pub(crate) mod drawing {
                     }
                     self.context.SetTransform(&transform);
                     result?;
-                    let bytes = width as usize * height as usize * 4;
-                    while self.text_rasters.len() >= 256
-                        || self.text_rasters.iter().map(|e| e.2).sum::<usize>() + bytes
-                            > 16 * 1024 * 1024
-                    {
-                        if self.text_rasters.pop_front().is_none() {
-                            break;
-                        }
-                    }
-                    self.text_rasters.push_back((key, bitmap.clone(), bytes));
-                    bitmap
+                    let bytes = mask_width as usize * mask_height as usize * 4;
+                    self.text_rasters.insert(key, (bitmap.clone(), destination), bytes, 16 * 1024 * 1024);
+                    (bitmap, destination)
                 };
                 self.brush.SetColor(&color(value));
                 let mode = self.context.GetAntialiasMode();
@@ -16099,7 +16272,7 @@ pub(crate) mod drawing {
                     &bitmap,
                     &self.brush,
                     D2D1_OPACITY_MASK_CONTENT_GRAPHICS,
-                    None,
+                    Some(&destination),
                     None,
                 );
                 self.context.SetAntialiasMode(mode);
@@ -16561,6 +16734,48 @@ pub(crate) mod drawing {
                 }
             }
 
+            #[test]
+            #[ignore = "Requires Windows hardware Direct3D and DirectComposition"]
+            fn gpu_cropped_text_masks_match_full_layout_masks_pixel_for_pixel() {
+                unsafe {
+                    let hwnd = CreateWindowExW(0, windows::core::w!("STATIC").as_ptr(), std::ptr::null(), WS_POPUP,
+                        0, 0, 240, 80, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null());
+                    assert!(!hwnd.is_null());
+                    let dc = CreateCompatibleDC(std::ptr::null_mut());
+                    let mut lf: LOGFONTW = std::mem::zeroed();
+                    lf.lfHeight = -24;
+                    lf.lfWeight = 700;
+                    for (to, from) in lf.lfFaceName.iter_mut().zip("Segoe UI".encode_utf16()) { *to = from; }
+                    let font = CreateFontIndirectW(&lf);
+                    let rect = RECT { left: 0, top: 0, right: 240, bottom: 80 };
+                    for (text, flags) in [
+                        ("GPU", DT_LEFT | DT_VCENTER),
+                        ("Héllo 世界 🎵", DT_CENTER | DT_VCENTER),
+                        ("Right aligned", DT_RIGHT | DT_VCENTER),
+                        ("Two lines with wrapping and clipped text at the edge", DT_WORDBREAK),
+                        ("Very long untrimmed string reaching past the layout", super::super::LYRICS_UNTRIMMED),
+                        (" ", DT_CENTER),
+                    ] {
+                        let mut reference = None;
+                        for cropped in [false, true] {
+                            let mut pixels = vec![0u32; 240 * 80];
+                            assert!(begin(hwnd, pixels.as_ptr().cast(), 240, 240, 80, 0, None));
+                            let frame = crate::drawing::Frame::begin(dc, pixels.as_mut_ptr().cast(), 240, 240, 80, false).unwrap();
+                            let path = crate::drawing::cached_text_path(font, text, rect, flags).unwrap();
+                            SURFACE.with(|slot| slot.borrow_mut().as_mut().unwrap().text_mask(path, 0xffaabbcc, 240, 80, cropped).unwrap());
+                            drop(frame);
+                            assert!(finish());
+                            let rendered = snapshot(rect).unwrap();
+                            if cropped { assert_eq!(reference.as_ref().unwrap(), &rendered, "mask crop changed {text:?}, flags={flags}"); }
+                            else { reference = Some(rendered); }
+                        }
+                    }
+                    SURFACE.with(|slot| *slot.borrow_mut() = None);
+                    DeleteObject(font);
+                    DeleteDC(dc);
+                    DestroyWindow(hwnd);
+                }
+            }
             #[test]
             #[ignore = "Requires Windows hardware Direct3D and DirectComposition"]
             fn gpu_rasterizes_alpha_clips_text_artwork_and_blur_without_cpu_foreground() {
@@ -17486,7 +17701,7 @@ pub(crate) mod drawing {
     thread_local! {static DC_REGIONS:std::cell::RefCell<DcRegions>=std::cell::RefCell::new(DcRegions {
         current:unsafe{CreateRectRgn(0,0,0,0)},scratch:unsafe{CreateRectRgn(0,0,0,0)}
     });}
-    thread_local! {static TEXT_PATHS:std::cell::RefCell<std::collections::VecDeque<(String,*mut GpPath)>>=const {std::cell::RefCell::new(std::collections::VecDeque::new())};}
+    thread_local! {static TEXT_PATHS:std::cell::RefCell<TextCache<String,*mut GpPath>>=std::cell::RefCell::new(TextCache::new());}
     thread_local! {static LIGHT:Cell<bool>=const {Cell::new(false)};}
     thread_local! {static FRAME_FONTS:std::cell::RefCell<std::collections::HashMap<usize,LOGFONTW>>=std::cell::RefCell::new(std::collections::HashMap::new());}
     unsafe fn font_properties(font: HFONT) -> LOGFONTW {
@@ -18077,6 +18292,8 @@ pub(crate) mod drawing {
         r: RECT,
         flags: u32,
     ) -> Option<*mut GpPath> {
+        #[cfg(feature = "diagnostics")]
+        let _text_path_timing = crate::diagnostics::span("text.path_total", "Text");
         let lf = font_properties(font);
         let key = format!(
             "{:p}:{}:{}:{}:{}:{}:{}",
@@ -18089,16 +18306,13 @@ pub(crate) mod drawing {
             value
         );
         let cached = TEXT_PATHS.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            let index = cache.iter().position(|(k, _)| *k == key)?;
-            let entry = cache.remove(index)?;
-            let path = entry.1;
-            cache.push_back(entry);
-            Some(path)
+            cache.borrow_mut().get(&key).copied()
         });
         if let Some(path) = cached {
             return Some(path);
         }
+        #[cfg(feature = "diagnostics")]
+        let _text_build_timing = crate::diagnostics::span("text.path_build", "Text");
         let mut family = null_mut();
         GdipCreateFontFamilyFromName(lf.lfFaceName.as_ptr(), null_mut(), &mut family);
         if family.is_null() {
@@ -18176,13 +18390,9 @@ pub(crate) mod drawing {
         GdipDeleteStringFormat(format);
         GdipDeleteFontFamily(family);
         TEXT_PATHS.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            if cache.len() >= 256 {
-                if let Some((_, old)) = cache.pop_front() {
-                    gpu_dispatch::GdipDeletePath(old);
-                }
+            for old in cache.borrow_mut().insert(key, p, 1, text_cache_limit()) {
+                gpu_dispatch::GdipDeletePath(old);
             }
-            cache.push_back((key, p));
         });
         Some(p)
     }
@@ -18568,6 +18778,8 @@ pub(crate) mod drawing {
         }
     }
     pub unsafe fn lyric_text_width(dc: HDC, font: HFONT, value: &str) -> i32 {
+        #[cfg(feature = "diagnostics")]
+        let _text_width_timing = crate::diagnostics::span("text.width_total", "Text");
         if value.is_empty() {
             return 0;
         }
@@ -18578,6 +18790,8 @@ pub(crate) mod drawing {
         {
             return width;
         }
+        #[cfg(feature = "diagnostics")]
+        let _text_measure_timing = crate::diagnostics::span("text.width_measure", "Text");
         let Some(g) = graphics(dc) else {
             return 0;
         };
